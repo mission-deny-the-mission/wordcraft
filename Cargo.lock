@@ -5216,6 +5216,7 @@ dependencies = [
  "wordcraft-pdf",
  "wordcraft-proof",
  "wordcraft-render",
+ "wordcraft-storage",
  "zeroize",
  "zip",
 ]

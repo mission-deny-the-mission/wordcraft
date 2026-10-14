@@ -18,6 +18,8 @@ pub mod ribbon;
 pub mod sample;
 mod session;
 pub mod speech;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod storage;
 
 use std::collections::HashMap;
 

@@ -1,0 +1,63 @@
+//! Live oCIS round-trip: engine [`Session`][wordcraft_engine::Session] ↔ WebDAV Bearer backend.
+//!
+//! Runs only with `CRAFT_E2E_LIVE=1` and `CRAFT_DAV_TOKEN` set (a short-lived OIDC access
+//! token minted out of band); plain `cargo test` skips without touching the network, so this
+//! never blocks offline runs. The token is read from the environment and never printed.
+//!
+//! What it proves beyond the k8s curl harness (raw bytes): a `.docx` goes oCIS → engine
+//! `Session` → oCIS with the backend carrying the bytes exactly (byte fidelity), and the
+//! parsed document keeps its text across both crossings.
+
+#![cfg(not(target_arch = "wasm32"))]
+
+use wordcraft_doc::StoryRef;
+use wordcraft_engine::Session;
+use wordcraft_engine::io::ExportOptions;
+use wordcraft_storage::StorageBackend;
+use wordcraft_storage::webdav::WebDavBackend;
+
+fn live_backend() -> Option<(WebDavBackend, String)> {
+    if std::env::var("CRAFT_E2E_LIVE").as_deref() != Ok("1") {
+        return None;
+    }
+    let base = std::env::var("CRAFT_DAV_BASE").unwrap_or_else(|_| "http://proxy.ocis.svc.cluster.local:9200".into());
+    let user = std::env::var("CRAFT_DAV_USER").unwrap_or_else(|_| "ocis-e2e-tmp".into());
+    let token = std::env::var("CRAFT_DAV_TOKEN").unwrap_or_default();
+    assert!(!token.is_empty(), "CRAFT_E2E_LIVE=1 needs CRAFT_DAV_TOKEN set");
+    let url = format!("{}/remote.php/dav/files/{user}/", base.trim_end_matches('/'));
+    let backend = WebDavBackend::with_bearer(&url, &token).expect("bearer backend builds");
+    Some((backend, user))
+}
+
+#[test]
+fn docx_round_trips_ocis_to_session_to_ocis() {
+    let Some((store, _user)) = live_backend() else {
+        eprintln!("skipped: set CRAFT_E2E_LIVE=1 with CRAFT_DAV_TOKEN for the live oCIS round-trip");
+        return;
+    };
+    let tag =
+        format!("craft-e2e-{}-{}.docx", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+    let copy = format!("{tag}.copy.docx");
+    let opts = ExportOptions::default();
+
+    // Session → oCIS.
+    let mut session = Session::new(wordcraft_engine::sample::sample_document());
+    let before = session.doc.plain_text(StoryRef::Body);
+    assert!(before.contains("Open Studio"));
+    let meta = session.save_to_storage(&store, &tag, &opts).expect("PUT session doc to oCIS");
+    assert_eq!(meta.size, store.stat(&tag).expect("PROPFIND after PUT").size);
+
+    // oCIS → engine Session → oCIS under another name; the backend carries bytes exactly.
+    let mut reopened = Session::new(wordcraft_doc::Document::new());
+    assert!(!reopened.open_from_storage(&store, &tag, None).expect("GET into a fresh session"));
+    assert_eq!(reopened.doc.plain_text(StoryRef::Body), before);
+    let expected = wordcraft_engine::io::save_bytes_with(&copy, &reopened.doc, None, &opts).unwrap();
+    wordcraft_engine::storage::save_to_storage(&store, &copy, &reopened.doc, None, &opts).expect("PUT copy back to oCIS");
+    assert_eq!(store.read(&copy).expect("GET the copy"), expected, "oCIS carried the bytes exactly");
+
+    // Clean up: both files gone afterwards (idempotent remove, then 404 on read).
+    store.remove(&tag).expect("DELETE original");
+    store.remove(&copy).expect("DELETE copy");
+    assert!(matches!(store.read(&tag), Err(wordcraft_storage::StorageError::NotFound(_))), "deleted file reads as missing");
+    eprintln!("live round-trip green: {tag} ({0} bytes) via oCIS", meta.size);
+}
