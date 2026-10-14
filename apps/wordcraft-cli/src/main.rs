@@ -41,7 +41,7 @@ USAGE:
                                               addNote, refresh, removeCodes, setDocPrefs
                                               (--cmd runs first, e.g. --cmd caret.docEnd)
   wordcraft-cli store-write PATH FILE [--store local --store-root DIR | --store webdav
-                    --store-url URL [--store-user U --store-password P]] [--etag TAG] [--atomic]
+                    --store-url URL [--store-user U --store-password P | --store-token T]] [--etag TAG] [--atomic]
                                               upload a local file to storage at PATH (--etag writes
                                               only if the stored version still carries TAG)
   wordcraft-cli store-read PATH OUT [--store …]  download storage PATH to local file OUT
@@ -52,7 +52,9 @@ USAGE:
   wordcraft-cli store-recover [--store …]     finish or drop interrupted writes, as JSON
                     --store-root is a local/NAS/synced folder; --store-url is the WebDAV
                     collection, e.g. http://ocis.lan:9200/remote.php/dav/files/alice/Docs/
-                    (plain http only: LAN, VPN or SSH tunnel; https is refused, see #518)
+                    (plain http only: LAN, VPN or SSH tunnel; https is refused, see #518).
+                    WebDAV auth is Basic (--store-user/--store-password) or an OIDC
+                    Bearer token (--store-token), never both.
   wordcraft-cli --version
 ";
 
@@ -145,6 +147,7 @@ const STORE_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--store-url", takes_value: true },
     OptionSpec { name: "--store-user", takes_value: true },
     OptionSpec { name: "--store-password", takes_value: true },
+    OptionSpec { name: "--store-token", takes_value: true },
     OptionSpec { name: "--etag", takes_value: true },
     OptionSpec { name: "--atomic", takes_value: false },
 ];
@@ -404,7 +407,8 @@ fn run(args: &[String]) -> Result<(), Failure> {
 }
 
 /// Open the storage backend named by the `--store*` flags: `local` (a folder at `--store-root`)
-/// or `webdav` (a collection at `--store-url`, `--store-user`/`--store-password` for Basic auth).
+/// or `webdav` (a collection at `--store-url`, Basic auth via `--store-user`/`--store-password`
+/// or an OIDC/Bearer token via `--store-token`; the two schemes are mutually exclusive).
 fn open_store(command: &str, args: &[String]) -> Result<Box<dyn wordcraft_storage::StorageBackend>, String> {
     match arg_value(args, "--store").as_deref().unwrap_or("local") {
         "local" => {
@@ -421,8 +425,17 @@ fn open_store(command: &str, args: &[String]) -> Result<Box<dyn wordcraft_storag
             if arg_value(args, "--store-root").is_some() {
                 return Err(format!("{command}: --store-root is for --store local, not webdav"));
             }
-            let (user, password) = (arg_value(args, "--store-user"), arg_value(args, "--store-password"));
-            wordcraft_storage::webdav::WebDavBackend::new(&url, user.as_deref(), password.as_deref())
+            let (user, password, token) =
+                (arg_value(args, "--store-user"), arg_value(args, "--store-password"), arg_value(args, "--store-token"));
+            if token.is_some() && (user.is_some() || password.is_some()) {
+                return Err(format!("{command}: --store-token cannot be combined with --store-user/--store-password (pick one auth scheme)"));
+            }
+            let backend = match (token, user, password) {
+                (Some(t), None, None) => wordcraft_storage::webdav::WebDavBackend::with_bearer(&url, &t),
+                (None, u, p) => wordcraft_storage::webdav::WebDavBackend::new(&url, u.as_deref(), p.as_deref()),
+                _ => unreachable!("token/user exclusivity checked above"),
+            };
+            backend
                 .map(|b| Box::new(b) as Box<dyn wordcraft_storage::StorageBackend>)
                 .map_err(|e| format!("{command}: {e}"))
         }
@@ -608,6 +621,11 @@ mod tests {
         assert!(validate_options("store-list", &args(&["--bogus"]), STORE_OPTIONS).is_err());
         assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/"])).is_ok());
         assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "https://h/dav/"])).is_err());
+        // Bearer token: accepted alone, rejected with user/password, rejected empty.
+        assert!(validate_options("store-probe", &args(&["--store", "webdav", "--store-url", "http://h/dav/", "--store-token", "t"]), STORE_OPTIONS).is_ok());
+        assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/", "--store-token", "t"])).is_ok());
+        assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/", "--store-token", "t", "--store-user", "u"])).is_err());
+        assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/", "--store-token", ""])).is_err());
         assert!(open_store("store-probe", &args(&[])).is_err());
         assert!(open_store("store-probe", &args(&["--store", "tape"])).is_err());
         assert!(open_store("store-probe", &args(&["--store", "local", "--store-root", "x", "--store-url", "http://h/"])).is_err());

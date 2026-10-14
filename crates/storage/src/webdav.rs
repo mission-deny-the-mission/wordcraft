@@ -2,7 +2,10 @@
 //!
 //! Only the standard library is used (blocking `TcpStream` HTTP/1.1), so there is no new
 //! dependency and no I/O on any path but an explicit storage call. Supported:
-//! - Basic authentication (`Authorization: Basic …`), as oCIS infinite-scale deployments take.
+//! - Basic authentication (`Authorization: Basic ...`), as oCIS infinite-scale deployments take.
+//! - Bearer authentication (`Authorization: Bearer <token>`), e.g. an oCIS OIDC access
+//!   token — required where Basic auth is disabled (external user management);
+//!   see [`WebDavBackend::with_bearer`].
 //! - Conditional writes: `PUT` carries `If-Match: <etag>` when [`WriteOptions::if_match`] is set;
 //!   a `412` becomes [`StorageError::Conflict`]. Without an ETag the backend sends a plain `PUT`
 //!   (fallback) and reports the server's `ETag` response header, if any.
@@ -11,7 +14,7 @@
 //!
 //! Deliberately stubbed (see [`строй`][WebDavBackend] docs and the crate report): `https://`
 //! URLs (no TLS in this build — put Caddy / a reverse proxy in front, or sync a local folder),
-//! digest/NTLM/bearer auth, locking (`LOCK`/`UNLOCK`, Phase 3 takes these), and partial writes.
+//! digest/NTLM auth, locking (`LOCK`/`UNLOCK`, Phase 3 takes these), and partial writes.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -48,6 +51,18 @@ impl WebDavBackend {
             _ => return Err(StorageError::Auth("need both user and password, or neither".into())),
         };
         Ok(WebDavBackend { host, port, base, auth })
+    }
+
+    /// `url` like `http://host:port/dav/spaces/...`; `token` becomes an OIDC/Bearer credential
+    /// (`Authorization: Bearer <token>`). Use this where the server does not take Basic auth
+    /// (e.g. oCIS with external user management). Must not be combined with Basic credentials —
+    /// pick one scheme.
+    pub fn with_bearer(url: &str, token: &str) -> Result<WebDavBackend, StorageError> {
+        let (host, port, base) = split_url(url)?;
+        if token.is_empty() {
+            return Err(StorageError::Auth("bearer token must not be empty".into()));
+        }
+        Ok(WebDavBackend { host, port, base, auth: Some(format!("Bearer {token}")) })
     }
 
     /// The collection URL this backend talks to (password never included).
@@ -570,6 +585,49 @@ mod tests {
         b.remove("memo.docx").unwrap();
         // Basic auth went out on the PUT.
         assert!(seen.lock().unwrap().iter().any(|l| l.starts_with("PUT")));
+    }
+
+    #[test]
+    fn bearer_token_sent_as_authorization_header() {
+        use std::sync::mpsc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let mut req = Vec::new();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        req.extend_from_slice(&buf[..n]);
+                        if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let head = String::from_utf8_lossy(&req).into_owned();
+            let auth = head
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                .unwrap_or("")
+                .to_string();
+            let _ = tx.send(auth);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nDAV: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let b = WebDavBackend::with_bearer(&format!("http://{addr}/dav/"), "test-token-123").unwrap();
+        b.probe().unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "Authorization: Bearer test-token-123");
+    }
+
+    #[test]
+    fn bearer_rejects_empty_token() {
+        let err = WebDavBackend::with_bearer("http://127.0.0.1/dav/", "").unwrap_err();
+        assert!(matches!(err, StorageError::Auth(_)));
     }
 
     /// Read one full HTTP request (headers plus any `Content-Length` body) from a mock

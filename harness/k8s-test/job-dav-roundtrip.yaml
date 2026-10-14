@@ -1,0 +1,74 @@
+# DAV round-trip harness (works as soon as a provisioned user's OIDC token is supplied).
+# Auth: Bearer ONLY. Password (Basic) auth is rejected by this oCIS deployment even
+# with LDAP-valid credentials (verified: Basic + known-good password -> 401).
+# The token goes in the out-of-band Secret `craft-storage-test-dav`, key `token`
+# (see README.md). No secret values live in this file.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dav-roundtrip
+  namespace: craft-storage-test
+  labels:
+    app.kubernetes.io/part-of: craft-storage-harness
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        job: dav-roundtrip
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dav-roundtrip
+          image: curlimages/curl:8.10.1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          env:
+            - name: CRAFT_DAV_BASE
+              value: http://proxy.ocis.svc.cluster.local:9200
+            - name: CRAFT_DAV_USER
+              value: ocis-e2e-tmp
+            - name: CRAFT_DAV_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: craft-storage-test-dav
+                  key: token
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              B="$CRAFT_DAV_BASE"; U="$CRAFT_DAV_USER"
+              F="craft-storage-test-$(date +%s).txt"
+              BODY="craft-storage-harness-probe"
+              AUTH="Authorization: Bearer $CRAFT_DAV_TOKEN"
+              need2xx() { code="$1"; what="$2"; case "$code" in 2*) ;; *) echo "FAIL: $what -> HTTP $code"; exit 1;; esac; }
+              echo "== PROPFIND /dav/spaces (expect 207) =="
+              C=$(curl -sS -m20 -o /dev/null -w "%{http_code}" -X PROPFIND -H "Depth: 0" -H "$AUTH" "$B/dav/spaces"); echo "HTTP $C"; [ "$C" = "207" ] || { echo "FAIL: spaces PROPFIND -> HTTP $C"; exit 1; }
+              echo "== PUT legacy path $U/$F (expect 2xx) =="
+              printf '%s' "$BODY" > /tmp/body.txt
+              C=$(curl -sS -m20 -o /dev/null -w "%{http_code}" -H "$AUTH" --upload-file /tmp/body.txt "$B/remote.php/dav/files/$U/$F"); echo "HTTP $C"; need2xx "$C" "PUT $F"
+              echo "== GET + byte compare =="
+              C=$(curl -sS -m20 -o /tmp/got.txt -w "%{http_code}" -H "$AUTH" "$B/remote.php/dav/files/$U/$F"); echo "HTTP $C"; need2xx "$C" "GET $F"
+              cmp -s /tmp/body.txt /tmp/got.txt && echo "MATCH" || { echo "FAIL: content mismatch"; exit 1; }
+              echo "== PROPFIND file (expect 207) =="
+              C=$(curl -sS -m20 -o /dev/null -w "%{http_code}" -X PROPFIND -H "Depth: 0" -H "$AUTH" "$B/remote.php/dav/files/$U/$F"); echo "HTTP $C"; [ "$C" = "207" ] || { echo "FAIL: file PROPFIND -> HTTP $C"; exit 1; }
+              echo "== DELETE (expect 2xx) + GET (expect 404) =="
+              C=$(curl -sS -m20 -o /dev/null -w "%{http_code}" -X DELETE -H "$AUTH" "$B/remote.php/dav/files/$U/$F"); echo "HTTP $C"; need2xx "$C" "DELETE $F"
+              C=$(curl -sS -m20 -o /dev/null -w "%{http_code}" -H "$AUTH" "$B/remote.php/dav/files/$U/$F"); echo "HTTP $C"; [ "$C" = "404" ] || { echo "FAIL: post-delete GET -> HTTP $C"; exit 1; }
+              echo "ALL GREEN: $F round-tripped and cleaned up"
