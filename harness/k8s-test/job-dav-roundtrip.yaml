@@ -58,8 +58,10 @@ spec:
               BODY="craft-storage-harness-probe"
               AUTH="Authorization: Bearer $CRAFT_DAV_TOKEN"
               need2xx() { code="$1"; what="$2"; case "$code" in 2*) ;; *) echo "FAIL: $what -> HTTP $code"; exit 1;; esac; }
-              echo "== PROPFIND /dav/spaces (expect 207) =="
-              C=$(curl -sS -m20 -o /dev/null -w "%{http_code}" -X PROPFIND -H "Depth: 0" -H "$AUTH" "$B/dav/spaces"); echo "HTTP $C"; [ "$C" = "207" ] || { echo "FAIL: spaces PROPFIND -> HTTP $C"; exit 1; }
+              echo "== GET drives via graph API (expect 200: auth + provisioning OK) =="
+              C=$(curl -sS -m20 -o /dev/null -w "%{http_code}" -H "$AUTH" "$B/graph/v1.0/drives"); echo "HTTP $C"; need2xx "$C" "graph drives"
+              # NOTE: PROPFIND /dav/spaces answers 405 on oCIS 8.2.0 (both depths);
+              # the per-user legacy path below is the supported WebDAV surface.
               echo "== PUT legacy path $U/$F (expect 2xx) =="
               printf '%s' "$BODY" > /tmp/body.txt
               C=$(curl -sS -m20 -o /dev/null -w "%{http_code}" -H "$AUTH" --upload-file /tmp/body.txt "$B/remote.php/dav/files/$U/$F"); echo "HTTP $C"; need2xx "$C" "PUT $F"
