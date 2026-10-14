@@ -40,6 +40,19 @@ USAGE:
                                               running): addEditCitation, addEditBibliography,
                                               addNote, refresh, removeCodes, setDocPrefs
                                               (--cmd runs first, e.g. --cmd caret.docEnd)
+  wordcraft-cli store-write PATH FILE [--store local --store-root DIR | --store webdav
+                    --store-url URL [--store-user U --store-password P]] [--etag TAG] [--atomic]
+                                              upload a local file to storage at PATH (--etag writes
+                                              only if the stored version still carries TAG)
+  wordcraft-cli store-read PATH OUT [--store …]  download storage PATH to local file OUT
+  wordcraft-cli store-stat PATH [--store …]   metadata (size, ETag) as JSON
+  wordcraft-cli store-list [PREFIX] [--store …] direct children as JSON
+  wordcraft-cli store-remove PATH [--store …] delete (missing: success)
+  wordcraft-cli store-probe [--store …]       capabilities + server probe as JSON
+  wordcraft-cli store-recover [--store …]     finish or drop interrupted writes, as JSON
+                    --store-root is a local/NAS/synced folder; --store-url is the WebDAV
+                    collection, e.g. http://ocis.lan:9200/remote.php/dav/files/alice/Docs/
+                    (plain http only: LAN, VPN or SSH tunnel; https is refused, see #518)
   wordcraft-cli --version
 ";
 
@@ -125,6 +138,15 @@ const ZOTERO_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--save", takes_value: true },
     OptionSpec { name: "--trace", takes_value: false },
     OptionSpec { name: "--port", takes_value: true },
+];
+const STORE_OPTIONS: &[OptionSpec] = &[
+    OptionSpec { name: "--store", takes_value: true },
+    OptionSpec { name: "--store-root", takes_value: true },
+    OptionSpec { name: "--store-url", takes_value: true },
+    OptionSpec { name: "--store-user", takes_value: true },
+    OptionSpec { name: "--store-password", takes_value: true },
+    OptionSpec { name: "--etag", takes_value: true },
+    OptionSpec { name: "--atomic", takes_value: false },
 ];
 
 /// Why a CLI run stopped early.
@@ -375,8 +397,135 @@ fn run(args: &[String]) -> Result<(), Failure> {
             Ok(())
         }
         "--version" | "-V" => write_stdout(|o| writeln!(o, "wordcraft-cli {}", env!("CARGO_PKG_VERSION"))),
+        "store-write" | "store-read" | "store-stat" | "store-list" | "store-remove" | "store-probe" | "store-recover" => store_command(cmd, &rest),
         "" | "help" | "--help" | "-h" => write_stdout(|o| write!(o, "{USAGE}")),
         other => Err(format!("unknown command `{other}`\n\n{USAGE}").into()),
+    }
+}
+
+/// Open the storage backend named by the `--store*` flags: `local` (a folder at `--store-root`)
+/// or `webdav` (a collection at `--store-url`, `--store-user`/`--store-password` for Basic auth).
+fn open_store(command: &str, args: &[String]) -> Result<Box<dyn wordcraft_storage::StorageBackend>, String> {
+    match arg_value(args, "--store").as_deref().unwrap_or("local") {
+        "local" => {
+            let root = arg_value(args, "--store-root").ok_or_else(|| format!("{command}: --store local needs --store-root DIR"))?;
+            if arg_value(args, "--store-url").is_some() {
+                return Err(format!("{command}: --store-url is for --store webdav, not local"));
+            }
+            wordcraft_storage::local::LocalBackend::open(std::path::Path::new(&root))
+                .map(|b| Box::new(b) as Box<dyn wordcraft_storage::StorageBackend>)
+                .map_err(|e| format!("{command}: {e}"))
+        }
+        "webdav" => {
+            let url = arg_value(args, "--store-url").ok_or_else(|| format!("{command}: --store webdav needs --store-url URL"))?;
+            if arg_value(args, "--store-root").is_some() {
+                return Err(format!("{command}: --store-root is for --store local, not webdav"));
+            }
+            let (user, password) = (arg_value(args, "--store-user"), arg_value(args, "--store-password"));
+            wordcraft_storage::webdav::WebDavBackend::new(&url, user.as_deref(), password.as_deref())
+                .map(|b| Box::new(b) as Box<dyn wordcraft_storage::StorageBackend>)
+                .map_err(|e| format!("{command}: {e}"))
+        }
+        other => Err(format!("{command}: unknown --store `{other}` (local or webdav)")),
+    }
+}
+
+/// The positional arguments of a `store-*` command: option values (`--store local`, …) are not
+/// positionals, wherever they appear. Unknown options are rejected by `validate_options` first.
+fn store_positionals(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg.starts_with("--") {
+            let takes = STORE_OPTIONS.iter().find(|spec| spec.name == arg).map(|spec| spec.takes_value).unwrap_or(false);
+            i += if takes { 2 } else { 1 };
+        } else {
+            out.push(arg.clone());
+            i += 1;
+        }
+    }
+    out
+}
+
+fn store_command(command: &str, rest: &[String]) -> Result<(), Failure> {
+    validate_options(command, rest, STORE_OPTIONS)?;
+    let positional = store_positionals(rest);
+    let pos = |i: usize| positional.get(i).cloned().ok_or_else(|| format!("missing argument\n\n{USAGE}"));
+    let store = open_store(command, rest).map_err(Failure::Error)?;
+    match command {
+        "store-write" => {
+            let (path, file) = (pos(0)?, pos(1)?);
+            wordcraft_engine::file_access::check_read(&file).map_err(Failure::Error)?;
+            let bytes = std::fs::read(&file).map_err(|e| Failure::Error(format!("{file}: {e}")))?;
+            let opts =
+                wordcraft_storage::WriteOptions { if_match: arg_value(rest, "--etag"), atomic: rest.iter().any(|a| a == "--atomic") };
+            let meta = store.write(&path, &bytes, &opts).map_err(|e| Failure::Error(format!("{path}: {e}")))?;
+            write_stdout(|o| writeln!(o, "{}", serde_json::to_string_pretty(&json!({"path": path, "size": meta.size, "etag": meta.etag})).unwrap_or_default()))?;
+            eprintln!("wrote {path} ({} bytes)", bytes.len());
+            Ok(())
+        }
+        "store-read" => {
+            let (path, out) = (pos(0)?, pos(1)?);
+            let bytes = store.read(&path).map_err(|e| Failure::Error(format!("{path}: {e}")))?;
+            wordcraft_engine::file_access::check_write(&out).map_err(Failure::Error)?;
+            std::fs::write(&out, &bytes).map_err(|e| Failure::Error(format!("{out}: {e}")))?;
+            eprintln!("wrote {out} ({} bytes)", bytes.len());
+            Ok(())
+        }
+        "store-stat" => {
+            let path = pos(0)?;
+            let meta = store.stat(&path).map_err(|e| Failure::Error(format!("{path}: {e}")))?;
+            write_stdout(|o| {
+                writeln!(
+                    o,
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"path": path, "size": meta.size, "etag": meta.etag, "modified": meta.modified, "isDir": meta.is_dir}))
+                        .unwrap_or_default()
+                )
+            })
+        }
+        "store-list" => {
+            let prefix = positional.first().cloned().unwrap_or_default();
+            let entries = store.list(&prefix).map_err(|e| Failure::Error(format!("{}: {e}", if prefix.is_empty() { "(root)" } else { &prefix })))?;
+            let list: Vec<Value> =
+                entries.iter().map(|e| json!({"path": e.path, "size": e.meta.size, "etag": e.meta.etag, "isDir": e.meta.is_dir})).collect();
+            write_stdout(|o| writeln!(o, "{}", serde_json::to_string_pretty(&list).unwrap_or_default()))
+        }
+        "store-remove" => {
+            let path = pos(0)?;
+            store.remove(&path).map_err(|e| Failure::Error(format!("{path}: {e}")))?;
+            eprintln!("removed {path}");
+            Ok(())
+        }
+        "store-probe" => {
+            let caps = store.capabilities();
+            let probe = store.probe().map_err(|e| Failure::Error(e.to_string()))?;
+            write_stdout(|o| {
+                writeln!(
+                    o,
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "atomicWrite": caps.atomic_write, "conditionalWrite": caps.conditional_write, "list": caps.list,
+                        "etag": caps.etag, "persistent": caps.persistent,
+                        "davClasses": probe.dav_classes, "notes": probe.notes,
+                    }))
+                    .unwrap_or_default()
+                )
+            })
+        }
+        _ => {
+            // store-recover: finish or drop interrupted writes; safe at every startup.
+            let report = store.recover().map_err(|e| Failure::Error(e.to_string()))?;
+            write_stdout(|o| {
+                writeln!(
+                    o,
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"completed": report.completed, "dropped": report.dropped, "removedTemp": report.removed_temp}))
+                        .unwrap_or_default()
+                )
+            })
+        }
     }
 }
 
@@ -450,6 +599,25 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn store_flags_open_the_right_backend_or_explain() {
+        assert!(validate_options("store-write", &args(&["a.docx", "f.docx", "--store", "local", "--store-root", "x", "--etag", "t", "--atomic"]), STORE_OPTIONS).is_ok());
+        assert!(validate_options("store-probe", &args(&["--store", "webdav", "--store-url", "http://h/dav/", "--store-user", "u", "--store-password", "p"]), STORE_OPTIONS).is_ok());
+        assert!(validate_options("store-list", &args(&["--bogus"]), STORE_OPTIONS).is_err());
+        assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/"])).is_ok());
+        assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "https://h/dav/"])).is_err());
+        assert!(open_store("store-probe", &args(&[])).is_err());
+        assert!(open_store("store-probe", &args(&["--store", "tape"])).is_err());
+        assert!(open_store("store-probe", &args(&["--store", "local", "--store-root", "x", "--store-url", "http://h/"])).is_err());
+    }
+
+    #[test]
+    fn store_positionals_skip_option_values_wherever_they_appear() {
+        assert_eq!(store_positionals(&args(&["--store", "local", "--store-root", "r", "a.docx", "f.docx", "--atomic"])), args(&["a.docx", "f.docx"]));
+        assert_eq!(store_positionals(&args(&["a.docx", "--etag", "t"])), args(&["a.docx"]));
+        assert!(store_positionals(&args(&["--atomic"])).is_empty());
     }
 
     #[test]
