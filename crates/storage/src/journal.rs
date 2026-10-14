@@ -5,7 +5,7 @@
 //! [`read`] + [`plan`] turn that log into work for [`StorageBackend::recover`][crate::StorageBackend::recover]:
 //! entries with no matching commit are finished (the staged file is renamed into place) or
 //! dropped (nothing staged survived). Phase 2 (version history) records its snapshots beside
-//! these entries; Phase 3 (lease files) takes the same append-then-commit shape.
+//! these entries; Phase 3 ([`lease`][crate::lease] files) takes the same append-then-commit shape.
 
 use serde::{Deserialize, Serialize};
 

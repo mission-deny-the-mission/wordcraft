@@ -16,11 +16,13 @@
 //!   the local backend stages a sibling temporary file and renames; WebDAV relies on the
 //!   server's single-`PUT` semantics.
 //! - [`StorageBackend::recover`] replays or clears the [`journal`] left by an interrupted write,
-//!   so the next startup lands in a known state. Phase 3 (lease files) builds on the journal.
+//!   so the next startup lands in a known state. Phase 3 adds cooperative TTL [`lease`] files
+//!   beside the document plus conditional writes, so sharing without a server never overwrites.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod journal;
+pub mod lease;
 pub mod local;
 pub mod webdav;
 

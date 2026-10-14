@@ -55,6 +55,24 @@ fn docx_round_trips_ocis_to_session_to_ocis() {
     wordcraft_engine::storage::save_to_storage(&store, &copy, &reopened.doc, None, &opts).expect("PUT copy back to oCIS");
     assert_eq!(store.read(&copy).expect("GET the copy"), expected, "oCIS carried the bytes exactly");
 
+    // A lease makes the sharing story safe: one holder at a time, and the document still
+    // round-trips byte-for-byte after the conditional save.
+    let lease_holder = format!("e2e-{}", std::process::id());
+    let hold = wordcraft_storage::lease::acquire(&store, &tag, &lease_holder, "e2e-test", 120).expect("acquire lease on oCIS");
+    assert!(matches!(
+        wordcraft_storage::lease::status(&store, &tag).expect("lease status"),
+        wordcraft_storage::lease::LeaseStatus::Held(ref l) if l.holder == lease_holder
+    ));
+    // A rival is refused, naming us.
+    let rival = wordcraft_storage::lease::acquire(&store, &tag, "rival", "other-box", 120).unwrap_err();
+    assert!(rival.to_string().contains(&lease_holder), "{rival}");
+    hold.renew(&store, 120).expect("renew the lease over WebDAV");
+    // Conditional save against the current tag, then the merged save round-trips.
+    let tag_now = wordcraft_engine::storage::stat_storage(&store, &tag).expect("stat the document").etag;
+    reopened.save_to_storage_checked(&store, &tag, &opts, tag_now.as_deref()).expect("If-Match save over WebDAV");
+    hold.release(&store).expect("release the lease");
+    assert!(matches!(wordcraft_storage::lease::status(&store, &tag).expect("lease status"), wordcraft_storage::lease::LeaseStatus::Absent));
+
     // Clean up: both files gone afterwards (idempotent remove, then 404 on read).
     store.remove(&tag).expect("DELETE original");
     store.remove(&copy).expect("DELETE copy");

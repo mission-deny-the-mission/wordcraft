@@ -160,12 +160,14 @@ impl StorageBackend for WebDavBackend {
             return Err(self.fail_for("list", &rel, &r));
         }
         let mut entries = parse_propfind(&r.text(), &self.base)?;
-        // The server lists the collection itself first; callers want its children.
+        // The server lists the collection itself first; callers want its children. Lease
+        // sidecars stay hidden, as on the local backend.
         if !rel.is_empty() {
             entries.retain(|e| e.path != rel);
         } else {
             entries.retain(|e| !e.path.is_empty());
         }
+        entries.retain(|e| !e.path.ends_with(".lease"));
         Ok(entries)
     }
 

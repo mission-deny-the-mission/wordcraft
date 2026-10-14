@@ -213,7 +213,12 @@ impl StorageBackend for LocalBackend {
         for ent in rd {
             let ent = ent.map_err(|e| StorageError::Io(e.to_string()))?;
             let name = ent.file_name().to_string_lossy().into_owned();
-            if name.starts_with(".wordcraft-save-") || name.ends_with(".tmp") || name.ends_with(".wc-etag") || name == journal::JOURNAL_FILE {
+            if name.starts_with(".wordcraft-save-")
+                || name.ends_with(".tmp")
+                || name.ends_with(".wc-etag")
+                || name.ends_with(".lease")
+                || name == journal::JOURNAL_FILE
+            {
                 continue;
             }
             let ft = ent.file_type().map_err(|e| StorageError::Io(e.to_string()))?;
