@@ -33,8 +33,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: wordcraft-cli
-          # TODO(storage-sibling): replace with the pushed test-binary tag.
-          image: git.harryslab2.xyz/harry/wordcraft-cli-test:REPLACE-ME
+          # Built from fork branch craft-storage-518-phase01 (release binary).
+          image: git.harryslab2.xyz/harry/wordcraft-cli-test:0.1.0-storage1
           imagePullPolicy: Always
           securityContext:
             allowPrivilegeEscalation: false
