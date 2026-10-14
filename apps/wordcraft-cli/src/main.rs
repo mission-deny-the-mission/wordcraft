@@ -54,7 +54,8 @@ USAGE:
                     collection, e.g. http://ocis.lan:9200/remote.php/dav/files/alice/Docs/
                     (plain http only: LAN, VPN or SSH tunnel; https is refused, see #518).
                     WebDAV auth is Basic (--store-user/--store-password) or an OIDC
-                    Bearer token (--store-token), never both.
+                    Bearer token (--store-token, or $CRAFT_DAV_TOKEN for k8s secretKeyRef),
+                    never both.
   wordcraft-cli --version
 ";
 
@@ -427,6 +428,8 @@ fn open_store(command: &str, args: &[String]) -> Result<Box<dyn wordcraft_storag
             }
             let (user, password, token) =
                 (arg_value(args, "--store-user"), arg_value(args, "--store-password"), arg_value(args, "--store-token"));
+            // k8s-friendly: the token may arrive via env (secretKeyRef) instead of argv.
+            let token = token.or_else(|| std::env::var("CRAFT_DAV_TOKEN").ok().filter(|t| !t.is_empty()));
             if token.is_some() && (user.is_some() || password.is_some()) {
                 return Err(format!("{command}: --store-token cannot be combined with --store-user/--store-password (pick one auth scheme)"));
             }

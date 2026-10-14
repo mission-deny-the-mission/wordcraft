@@ -57,5 +57,9 @@ spec:
                 secretKeyRef:
                   name: craft-storage-test-dav
                   key: token
-          # TODO(storage-sibling): replace with the real StorageBackend self-test invocation.
-          command: ["/wordcraft-cli", "storage-selftest"]
+          # Auth gate for the new binary against the real oCIS endpoint: the token
+          # arrives via $CRAFT_DAV_TOKEN (secretKeyRef above), so no secret on argv.
+          # Full CRUD is covered by job/dav-roundtrip; this validates the binary
+          # speaks Bearer correctly. Requires the §3 provisioning precondition.
+          command: ["/wordcraft-cli", "store-probe", "--store", "webdav",
+                    "--store-url", "http://proxy.ocis.svc.cluster.local:9200/remote.php/dav/files/ocis-e2e-tmp/"]
