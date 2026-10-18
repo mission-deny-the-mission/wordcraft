@@ -436,7 +436,7 @@ fn open_store(command: &str, args: &[String]) -> Result<Box<dyn wordcraft_storag
             let backend = match (token, user, password) {
                 (Some(t), None, None) => wordcraft_storage::webdav::WebDavBackend::with_bearer(&url, &t),
                 (None, u, p) => wordcraft_storage::webdav::WebDavBackend::new(&url, u.as_deref(), p.as_deref()),
-                _ => unreachable!("token/user exclusivity checked above"),
+                _ => return Err(format!("{command}: --store-token cannot be combined with --store-user/--store-password (pick one auth scheme)")),
             };
             backend
                 .map(|b| Box::new(b) as Box<dyn wordcraft_storage::StorageBackend>)
