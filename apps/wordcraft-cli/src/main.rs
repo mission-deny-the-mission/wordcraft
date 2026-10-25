@@ -743,8 +743,7 @@ fn open_store(command: &str, args: &[String]) -> Result<Box<dyn wordcraft_storag
             if arg_value(args, "--store-root").is_some() {
                 return Err(format!("{command}: --store-root is for --store local, not webdav"));
             }
-            let (user, password, token) =
-                (arg_value(args, "--store-user"), arg_value(args, "--store-password"), arg_value(args, "--store-token"));
+            let (user, password, token) = (arg_value(args, "--store-user"), arg_value(args, "--store-password"), arg_value(args, "--store-token"));
             // The token may arrive via the environment instead of argv, where other processes can read it.
             let token = token.or_else(|| std::env::var("CRAFT_DAV_TOKEN").ok().filter(|t| !t.is_empty()));
             if token.is_some() && (user.is_some() || password.is_some()) {
@@ -755,9 +754,7 @@ fn open_store(command: &str, args: &[String]) -> Result<Box<dyn wordcraft_storag
                 (None, u, p) => wordcraft_storage::webdav::WebDavBackend::new(&url, u.as_deref(), p.as_deref()),
                 _ => return Err(format!("{command}: --store-token cannot be combined with --store-user/--store-password (pick one auth scheme)")),
             };
-            backend
-                .map(|b| Box::new(b) as Box<dyn wordcraft_storage::StorageBackend>)
-                .map_err(|e| format!("{command}: {e}"))
+            backend.map(|b| Box::new(b) as Box<dyn wordcraft_storage::StorageBackend>).map_err(|e| format!("{command}: {e}"))
         }
         other => Err(format!("{command}: unknown --store `{other}` (local or webdav)")),
     }
@@ -773,10 +770,11 @@ fn store_command(command: &str, rest: &[String]) -> Result<(), Failure> {
             let (path, file) = (pos(0)?, pos(1)?);
             wordcraft_engine::file_access::check_read(&file).map_err(Failure::Error)?;
             let bytes = std::fs::read(&file).map_err(|e| Failure::Error(format!("{file}: {e}")))?;
-            let opts =
-                wordcraft_storage::WriteOptions { if_match: arg_value(rest, "--etag"), atomic: rest.iter().any(|a| a == "--atomic") };
+            let opts = wordcraft_storage::WriteOptions { if_match: arg_value(rest, "--etag"), atomic: rest.iter().any(|a| a == "--atomic") };
             let meta = store.write(&path, &bytes, &opts).map_err(|e| Failure::Error(format!("{path}: {e}")))?;
-            write_stdout(|o| writeln!(o, "{}", serde_json::to_string_pretty(&json!({"path": path, "size": meta.size, "etag": meta.etag})).unwrap_or_default()))?;
+            write_stdout(|o| {
+                writeln!(o, "{}", serde_json::to_string_pretty(&json!({"path": path, "size": meta.size, "etag": meta.etag})).unwrap_or_default())
+            })?;
             eprintln!("wrote {path} ({} bytes)", bytes.len());
             Ok(())
         }
@@ -795,8 +793,10 @@ fn store_command(command: &str, rest: &[String]) -> Result<(), Failure> {
                 writeln!(
                     o,
                     "{}",
-                    serde_json::to_string_pretty(&json!({"path": path, "size": meta.size, "etag": meta.etag, "modified": meta.modified, "isDir": meta.is_dir}))
-                        .unwrap_or_default()
+                    serde_json::to_string_pretty(
+                        &json!({"path": path, "size": meta.size, "etag": meta.etag, "modified": meta.modified, "isDir": meta.is_dir})
+                    )
+                    .unwrap_or_default()
                 )
             })
         }
@@ -836,8 +836,10 @@ fn store_command(command: &str, rest: &[String]) -> Result<(), Failure> {
                 writeln!(
                     o,
                     "{}",
-                    serde_json::to_string_pretty(&json!({"completed": report.completed, "dropped": report.dropped, "removedTemp": report.removed_temp}))
-                        .unwrap_or_default()
+                    serde_json::to_string_pretty(
+                        &json!({"completed": report.completed, "dropped": report.dropped, "removedTemp": report.removed_temp})
+                    )
+                    .unwrap_or_default()
                 )
             })
         }
@@ -919,15 +921,38 @@ mod tests {
 
     #[test]
     fn store_flags_open_the_right_backend_or_explain() {
-        assert!(validate_options("store-write", &args(&["a.docx", "f.docx", "--store", "local", "--store-root", "x", "--etag", "t", "--atomic"]), STORE_OPTIONS).is_ok());
-        assert!(validate_options("store-probe", &args(&["--store", "webdav", "--store-url", "http://h/dav/", "--store-user", "u", "--store-password", "p"]), STORE_OPTIONS).is_ok());
+        assert!(
+            validate_options(
+                "store-write",
+                &args(&["a.docx", "f.docx", "--store", "local", "--store-root", "x", "--etag", "t", "--atomic"]),
+                STORE_OPTIONS
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_options(
+                "store-probe",
+                &args(&["--store", "webdav", "--store-url", "http://h/dav/", "--store-user", "u", "--store-password", "p"]),
+                STORE_OPTIONS
+            )
+            .is_ok()
+        );
         assert!(validate_options("store-list", &args(&["--bogus"]), STORE_OPTIONS).is_err());
         assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/"])).is_ok());
         assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "https://h/dav/"])).is_err());
         // Bearer token: accepted alone, rejected with user/password, rejected empty.
-        assert!(validate_options("store-probe", &args(&["--store", "webdav", "--store-url", "http://h/dav/", "--store-token", "t"]), STORE_OPTIONS).is_ok());
+        assert!(
+            validate_options("store-probe", &args(&["--store", "webdav", "--store-url", "http://h/dav/", "--store-token", "t"]), STORE_OPTIONS)
+                .is_ok()
+        );
         assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/", "--store-token", "t"])).is_ok());
-        assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/", "--store-token", "t", "--store-user", "u"])).is_err());
+        assert!(
+            open_store(
+                "store-probe",
+                &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/", "--store-token", "t", "--store-user", "u"])
+            )
+            .is_err()
+        );
         assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/", "--store-token", ""])).is_err());
         assert!(open_store("store-probe", &args(&[])).is_err());
         assert!(open_store("store-probe", &args(&["--store", "tape"])).is_err());
@@ -936,7 +961,10 @@ mod tests {
 
     #[test]
     fn store_positionals_skip_option_values_wherever_they_appear() {
-        assert_eq!(positionals(&args(&["--store", "local", "--store-root", "r", "a.docx", "f.docx", "--atomic"]), STORE_OPTIONS), vec!["a.docx", "f.docx"]);
+        assert_eq!(
+            positionals(&args(&["--store", "local", "--store-root", "r", "a.docx", "f.docx", "--atomic"]), STORE_OPTIONS),
+            vec!["a.docx", "f.docx"]
+        );
         assert_eq!(positionals(&args(&["a.docx", "--etag", "t"]), STORE_OPTIONS), vec!["a.docx"]);
         assert!(positionals(&args(&["--atomic"]), STORE_OPTIONS).is_empty());
     }

@@ -160,11 +160,7 @@ impl StorageBackend for LocalBackend {
         let rel = clean_path(path)?;
         let dest = self.root.join(&rel);
         fs::read(&dest).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound(rel)
-            } else {
-                StorageError::Io(format!("{}: {e}", dest.display()))
-            }
+            if e.kind() == std::io::ErrorKind::NotFound { StorageError::NotFound(rel) } else { StorageError::Io(format!("{}: {e}", dest.display())) }
         })
     }
 
@@ -376,7 +372,8 @@ mod tests {
     fn no_half_file_visible() {
         let (_tmp, b) = backend();
         b.write("a/b/c.txt", b"hello", &WriteOptions { atomic: true, ..Default::default() }).unwrap();
-        let leftovers: Vec<_> = fs::read_dir(b.root()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(".wordcraft-save-")).collect();
+        let leftovers: Vec<_> =
+            fs::read_dir(b.root()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(".wordcraft-save-")).collect();
         assert!(leftovers.is_empty());
         assert_eq!(b.list("a/b").unwrap().len(), 1);
     }

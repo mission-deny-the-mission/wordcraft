@@ -20,8 +20,8 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use base64::Engine as _;
 use crate::{Capabilities, Entry, FileMeta, ProbeReport, RecoveryReport, StorageBackend, StorageError, WriteOptions, clean_path};
+use base64::Engine as _;
 
 /// Talk timeout per connection phase (connect, write, read). WebDAV runs on LANs and localhost;
 /// a hung server must not hang a save longer than this per phase.
@@ -236,7 +236,11 @@ fn ensure_parents(b: &WebDavBackend, rel: &str) -> Result<(), StorageError> {
 /// Split `http://host[:port][/base]` into parts. Anything else (notably `https://`) is refused:
 /// this build speaks plain HTTP only.
 fn split_url(url: &str) -> Result<(String, u16, String), StorageError> {
-    let rest = url.strip_prefix("http://").ok_or_else(|| StorageError::Unsupported(format!("{url}: only http:// URLs are supported in this build (no TLS); serve WebDAV over a trusted network or tunnel")))?;
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        StorageError::Unsupported(format!(
+            "{url}: only http:// URLs are supported in this build (no TLS); serve WebDAV over a trusted network or tunnel"
+        ))
+    })?;
     let (authority, base) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, "/".to_string()),
@@ -318,8 +322,11 @@ fn read_response(sock: &mut TcpStream) -> Result<Response, StorageError> {
     let head = String::from_utf8_lossy(&raw[..split]).into_owned();
     let mut lines = head.lines();
     let status_line = lines.next().ok_or_else(|| StorageError::Protocol("empty response".into()))?;
-    let status: u16 =
-        status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or_else(|| StorageError::Protocol(format!("bad status line: {status_line}")))?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| StorageError::Protocol(format!("bad status line: {status_line}")))?;
     let mut headers = Vec::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
@@ -479,7 +486,10 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
             out.push(h * 16 + l);
             i += 3;
             continue;
@@ -523,8 +533,14 @@ mod tests {
         let stat_xml = r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/docs/memo.docx</d:href><d:propstat><d:prop><d:getcontentlength>5</d:getcontentlength><d:getetag>"abc123"</d:getetag><d:resourcetype/></d:prop></d:propstat></d:response></d:multistatus>"#.to_string();
         let put_resp = "HTTP/1.1 201 Created\r\nETag: \"abc123\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
         let get_resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_string();
-        let propfind_stat = format!("HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{stat_xml}", stat_xml.len());
-        let propfind_list = format!("HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{list_xml}", list_xml.len());
+        let propfind_stat = format!(
+            "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{stat_xml}",
+            stat_xml.len()
+        );
+        let propfind_list = format!(
+            "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{list_xml}",
+            list_xml.len()
+        );
         let del_resp = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -569,7 +585,11 @@ mod tests {
                 let request_line = head.lines().next().unwrap_or("").to_string();
                 let key = request_line.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
                 seen2.lock().unwrap().push(request_line.clone());
-                let body = responses.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone()).unwrap_or_else(|| "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string());
+                let body = responses
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string());
                 let _ = stream.write_all(body.as_bytes());
             }
         });
@@ -613,11 +633,7 @@ mod tests {
                 }
             }
             let head = String::from_utf8_lossy(&req).into_owned();
-            let auth = head
-                .lines()
-                .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-                .unwrap_or("")
-                .to_string();
+            let auth = head.lines().find(|l| l.to_ascii_lowercase().starts_with("authorization:")).unwrap_or("").to_string();
             let _ = tx.send(auth);
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nDAV: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         });
