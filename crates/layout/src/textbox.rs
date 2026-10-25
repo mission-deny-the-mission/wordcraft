@@ -14,7 +14,7 @@ use wordcraft_doc::props::{TextDirection, TextVert, VAlign};
 use wordcraft_doc::{Block, Blocks, Path, StoryRef, TextBody};
 use wordcraft_geom::Rect;
 
-use crate::{Ctx, Placed, fit_box, layout_box};
+use crate::{BoxContext, Ctx, Placed, fit_box, layout_box};
 
 /// Linked text boxes for one layout, worked out when a linked box is first laid out.
 #[derive(Default)]
@@ -90,9 +90,9 @@ fn lay(ctx: &mut Ctx, id: u32, blocks: &Blocks, len: f32, vert: TextVert, depth:
                 _ => b.clone(),
             })
             .collect();
-        return layout_box(ctx, story, &stacked, &[], STACK_WIDTH, None, depth + 1, None).items;
+        return layout_box(ctx, story, &stacked, &[], STACK_WIDTH, BoxContext::Other, depth + 1, None).items;
     }
-    layout_box(ctx, story, blocks, &[], len, None, depth + 1, None).items
+    layout_box(ctx, story, blocks, &[], len, BoxContext::Other, depth + 1, None).items
 }
 
 /// The items showing text box `id` in its frame `rect` (page coordinates): its text, or its
@@ -115,6 +115,30 @@ pub(crate) fn box_items(ctx: &mut Ctx, id: u32, rect: Rect, depth: usize) -> Vec
         }
     };
     place(items, &body, rect, across)
+}
+
+/// The height of a `w` wide text box `id` that resizes to fit its text (`a:spAutoFit`): its text's
+/// depth plus its top and bottom margins, as Word fits it when laying the document out. `None`
+/// for a box that keeps its own height: one that doesn't resize, with turned text, or linked.
+pub(crate) fn fitted_height(ctx: &mut Ctx, id: u32, w: f32) -> Option<f32> {
+    let body = ctx.doc.parts.get(&id).map(|p| p.body)?;
+    if !body.auto_fit || body.vert.turn() != TextDirection::Horizontal || body.next.is_some() {
+        return None;
+    }
+    ctx.chains.build(ctx.doc);
+    if ctx.chains.member.contains_key(&id) || !ctx.boxes.enter(id) {
+        return None;
+    }
+    let blocks = ctx.doc.parts.get(&id).map(|p| p.blocks.clone()).unwrap_or_default();
+    let (len, _) = frame(&body, w, 0.0);
+    // Measuring doesn't count the box's list numbers and equations: `box_items` lays it out again.
+    let snap = (ctx.counters.clone(), ctx.eq_count);
+    let items = lay(ctx, id, &blocks, len, body.vert, 0);
+    (ctx.counters, ctx.eq_count) = snap;
+    ctx.boxes.leave();
+    let [_, t, _, b] = body.insets_pt();
+    let h = extent(&items) + t + b;
+    h.is_finite().then_some(h)
 }
 
 /// Move items laid out in a box's frame onto the page: aligned in the `across` room (top,

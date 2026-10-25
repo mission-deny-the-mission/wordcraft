@@ -2,9 +2,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod automation_args;
+mod script;
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde_json::{Value, json};
@@ -14,17 +17,26 @@ const USAGE: &str = "\
 wordcraft-cli — WordCraft from the command line
 
 USAGE:
-  wordcraft-cli convert <in> <out> [--markup]
-                                              convert between formats (docx, doc [read], pdf, odt, rtf, html, md, tex, txt, json, png);
+  wordcraft-cli convert <in> <out> [--markup] [--update-fields] [--format wordml2003|flatopc]
+                                              convert between formats (docx, doc [read], pdf, odt, rtf, html, md, tex, txt, json, png,
+                                              xml); --update-fields refreshes unlocked fields before saving;
+                                              an .xml file is a Word XML Document (Flat OPC), or with
+                                              --format wordml2003 a Word 2003 XML Document;
                                               --markup (Print Markup): comments beside each page and
                                               tracked changes in pdf/png, a comment list in html/md/txt
   wordcraft-cli info <file>                   pages, words, paragraphs, properties (JSON)
   wordcraft-cli text <file>                   plain text
   wordcraft-cli inspect <file>                document structure (JSON)
   wordcraft-cli render <file> <out.png> [--page N] [--scale S]
-  wordcraft-cli run [--file F | --template T] --cmd 'id={json}' [--cmd …] [--save OUT] [--print]
-                    [--author NAME]           run commands headlessly, then save (--author names
-                                              who tracked changes and comments are by)
+  wordcraft-cli run [--file F | --template T] [--script FILE|-] --cmd 'id={json}' [--cmd …]
+                    [--save OUT] [--print] [--author NAME]
+                                              run commands headlessly, then save (--author names
+                                              who tracked changes and comments are by).
+                                              --script runs a JSON file (- is stdin) first:
+                                              {\"file\"?, \"template\"?, \"commands\": [{\"command\": id,
+                                              \"params\"?: {…}} | id, …], \"save\"?: [OUT, …]}; save
+                                              formats follow the extension (docx and pdf in one run);
+                                              relative paths resolve against the script's folder
   wordcraft-cli commands [--json]             list every command
   wordcraft-cli parity [--markdown]           feature-catalog parity
   wordcraft-cli mcp [--connect HOST:PORT | --author NAME] [--automation-read-root DIR] [--automation-write-root DIR]
@@ -54,25 +66,214 @@ USAGE:
                     collection, e.g. http://ocis.lan:9200/remote.php/dav/files/alice/Docs/
                     (plain http only: LAN, VPN or SSH tunnel; https is refused, see #518).
                     WebDAV auth is Basic (--store-user/--store-password) or an OIDC
-                    Bearer token (--store-token, or $CRAFT_DAV_TOKEN for k8s secretKeyRef),
+                    Bearer token (--store-token, or $CRAFT_DAV_TOKEN to keep it off argv),
                     never both.
+  wordcraft-cli [<command>] -h | --help       this help
   wordcraft-cli --version
+
+A password-protected Word file is opened with --password PASS, --password-file PATH or the
+WORDCRAFT_PASSWORD environment variable; a password given on the command line is readable by
+every other process, so the other two are better. A file opened with a password is written with
+it again, as the app does. Exports that cannot carry a password (pdf, html, txt) stay plain.
+
+Paper: documents created here, and HTML, Markdown and text files (which give no page size), use
+the system region's paper (A4, or Letter in the US and other Letter regions), read from
+LC_ALL / LC_PAPER / LANG or the platform. Set WORDCRAFT_REGION=en-US (or another tag) for the
+same output on every machine.
 ";
 
-fn open(path: &str) -> Result<Session, String> {
-    let doc = wordcraft_engine::io::open_path(std::path::Path::new(path))?;
-    let mut s = Session::new(doc);
+/// The subcommands, in `USAGE` order; `--help` or `-h` after any of them prints `USAGE` (#968).
+const SUBCOMMANDS: &[&str] = &[
+    "convert",
+    "info",
+    "text",
+    "inspect",
+    "render",
+    "run",
+    "commands",
+    "parity",
+    "mcp",
+    "zotero",
+    "store-write",
+    "store-read",
+    "store-stat",
+    "store-list",
+    "store-remove",
+    "store-probe",
+    "store-recover",
+];
+
+fn wants_help(cmd: &str, rest: &[String]) -> bool {
+    SUBCOMMANDS.contains(&cmd) && rest.iter().any(|a| a == "--help" || a == "-h")
+}
+
+/// The error every subcommand gives when a required path is not there.
+fn missing_argument() -> Failure {
+    format!("missing argument\n\n{USAGE}").into()
+}
+
+/// Open a document for a subcommand. A password-protected Word file needs its password
+/// ([`password_from`]). As in the app, a document opened with one is saved with it again, so
+/// `convert` does not quietly write a copy the password no longer protects.
+fn open(path: &Path, password: Option<&str>) -> Result<Session, String> {
+    // A file that gives no page size (HTML, Markdown, plain text) opens on the system region's
+    // paper, as in the app: A4 in Italy, Letter in the US (#1381).
+    let region = system_region();
+    let (doc, encrypted) = wordcraft_engine::io::open_path_in(path, password, &region)?;
+    let mut s = session(doc);
     s.path = Some(path.into());
+    if encrypted {
+        s.password = password.map(wordcraft_engine::io::Password::new);
+    }
     Ok(s)
 }
 
+/// The commands that open a file, and which of their arguments not starting with `--` it is (as
+/// `pos` counts). `run` opens the value of `--file`.
+const OPENS_FILE: &[(&str, usize)] = &[("convert", 0), ("info", 0), ("text", 0), ("inspect", 0), ("render", 0), ("zotero", 1)];
+
+/// The arguments as text. Only the file the command opens may have a name that isn't valid Unicode,
+/// such as a Latin-1 one (#1440): it comes back as the path to open, and lossy among the arguments.
+/// Any other such argument is an error naming it.
+fn text_args<S: AsRef<OsStr>>(raw: &[S]) -> Result<(Vec<String>, Option<PathBuf>), String> {
+    let args: Vec<String> = raw.iter().map(|a| a.as_ref().to_string_lossy().into_owned()).collect();
+    let cmd = args.first().map(String::as_str).unwrap_or("");
+    let file_at = match OPENS_FILE.iter().find(|(c, _)| *c == cmd) {
+        Some((_, n)) => args.iter().enumerate().skip(1).filter(|(_, a)| !a.starts_with("--")).nth(*n).map(|(i, _)| i),
+        None if cmd == "run" => args.iter().position(|a| a == "--file").map(|i| i + 1),
+        None => None,
+    };
+    // `run --script FILE` may also name its script with such a file name.
+    let script_at = if cmd == "run" { args.iter().position(|a| a == "--script").map(|i| i + 1) } else { None };
+    let mut file = None;
+    for (i, a) in raw.iter().map(AsRef::as_ref).enumerate() {
+        if a.to_str().is_none() {
+            if Some(i) != file_at && Some(i) != script_at {
+                return Err(format!("argument {} is not valid Unicode: {}", i + 1, a.to_string_lossy()));
+            }
+            if Some(i) == file_at {
+                file = Some(PathBuf::from(a));
+            }
+        }
+    }
+    Ok((args, file))
+}
+
+/// The password for a protected Word file: `--password`, `--password-file`, or
+/// `WORDCRAFT_PASSWORD`, in that order. The file form exists because a password on a command line
+/// is readable by every other process on the machine; a trailing newline is dropped so a file
+/// written by `echo` works. Never logged, and never named in an error.
+fn password_from(args: &[String]) -> Result<Option<String>, String> {
+    if let Some(password) = arg_value(args, "--password") {
+        return Ok(Some(password));
+    }
+    if let Some(path) = arg_value(args, "--password-file") {
+        let raw = std::fs::read_to_string(&path).map_err(|e| format!("--password-file {path}: {e}"))?;
+        return Ok(Some(raw.trim_end_matches(['\r', '\n']).to_string()));
+    }
+    Ok(std::env::var("WORDCRAFT_PASSWORD").ok().filter(|p| !p.is_empty()))
+}
+
+/// The positional arguments, skipping every option's value so an option value is never read as a
+/// path. Mirrors [`validate_options`], which has already checked the options are known.
+fn positionals<'a>(args: &'a [String], specs: &[OptionSpec]) -> Vec<&'a String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let takes_value =
+            arg.starts_with("--") && specs.iter().any(|s| s.name == arg && s.takes_value) && args.get(i + 1).is_some_and(|v| !v.starts_with("--"));
+        if takes_value {
+            i += 2;
+        } else {
+            if !arg.starts_with("--") {
+                out.push(arg);
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A headless session in the system region: every way the CLI starts one gives `file.new` the
+/// same paper (#1381).
+fn session(doc: wordcraft_doc::Document) -> Session {
+    let mut s = Session::new(doc);
+    s.system_region = system_region();
+    s
+}
+
+/// The system region, read as the app reads it (locale variables, else the platform's locale).
+fn system_region() -> wordcraft_engine::Region {
+    wordcraft_engine::Region::from_locale_vars(|name| std::env::var(name).ok(), sys_locale::get_locale)
+}
+
+/// The body text for `text`: the plain-text export, so list items keep their bullet or number label.
+fn listed_text(doc: &wordcraft_doc::Document) -> Result<String, String> {
+    let bytes = wordcraft_engine::io::save_bytes("out.txt", doc)?;
+    Ok(String::from_utf8_lossy(&bytes).replace("\r\n", "\n"))
+}
+
 /// `--author NAME`: the author recorded on tracked changes and comments (`file.setAuthor`).
+/// The command also checks whether the open document is protected: this name determines which
+/// named editing exceptions the session can use, so the flag must not bypass that check.
 fn set_author(s: &mut Session, name: &str) -> Result<(), String> {
     s.run("file.setAuthor", &json!({"name": name})).map(|_| ()).map_err(|e| format!("--author: {e}"))
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+
+enum OptionArg<'a> {
+    Absent,
+    Duplicate,
+    MissingValue,
+    Value(&'a str),
+}
+
+fn find_option_arg<'a>(args: &'a [String], name: &str) -> OptionArg<'a> {
+    let mut matches = args.iter().enumerate().filter(|(_, a)| *a == name);
+    let Some((i, _)) = matches.next() else {
+        return OptionArg::Absent;
+    };
+    if matches.next().is_some() {
+        return OptionArg::Duplicate;
+    }
+    match args.get(i + 1) {
+        None => OptionArg::MissingValue,
+        Some(val) if val.starts_with("--") => OptionArg::MissingValue,
+        Some(val) => OptionArg::Value(val.as_str()),
+    }
+}
+
+fn parse_page_arg(command: &str, args: &[String]) -> Result<Option<u64>, String> {
+    match find_option_arg(args, "--page") {
+        OptionArg::Absent => Ok(None),
+        OptionArg::Duplicate => Err(format!("{command}: duplicate --page option")),
+        OptionArg::MissingValue => Err(format!("{command}: --page requires a value")),
+        OptionArg::Value(val) => {
+            let n = val.parse::<u64>().map_err(|_| format!("{command}: invalid --page `{val}`: not a valid integer"))?;
+            if n == 0 {
+                return Err(format!("{command}: invalid --page `0`: page numbers start at 1"));
+            }
+            Ok(Some(n))
+        }
+    }
+}
+
+fn parse_scale_arg(command: &str, args: &[String]) -> Result<Option<f64>, String> {
+    match find_option_arg(args, "--scale") {
+        OptionArg::Absent => Ok(None),
+        OptionArg::Duplicate => Err(format!("{command}: duplicate --scale option")),
+        OptionArg::MissingValue => Err(format!("{command}: --scale requires a value")),
+        OptionArg::Value(val) => {
+            let scale = val.parse::<f64>().map_err(|_| format!("{command}: invalid --scale `{val}`: not a number"))?;
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(format!("{command}: invalid --scale `{val}`: scale must be a positive number"));
+            }
+            Ok(Some(scale))
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -120,13 +321,30 @@ fn automation_roots(
     Ok((roots, left))
 }
 
-const NO_OPTIONS: &[OptionSpec] = &[];
-const CONVERT_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--markup", takes_value: false }];
-const RENDER_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--page", takes_value: true }, OptionSpec { name: "--scale", takes_value: true }];
+/// The password a protected Word file is opened with: `--password` (which any other process on
+/// the machine can read from the command line), `--password-file`, or `WORDCRAFT_PASSWORD`.
+const PASSWORD_OPTIONS: &[OptionSpec] =
+    &[OptionSpec { name: "--password", takes_value: true }, OptionSpec { name: "--password-file", takes_value: true }];
+const CONVERT_OPTIONS: &[OptionSpec] = &[
+    OptionSpec { name: "--markup", takes_value: false },
+    OptionSpec { name: "--format", takes_value: true },
+    OptionSpec { name: "--update-fields", takes_value: false },
+    OptionSpec { name: "--password", takes_value: true },
+    OptionSpec { name: "--password-file", takes_value: true },
+];
+const RENDER_OPTIONS: &[OptionSpec] = &[
+    OptionSpec { name: "--page", takes_value: true },
+    OptionSpec { name: "--scale", takes_value: true },
+    OptionSpec { name: "--password", takes_value: true },
+    OptionSpec { name: "--password-file", takes_value: true },
+];
 const RUN_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--file", takes_value: true },
+    OptionSpec { name: "--password", takes_value: true },
+    OptionSpec { name: "--password-file", takes_value: true },
     OptionSpec { name: "--template", takes_value: true },
     OptionSpec { name: "--cmd", takes_value: true },
+    OptionSpec { name: "--script", takes_value: true },
     OptionSpec { name: "--save", takes_value: true },
     OptionSpec { name: "--page", takes_value: true },
     OptionSpec { name: "--scale", takes_value: true },
@@ -199,64 +417,131 @@ fn write_stdout(write: impl FnOnce(&mut std::io::StdoutLock<'static>) -> std::io
     Ok(())
 }
 
-fn run(args: &[String]) -> Result<(), Failure> {
+/// The operand after `--script`, by its real name (it may not be valid Unicode).
+fn script_operand<S: AsRef<OsStr>>(raw: &[S]) -> Option<PathBuf> {
+    let at = raw.iter().position(|a| a.as_ref() == OsStr::new("--script"))?;
+    raw.get(at + 1).map(|a| PathBuf::from(a.as_ref()))
+}
+
+/// Whether `addr` (`HOST:PORT`, as `--connect` gives it) is at least shaped like an address: a
+/// host of some kind and a numeric port. Malformed addresses fail at startup — a lazy remote
+/// would otherwise retry one on every call and never say why nothing connects.
+fn valid_connect_addr(addr: &str) -> bool {
+    let Some((host, port)) = addr.rsplit_once(':') else { return false };
+    !host.is_empty() && port.parse::<u16>().is_ok()
+}
+
+fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
+    let script_path = script_operand(args);
+    let (args, file) = text_args(args)?;
+    // Opens the file by its real name, which its text in `args` may have lost, and with the
+    // password of a protected document (`password_from`).
+    let open = |text: &str, password: Option<&str>| open(file.as_deref().unwrap_or(Path::new(text)), password);
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
-    let pos = |i: usize| rest.iter().filter(|a| !a.starts_with("--")).nth(i).cloned().ok_or_else(|| format!("missing argument\n\n{USAGE}"));
+    // Before options are checked or files and folders opened.
+    if wants_help(cmd, &rest) {
+        return write_stdout(|o| write!(o, "{USAGE}"));
+    }
     match cmd {
         "convert" => {
             validate_options("convert", &rest, CONVERT_OPTIONS)?;
-            let (i, o) = (pos(0)?, pos(1)?);
+            // `--format wordml2003` (or `flatopc`) picks the kind of `.xml` file; its value isn't a path.
+            let format = arg_value(&rest, "--format");
+            let paths = positionals(&rest, CONVERT_OPTIONS);
+            let (i, o) = (paths.first().ok_or_else(missing_argument)?.to_string(), paths.get(1).ok_or_else(missing_argument)?.to_string());
             let markup = rest.iter().any(|a| a == "--markup");
-            let mut s = open(&i)?;
+            let password = password_from(&rest)?;
+            let mut s = open(&i, password.as_deref())?;
+            if rest.iter().any(|a| a == "--update-fields") {
+                s.run("references.updateFields", &json!({})).map_err(|e| e.to_string())?;
+            }
             let r = if o.to_ascii_lowercase().ends_with(".png") {
                 s.run("file.exportPng", &json!({"path": o, "page": 1, "markup": markup}))
             } else {
-                s.run("file.save", &json!({"path": o, "markup": markup}))
+                let mut params = json!({"path": o, "markup": markup});
+                if let Some(f) = format {
+                    params["format"] = json!(f);
+                }
+                s.run("file.save", &params)
             };
             r.map_err(|e| e.to_string())?;
             eprintln!("wrote {o}");
             Ok(())
         }
         "info" => {
-            validate_options("info", &rest, NO_OPTIONS)?;
-            let mut s = open(&pos(0)?)?;
+            validate_options("info", &rest, PASSWORD_OPTIONS)?;
+            let paths = positionals(&rest, PASSWORD_OPTIONS);
+            let password = password_from(&rest)?;
+            let mut s = open(paths.first().ok_or_else(missing_argument)?, password.as_deref())?;
             let info = serde_json::to_string_pretty(&s.run("file.info", &json!({})).map_err(|e| e.to_string())?).unwrap_or_default();
             write_stdout(|o| writeln!(o, "{info}"))
         }
         "text" => {
-            validate_options("text", &rest, NO_OPTIONS)?;
-            let s = open(&pos(0)?)?;
-            write_stdout(|o| writeln!(o, "{}", s.doc.plain_text(wordcraft_doc::StoryRef::Body)))
+            validate_options("text", &rest, PASSWORD_OPTIONS)?;
+            let paths = positionals(&rest, PASSWORD_OPTIONS);
+            let password = password_from(&rest)?;
+            let s = open(paths.first().ok_or_else(missing_argument)?, password.as_deref())?;
+            let text = listed_text(&s.doc)?;
+            write_stdout(|o| writeln!(o, "{text}"))
         }
         "inspect" => {
-            validate_options("inspect", &rest, NO_OPTIONS)?;
-            let mut s = open(&pos(0)?)?;
+            validate_options("inspect", &rest, PASSWORD_OPTIONS)?;
+            let paths = positionals(&rest, PASSWORD_OPTIONS);
+            let password = password_from(&rest)?;
+            let mut s = open(paths.first().ok_or_else(missing_argument)?, password.as_deref())?;
             let tree = serde_json::to_string_pretty(&s.run("document.inspect", &json!({})).map_err(|e| e.to_string())?).unwrap_or_default();
             write_stdout(|o| writeln!(o, "{tree}"))
         }
         "render" => {
             validate_options("render", &rest, RENDER_OPTIONS)?;
-            let (i, o) = (pos(0)?, pos(1)?);
-            let mut s = open(&i)?;
-            let page = arg_value(&rest, "--page").and_then(|p| p.parse::<u64>().ok()).unwrap_or(1);
-            let scale = arg_value(&rest, "--scale").and_then(|p| p.parse::<f64>().ok()).unwrap_or(2.0);
+            let paths = positionals(&rest, RENDER_OPTIONS);
+            let password = password_from(&rest)?;
+            let (Some(i), Some(o)) = (paths.first(), paths.get(1)) else {
+                return Err(missing_argument());
+            };
+            let (i, o) = (i.to_string(), o.to_string());
+            let page = parse_page_arg("render", &rest)?.unwrap_or(1);
+            let scale = parse_scale_arg("render", &rest)?.unwrap_or(2.0);
+            let mut s = open(&i, password.as_deref())?;
             let r = s.run("file.exportPng", &json!({"path": o, "page": page, "scale": scale})).map_err(|e| e.to_string())?;
             write_stdout(|o| writeln!(o, "{r}"))
         }
         "run" => {
             validate_options("run", &rest, RUN_OPTIONS)?;
-            let mut s = match (arg_value(&rest, "--file"), arg_value(&rest, "--template")) {
-                (Some(f), _) => open(&f)?,
-                (None, Some(t)) => {
-                    let mut s = Session::new(wordcraft_doc::Document::new());
-                    s.run("file.new", &json!({"template": t})).map_err(|e| e.to_string())?;
+            let page = parse_page_arg("run", &rest)?;
+            let scale = parse_scale_arg("run", &rest)?;
+            let password = password_from(&rest)?;
+            let script = match arg_value(&rest, "--script") {
+                Some(path) if !path.starts_with("--") => Some(script::load(script_path.as_deref().unwrap_or(Path::new(&path)))?),
+                _ if rest.iter().any(|a| a == "--script") => return Err("run: --script requires a value".into()),
+                _ => None,
+            };
+            // A source named on the command line wins over both of the script's.
+            let (mut from_file, mut from_template) = (arg_value(&rest, "--file"), arg_value(&rest, "--template"));
+            if from_file.is_none() && from_template.is_none() {
+                from_file = script.as_ref().and_then(|c| c.file.clone());
+                from_template = script.as_ref().and_then(|c| c.template.clone());
+            }
+            let mut s = match (from_file, from_template) {
+                (Some(f), _) => open(&f, password.as_deref())?,
+                // Both go through `file.new`, which puts a blank document on the region's paper (#3152).
+                (None, t) => {
+                    let mut s = session(wordcraft_doc::Document::new());
+                    let params = t.map_or_else(|| json!({}), |t| json!({"template": t}));
+                    s.run("file.new", &params).map_err(|e| e.to_string())?;
                     s
                 }
-                _ => Session::new(wordcraft_doc::Document::new()),
             };
             if let Some(name) = arg_value(&rest, "--author") {
                 set_author(&mut s, &name)?;
+            }
+            let print = rest.iter().any(|a| a == "--print");
+            for (n, (id, params)) in script.iter().flat_map(|c| c.commands.iter()).enumerate() {
+                let r = s.run(id, params).map_err(|e| format!("command {} ({id}): {e}", n + 1))?;
+                if print {
+                    write_stdout(|o| writeln!(o, "{id}: {r}"))?;
+                }
             }
             let mut i = 0;
             while i < rest.len() {
@@ -267,7 +552,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
                         None => (spec.clone(), json!({})),
                     };
                     let r = s.run(&id, &params).map_err(|e| format!("{id}: {e}"))?;
-                    if rest.iter().any(|a| a == "--print") {
+                    if print {
                         write_stdout(|o| writeln!(o, "{id}: {r}"))?;
                     }
                     i += 2;
@@ -275,13 +560,27 @@ fn run(args: &[String]) -> Result<(), Failure> {
                     i += 1;
                 }
             }
-            if let Some(out) = arg_value(&rest, "--save") {
+            let outputs: Vec<String> = script.iter().flat_map(|c| c.save.iter().cloned()).chain(arg_value(&rest, "--save")).collect();
+            // Check every output can be made before writing any, so a bad one leaves no half-done job.
+            for out in &outputs {
+                let parent = Path::new(out).parent().filter(|p| !p.as_os_str().is_empty());
+                if let Some(p) = parent.filter(|p| !p.is_dir()) {
+                    return Err(format!("{out}: folder {} does not exist", p.display()).into());
+                }
+                if Path::new(out).is_dir() {
+                    return Err(format!("{out}: is a folder, not a file").into());
+                }
+                if !out.to_ascii_lowercase().ends_with(".png") {
+                    wordcraft_engine::io::save_bytes(out, &s.doc)?;
+                }
+            }
+            for out in outputs {
                 let r = if out.to_ascii_lowercase().ends_with(".png") {
                     let mut v = json!({"path": out});
-                    if let Some(n) = arg_value(&rest, "--page").and_then(|p| p.parse::<u64>().ok()) {
+                    if let Some(n) = page {
                         v["page"] = json!(n);
                     }
-                    if let Some(k) = arg_value(&rest, "--scale").and_then(|p| p.parse::<f64>().ok()) {
+                    if let Some(k) = scale {
                         v["scale"] = json!(k);
                     }
                     s.run("file.exportPng", &v)
@@ -295,7 +594,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
         }
         "commands" => {
             validate_options("commands", &rest, COMMANDS_OPTIONS)?;
-            let s = Session::new(wordcraft_doc::Document::new());
+            let s = session(wordcraft_doc::Document::new());
             if rest.iter().any(|a| a == "--json") {
                 let list = serde_json::to_string_pretty(&s.registry.describe()).unwrap_or_default();
                 write_stdout(|o| writeln!(o, "{list}"))
@@ -310,7 +609,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
         }
         "parity" => {
             validate_options("parity", &rest, PARITY_OPTIONS)?;
-            let s = Session::new(wordcraft_doc::Document::new());
+            let s = session(wordcraft_doc::Document::new());
             let p = wordcraft_engine::catalog::parity(&s.registry);
             if rest.iter().any(|a| a == "--markdown") {
                 write_stdout(|o| write!(o, "{}", parity_markdown(&p)))
@@ -335,11 +634,27 @@ fn run(args: &[String]) -> Result<(), Failure> {
                     return Err("mcp: --author applies to the headless server; with --connect, run file.setAuthor".into());
                 }
                 Some(addr) => {
-                    let remote = wordcraft_mcp::Remote::connect(&addr).map_err(|e| format!("can't reach the WordCraft app at {addr}: {e}"))?;
-                    if let Some(w) = remote.key_warning() {
-                        eprintln!("wordcraft-cli: {w}");
+                    // A malformed address must fail at startup, not on every tool call the lazy
+                    // remote would retry it with.
+                    if !valid_connect_addr(&addr) {
+                        return Err(format!("mcp: --connect needs HOST:PORT with a numeric port, got `{addr}`").into());
                     }
-                    Box::new(remote)
+                    match wordcraft_mcp::Remote::connect(&addr) {
+                        Ok(remote) => {
+                            eprintln!("wordcraft-cli mcp: connected to WordCraft at {addr}");
+                            if let Some(w) = remote.key_warning() {
+                                eprintln!("wordcraft-cli: {w}");
+                            }
+                            Box::new(remote)
+                        }
+                        // The app may start after the client does: serve anyway and connect on the
+                        // first call, or the client marks the server failed for its whole session
+                        // (#4078).
+                        Err(e) => {
+                            eprintln!("wordcraft-cli mcp: WordCraft is not reachable at {addr} yet ({e}); will retry on each call");
+                            Box::new(wordcraft_mcp::Remote::lazy(&addr))
+                        }
+                    }
                 }
                 None => {
                     let mut headless = wordcraft_mcp::Headless::default();
@@ -363,10 +678,12 @@ fn run(args: &[String]) -> Result<(), Failure> {
         }
         "zotero" => {
             validate_options("zotero", &rest, ZOTERO_OPTIONS)?;
-            let name = pos(0)?;
-            let command = wordcraft_zotero::Command::from_name(&name).ok_or_else(|| format!("unknown Zotero command `{name}`\n\n{USAGE}"))?;
-            let file = pos(1)?;
-            let mut s = open(&file)?;
+            let paths = positionals(&rest, ZOTERO_OPTIONS);
+            let (Some(name), Some(file)) = (paths.first(), paths.get(1)) else {
+                return Err(missing_argument());
+            };
+            let command = wordcraft_zotero::Command::from_name(name).ok_or_else(|| format!("unknown Zotero command `{name}`\n\n{USAGE}"))?;
+            let mut s = open(file, None)?;
             for spec in rest.iter().zip(rest.iter().skip(1)).filter(|(a, _)| *a == "--cmd").map(|(_, v)| v) {
                 let (id, params) = match spec.split_once('=') {
                     Some((id, p)) => (id.to_string(), serde_json::from_str::<Value>(p).map_err(|e| format!("{id}: bad JSON params: {e}"))?),
@@ -428,7 +745,7 @@ fn open_store(command: &str, args: &[String]) -> Result<Box<dyn wordcraft_storag
             }
             let (user, password, token) =
                 (arg_value(args, "--store-user"), arg_value(args, "--store-password"), arg_value(args, "--store-token"));
-            // k8s-friendly: the token may arrive via env (secretKeyRef) instead of argv.
+            // The token may arrive via the environment instead of argv, where other processes can read it.
             let token = token.or_else(|| std::env::var("CRAFT_DAV_TOKEN").ok().filter(|t| !t.is_empty()));
             if token.is_some() && (user.is_some() || password.is_some()) {
                 return Err(format!("{command}: --store-token cannot be combined with --store-user/--store-password (pick one auth scheme)"));
@@ -446,28 +763,10 @@ fn open_store(command: &str, args: &[String]) -> Result<Box<dyn wordcraft_storag
     }
 }
 
-/// The positional arguments of a `store-*` command: option values (`--store local`, …) are not
-/// positionals, wherever they appear. Unknown options are rejected by `validate_options` first.
-fn store_positionals(args: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg.starts_with("--") {
-            let takes = STORE_OPTIONS.iter().find(|spec| spec.name == arg).map(|spec| spec.takes_value).unwrap_or(false);
-            i += if takes { 2 } else { 1 };
-        } else {
-            out.push(arg.clone());
-            i += 1;
-        }
-    }
-    out
-}
-
 fn store_command(command: &str, rest: &[String]) -> Result<(), Failure> {
     validate_options(command, rest, STORE_OPTIONS)?;
-    let positional = store_positionals(rest);
-    let pos = |i: usize| positional.get(i).cloned().ok_or_else(|| format!("missing argument\n\n{USAGE}"));
+    let positional: Vec<String> = positionals(rest, STORE_OPTIONS).into_iter().cloned().collect();
+    let pos = |i: usize| positional.get(i).cloned().ok_or_else(missing_argument);
     let store = open_store(command, rest).map_err(Failure::Error)?;
     match command {
         "store-write" => {
@@ -580,7 +879,7 @@ fn parity_markdown(p: &Value) -> String {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match run(&args) {
         Ok(()) | Err(Failure::StdoutClosed) => ExitCode::SUCCESS,
         Err(Failure::Error(e)) => {
@@ -593,6 +892,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).into()).collect()
@@ -600,7 +900,7 @@ mod tests {
 
     #[test]
     fn validators_accept_only_the_documented_options() {
-        assert!(validate_options("info", &args(&["file.docx"]), NO_OPTIONS).is_ok());
+        assert!(validate_options("info", &args(&["file.docx"]), PASSWORD_OPTIONS).is_ok());
         assert!(validate_options("render", &args(&["in.docx", "out.png", "--page", "2", "--scale", "1.5"]), RENDER_OPTIONS).is_ok());
         assert!(validate_options("run", &args(&["--cmd", "text.insert={}", "--cmd", "edit.undo", "--print"]), RUN_OPTIONS).is_ok());
         assert!(validate_options("commands", &args(&["--json"]), COMMANDS_OPTIONS).is_ok());
@@ -636,9 +936,44 @@ mod tests {
 
     #[test]
     fn store_positionals_skip_option_values_wherever_they_appear() {
-        assert_eq!(store_positionals(&args(&["--store", "local", "--store-root", "r", "a.docx", "f.docx", "--atomic"])), args(&["a.docx", "f.docx"]));
-        assert_eq!(store_positionals(&args(&["a.docx", "--etag", "t"])), args(&["a.docx"]));
-        assert!(store_positionals(&args(&["--atomic"])).is_empty());
+        assert_eq!(positionals(&args(&["--store", "local", "--store-root", "r", "a.docx", "f.docx", "--atomic"]), STORE_OPTIONS), vec!["a.docx", "f.docx"]);
+        assert_eq!(positionals(&args(&["a.docx", "--etag", "t"]), STORE_OPTIONS), vec!["a.docx"]);
+        assert!(positionals(&args(&["--atomic"]), STORE_OPTIONS).is_empty());
+    }
+
+    #[test]
+    fn an_option_value_is_never_read_as_a_path() {
+        // `--password`'s value sits between the paths and would be taken for one without
+        // `positionals`, so `render` would write its picture over a file called after the password.
+        assert_eq!(positionals(&args(&["in.docx", "--password", "secret", "out.png"]), RENDER_OPTIONS), vec!["in.docx", "out.png"]);
+        assert_eq!(positionals(&args(&["in.docx", "out.png", "--page", "2"]), RENDER_OPTIONS), vec!["in.docx", "out.png"]);
+        // A bare flag takes no value, so the next argument stays a path.
+        assert_eq!(positionals(&args(&["--print", "in.docx"]), RUN_OPTIONS), vec!["in.docx"]);
+        // `convert` is the one with a value-taking flag between the two paths.
+        assert_eq!(positionals(&args(&["in.docx", "--format", "flatopc", "out.docx"]), CONVERT_OPTIONS), vec!["in.docx", "out.docx"]);
+    }
+
+    #[test]
+    fn the_password_comes_from_an_option_a_file_or_the_environment() {
+        assert_eq!(password_from(&args(&["f.docx"])), Ok(None));
+        assert_eq!(password_from(&args(&["f.docx", "--password", "s3cret"])), Ok(Some("s3cret".into())));
+        // `--password` wins over the other two sources.
+        assert_eq!(password_from(&args(&["--password", "a", "--password-file", "/nonexistent"])), Ok(Some("a".into())));
+    }
+
+    #[test]
+    fn a_password_file_loses_only_its_trailing_newline() {
+        let path = std::env::temp_dir().join("wordcraft-cli-password-test.txt");
+        std::fs::write(&path, "s3cret\r\n").unwrap();
+        let got = password_from(&args(&["f.docx", "--password-file", &path.to_string_lossy()]));
+        std::fs::remove_file(&path).ok();
+        assert_eq!(got, Ok(Some("s3cret".into())));
+    }
+
+    #[test]
+    fn a_missing_password_file_is_named_without_the_password() {
+        let err = password_from(&args(&["f.docx", "--password-file", "/nonexistent/secret.txt"])).unwrap_err();
+        assert!(err.contains("--password-file"), "{err}");
     }
 
     #[test]
@@ -646,6 +981,32 @@ mod tests {
         assert_eq!(run(&args(&["info", "missing.docx", "--passwrod", "x"])), Err("info: unknown option --passwrod".into()));
         assert_eq!(run(&args(&["render", "missing.docx", "out.png", "--sclae", "2"])), Err("render: unknown option --sclae".into()));
         assert_eq!(run(&args(&["zotero", "refresh", "missing.docx", "--prot", "1"])), Err("zotero: unknown option --prot".into()));
+    }
+
+    #[test]
+    fn help_or_h_after_a_subcommand_asks_for_the_usage() {
+        for cmd in SUBCOMMANDS {
+            assert!(wants_help(cmd, &args(&["in.docx", "--help"])), "{cmd}");
+            assert!(wants_help(cmd, &args(&["-h"])), "{cmd}");
+            assert!(!wants_help(cmd, &args(&["in.docx", "--hepl"])), "{cmd}");
+        }
+        assert!(!wants_help("frobnicate", &args(&["--help"])));
+    }
+
+    #[test]
+    fn usage_lists_exactly_the_subcommands() {
+        let listed: Vec<&str> = USAGE
+            .lines()
+            .filter_map(|line| line.strip_prefix("  wordcraft-cli ")?.split_whitespace().next())
+            .filter(|word| !word.starts_with(['-', '[']))
+            .collect();
+        assert_eq!(listed, SUBCOMMANDS);
+    }
+
+    #[test]
+    fn text_keeps_bullet_and_number_labels() {
+        let doc = wordcraft_engine::io::open_bytes("lists.md", b"- alpha\n- beta\n\n1. first\n2. second\n").unwrap();
+        assert_eq!(listed_text(&doc).unwrap(), "\u{2022}\talpha\n\u{2022}\tbeta\n1.\tfirst\n2.\tsecond");
     }
 
     #[test]
@@ -659,6 +1020,34 @@ mod tests {
         assert!(run(&args(&["run", "--author", "Claude", "--cmd", "review.trackChanges={\"value\":true}"])).is_ok());
         // The app's user name is the person's own; a bridge flag must not rewrite it.
         assert!(run(&args(&["mcp", "--connect", "127.0.0.1:9", "--author", "Claude"])).is_err_and(|e| e.to_string().contains("--author")));
+        // A malformed address fails at startup, not on every retried call.
+        assert!(run(&args(&["mcp", "--connect", "127.0.0.1:notaport"])).is_err_and(|e| e.to_string().contains("numeric port")));
+        assert!(run(&args(&["mcp", "--connect", "notaport"])).is_err_and(|e| e.to_string().contains("numeric port")));
+        // The flag goes through the same protection check as the command.
+        let mut s = Session::new(wordcraft_doc::Document::new());
+        s.run("review.restrict", &json!({"mode": "readOnly"})).unwrap();
+        let before = s.author.clone();
+        assert!(set_author(&mut s, "Claude").is_err());
+        assert_eq!(s.author, before);
+        assert!(s.run("file.setAuthor", &json!({"name": "Claude"})).is_err());
+    }
+
+    #[test]
+    fn author_flag_cannot_claim_a_named_exception_after_protection() {
+        use wordcraft_doc::{CharProps, InlineObject, StoryRef};
+
+        let mut s = Session::new(wordcraft_doc::Document::from_text("Named exception."));
+        let end = s.doc.end_of(StoryRef::Body);
+        s.doc.insert_object(&end, InlineObject::PermEnd { id: 1 }, &CharProps::default()).unwrap();
+        let start = s.doc.start_of(StoryRef::Body);
+        s.doc.insert_object(&start, InlineObject::PermStart { id: 1, group: String::new(), editor: "Alice".into() }, &CharProps::default()).unwrap();
+        assert_eq!(s.doc.perm_ranges().len(), 1);
+        s.run("review.restrict", &json!({"mode": "readOnly"})).unwrap();
+        s.run("select.text", &json!({"text": "Named"})).unwrap();
+        assert!(s.run("text.insert", &json!({"text": "Changed"})).is_err());
+
+        assert!(set_author(&mut s, "Alice").is_err(), "--author changed the identity used for a protected exception");
+        assert!(s.run("text.insert", &json!({"text": "Changed"})).is_err());
     }
 
     #[test]
@@ -708,10 +1097,372 @@ mod tests {
         assert!(run(&args(&["mcp", "--automation-write-root", "/definitely/not/a/folder"])).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn only_the_opened_file_may_be_other_than_unicode() {
+        use std::os::unix::ffi::OsStringExt;
+        let latin1 = || OsString::from_vec(b"caf\xe9.docx".to_vec());
+        let ok = |raw: Vec<OsString>| text_args(&raw).unwrap().1;
+        assert_eq!(ok(vec!["zotero".into(), "refresh".into(), latin1()]), Some(PathBuf::from(latin1())));
+        assert_eq!(ok(vec!["render".into(), latin1(), "out.png".into(), "--page".into(), "2".into()]), Some(PathBuf::from(latin1())));
+        assert_eq!(ok(vec!["run".into(), "--print".into(), "--file".into(), latin1()]), Some(PathBuf::from(latin1())));
+        assert_eq!(ok(vec!["info".into(), "in.docx".into()]), None);
+        // Every command that opens a file reaches the open with it (no such file here), so
+        // `OPENS_FILE` and the commands' own arguments agree.
+        let missing = || OsString::from_vec(b"/definitely/not/caf\xe9.docx".to_vec());
+        let mut opening: Vec<Vec<OsString>> = OPENS_FILE
+            .iter()
+            .map(|(cmd, n)| [vec![(*cmd).into()], vec![OsString::from("refresh"); *n], vec![missing(), "out.png".into()]].concat())
+            .collect();
+        opening.push(vec!["run".into(), "--file".into(), missing()]);
+        for raw in opening {
+            let e = run(&raw).unwrap_err().to_string();
+            assert!(e.contains("No such file"), "{raw:?}: {e}");
+        }
+        for (raw, n) in [
+            (vec!["zotero".into(), latin1(), "in.docx".into()], 2),
+            (vec!["render".into(), "in.docx".into(), latin1()], 3),
+            (vec!["run".into(), "--save".into(), latin1()], 3),
+            (vec!["commands".into(), latin1()], 2),
+        ] {
+            assert_eq!(text_args(&raw).unwrap_err(), format!("argument {n} is not valid Unicode: caf\u{FFFD}.docx"));
+        }
+    }
+
     #[test]
     fn automation_roots_are_an_error_with_connect() {
         let dir = std::env::temp_dir().to_string_lossy().into_owned();
         let e = run(&args(&["mcp", "--connect", "127.0.0.1:9", "--automation-read-root", &dir])).unwrap_err().to_string();
         assert!(e.contains("--automation-read-root") && e.contains("headless"), "{e}");
+    }
+
+    #[test]
+    fn render_rejects_missing_or_invalid_page_and_scale() {
+        // Missing operands
+        assert_eq!(run(&args(&["render", "missing.docx", "out.png", "--page"])), Err("render: --page requires a value".into()));
+        assert_eq!(run(&args(&["render", "missing.docx", "out.png", "--scale"])), Err("render: --scale requires a value".into()));
+        assert_eq!(run(&args(&["render", "missing.docx", "out.png", "--page", "--scale", "2"])), Err("render: --page requires a value".into()));
+        assert_eq!(run(&args(&["render", "missing.docx", "out.png", "--scale", "--page", "1"])), Err("render: --scale requires a value".into()));
+
+        // Non-numeric operands
+        assert_eq!(
+            run(&args(&["render", "missing.docx", "out.png", "--page", "banana"])),
+            Err("render: invalid --page `banana`: not a valid integer".into())
+        );
+        assert_eq!(
+            run(&args(&["render", "missing.docx", "out.png", "--scale", "banana"])),
+            Err("render: invalid --scale `banana`: not a number".into())
+        );
+
+        // Out-of-range values
+        assert_eq!(
+            run(&args(&["render", "missing.docx", "out.png", "--page", "0"])),
+            Err("render: invalid --page `0`: page numbers start at 1".into())
+        );
+        assert_eq!(
+            run(&args(&["render", "missing.docx", "out.png", "--page", "-1"])),
+            Err("render: invalid --page `-1`: not a valid integer".into())
+        );
+        assert_eq!(
+            run(&args(&["render", "missing.docx", "out.png", "--scale", "0"])),
+            Err("render: invalid --scale `0`: scale must be a positive number".into())
+        );
+        assert_eq!(
+            run(&args(&["render", "missing.docx", "out.png", "--scale", "-2"])),
+            Err("render: invalid --scale `-2`: scale must be a positive number".into())
+        );
+        assert_eq!(
+            run(&args(&["render", "missing.docx", "out.png", "--scale", "NaN"])),
+            Err("render: invalid --scale `NaN`: scale must be a positive number".into())
+        );
+        assert_eq!(
+            run(&args(&["render", "missing.docx", "out.png", "--scale", "inf"])),
+            Err("render: invalid --scale `inf`: scale must be a positive number".into())
+        );
+
+        // Duplicate options
+        assert_eq!(run(&args(&["render", "missing.docx", "out.png", "--page", "1", "--page", "2"])), Err("render: duplicate --page option".into()));
+        assert_eq!(
+            run(&args(&["render", "missing.docx", "out.png", "--scale", "1", "--scale", "2"])),
+            Err("render: duplicate --scale option".into())
+        );
+    }
+
+    #[test]
+    fn run_rejects_missing_or_invalid_page_and_scale() {
+        // Missing operands
+        assert_eq!(run(&args(&["run", "--template", "sample", "--save", "out.png", "--page"])), Err("run: --page requires a value".into()));
+        assert_eq!(run(&args(&["run", "--template", "sample", "--save", "out.png", "--scale"])), Err("run: --scale requires a value".into()));
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--page", "--scale", "2"])),
+            Err("run: --page requires a value".into())
+        );
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--scale", "--page", "1"])),
+            Err("run: --scale requires a value".into())
+        );
+
+        // Non-numeric operands
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--page", "banana"])),
+            Err("run: invalid --page `banana`: not a valid integer".into())
+        );
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--scale", "banana"])),
+            Err("run: invalid --scale `banana`: not a number".into())
+        );
+
+        // Out-of-range values
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--page", "0"])),
+            Err("run: invalid --page `0`: page numbers start at 1".into())
+        );
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--page", "-1"])),
+            Err("run: invalid --page `-1`: not a valid integer".into())
+        );
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--scale", "0"])),
+            Err("run: invalid --scale `0`: scale must be a positive number".into())
+        );
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--scale", "-1"])),
+            Err("run: invalid --scale `-1`: scale must be a positive number".into())
+        );
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--scale", "NaN"])),
+            Err("run: invalid --scale `NaN`: scale must be a positive number".into())
+        );
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--scale", "inf"])),
+            Err("run: invalid --scale `inf`: scale must be a positive number".into())
+        );
+
+        // Duplicate options
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--page", "1", "--page", "2"])),
+            Err("run: duplicate --page option".into())
+        );
+        assert_eq!(
+            run(&args(&["run", "--template", "sample", "--save", "out.png", "--scale", "1", "--scale", "2"])),
+            Err("run: duplicate --scale option".into())
+        );
+    }
+
+    #[test]
+    fn render_and_run_valid_options_and_defaults_produce_files() {
+        let dir = std::env::temp_dir().join(format!("wc-cli-render-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let docx_path = dir.join("sample.docx");
+        // Create sample docx via `run --save sample.docx`
+        assert!(run(&args(&["run", "--template", "sample", "--save", &docx_path.to_string_lossy()])).is_ok());
+        assert!(docx_path.exists());
+
+        let docx_str = docx_path.to_string_lossy().into_owned();
+
+        // 1. render with defaults
+        let out_default = dir.join("out_default.png");
+        assert!(run(&args(&["render", &docx_str, &out_default.to_string_lossy()])).is_ok());
+        assert!(out_default.exists());
+
+        // 2. render with valid --page and --scale
+        let out_valid = dir.join("out_valid.png");
+        assert!(run(&args(&["render", &docx_str, &out_valid.to_string_lossy(), "--page", "1", "--scale", "2"])).is_ok());
+        assert!(out_valid.exists());
+
+        // 3. render with different flag order
+        let out_reordered = dir.join("out_reordered.png");
+        assert!(run(&args(&["render", &docx_str, &out_reordered.to_string_lossy(), "--scale", "1", "--page", "1"])).is_ok());
+        assert!(out_reordered.exists());
+
+        // 4. render failure leaves no output file
+        let out_invalid = dir.join("out_invalid.png");
+        assert!(run(&args(&["render", &docx_str, &out_invalid.to_string_lossy(), "--page", "banana"])).is_err());
+        assert!(!out_invalid.exists());
+
+        // 5. run --save out.png with defaults
+        let run_default = dir.join("run_default.png");
+        assert!(run(&args(&["run", "--file", &docx_str, "--save", &run_default.to_string_lossy()])).is_ok());
+        assert!(run_default.exists());
+
+        // 6. run --save out.png with --page and --scale
+        let run_valid = dir.join("run_valid.png");
+        assert!(run(&args(&["run", "--file", &docx_str, "--save", &run_valid.to_string_lossy(), "--page", "1", "--scale", "1"])).is_ok());
+        assert!(run_valid.exists());
+
+        // 7. run --save out.png with different flag order
+        let run_reordered = dir.join("run_reordered.png");
+        assert!(run(&args(&["run", "--file", &docx_str, "--scale", "1", "--page", "1", "--save", &run_reordered.to_string_lossy()])).is_ok());
+        assert!(run_reordered.exists());
+
+        // 8. run --save out.png failure leaves no output file
+        let run_invalid = dir.join("run_invalid.png");
+        assert!(run(&args(&["run", "--file", &docx_str, "--save", &run_invalid.to_string_lossy(), "--scale", "banana"])).is_err());
+        assert!(!run_invalid.exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    /// A scratch folder that removes itself, even when the test fails.
+    struct ScriptDir(PathBuf);
+
+    impl std::ops::Deref for ScriptDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScriptDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn script_dir(tag: &str) -> ScriptDir {
+        let dir = std::env::temp_dir().join(format!("wc-cli-script-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ScriptDir(dir)
+    }
+
+    fn write_script(dir: &Path, text: &str) -> String {
+        let p = dir.join("job.json");
+        std::fs::write(&p, text).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn script_builds_a_document_and_saves_docx_and_pdf_relative_to_the_script() {
+        let dir = script_dir("two");
+        let script = write_script(
+            &dir,
+            r#"{"template":"blank","commands":[{"command":"text.insert","params":{"text":"Hello script"}},{"command":"format.bold"}],"save":["out.docx","out.pdf"]}"#,
+        );
+        run(&args(&["run", "--script", &script])).unwrap();
+        assert!(std::fs::read(dir.join("out.pdf")).unwrap().starts_with(b"%PDF"));
+        let doc = open(&dir.join("out.docx"), None).unwrap().doc;
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(json.contains("Hello script") && json.contains("\"bold\":true"));
+    }
+
+    #[test]
+    fn script_with_a_bad_output_writes_no_output() {
+        let dir = script_dir("badout");
+        let script = write_script(&dir, r#"{"commands":["caret.docEnd"],"save":["a.docx","b.xyz"]}"#);
+        let e = run(&args(&["run", "--script", &script])).unwrap_err().to_string();
+        assert_eq!(e.matches("b.xyz").count(), 1, "{e}");
+        assert!(!dir.join("a.docx").exists());
+        let script = write_script(&dir, r#"{"commands":["caret.docEnd"],"save":["a.docx","nope/b.docx"]}"#);
+        assert!(run(&args(&["run", "--script", &script])).is_err());
+        assert!(!dir.join("a.docx").exists());
+    }
+
+    #[test]
+    fn script_with_a_folder_as_output_writes_no_output() {
+        let dir = script_dir("folderout");
+        std::fs::create_dir(dir.join("b.pdf")).unwrap();
+        let script = write_script(&dir, r#"{"commands":["caret.docEnd"],"save":["a.docx","b.pdf"]}"#);
+        let e = run(&args(&["run", "--script", &script])).unwrap_err().to_string();
+        assert!(e.contains("b.pdf"), "{e}");
+        assert!(!dir.join("a.docx").exists());
+    }
+
+    /// APFS refuses file names that aren't valid UTF-8, so the fixture can't be made on macOS
+    /// (as in `tests/it/non_utf8_args.rs`).
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn script_file_name_need_not_be_unicode() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = script_dir("latin1");
+        let mut name = dir.as_os_str().to_os_string().into_vec();
+        name.extend_from_slice(b"/caf\xe9.json");
+        let path = PathBuf::from(OsString::from_vec(name));
+        std::fs::write(&path, r#"{"commands":["caret.docEnd"],"save":["o.txt"]}"#).unwrap();
+        let raw = vec![OsString::from("run"), OsString::from("--script"), path.into_os_string()];
+        run(&raw).unwrap();
+        assert!(dir.join("o.txt").exists());
+    }
+
+    #[test]
+    fn command_line_template_wins_over_the_scripts_file() {
+        let dir = script_dir("source");
+        let input = dir.join("in.docx");
+        run(&args(&["run", "--template", "blank", "--cmd", "text.insert={\"text\":\"FROM FILE\"}", "--save", &input.to_string_lossy()])).unwrap();
+        let script = write_script(&dir, r#"{"file":"in.docx","commands":["caret.docEnd"]}"#);
+        let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+        run(&args(&["run", "--script", &script, "--template", "blank", "--save", &a.to_string_lossy()])).unwrap();
+        assert!(!std::fs::read_to_string(&a).unwrap().contains("FROM FILE"));
+        run(&args(&["run", "--script", &script, "--save", &b.to_string_lossy()])).unwrap();
+        assert!(std::fs::read_to_string(&b).unwrap().contains("FROM FILE"));
+    }
+
+    #[test]
+    fn script_value_missing_is_reported() {
+        let e = run(&args(&["run", "--script", "--cmd", "caret.docEnd"])).unwrap_err().to_string();
+        assert!(e.contains("--script requires a value"), "{e}");
+    }
+
+    #[test]
+    fn script_reads_from_a_stream_and_caps_its_size() {
+        let s = script::load_from(&br#"{"commands":["caret.docEnd"],"save":["o.docx"]}"#[..], "-", None).unwrap();
+        assert_eq!((s.commands.len(), s.save), (1, vec!["o.docx".to_string()]));
+        let big = std::io::repeat(b' ').take(script::MAX_SCRIPT_BYTES + 10);
+        let e = script::load_from(big, "-", None).unwrap_err();
+        assert!(e.contains("too large"), "{e}");
+        assert!(script::load_from(&b"{"[..], "-", None).is_err());
+    }
+
+    #[test]
+    fn script_commands_run_before_cmd_flags() {
+        let dir = script_dir("order");
+        let script = write_script(&dir, r#"{"commands":[{"command":"text.insert","params":{"text":"first"}}]}"#);
+        let out = dir.join("o.txt");
+        run(&args(&["run", "--script", &script, "--cmd", "text.insert={\"text\":\" second\"}", "--save", &out.to_string_lossy()])).unwrap();
+        assert!(std::fs::read_to_string(&out).unwrap().contains("first second"));
+    }
+
+    #[test]
+    fn script_failure_names_the_command_and_writes_nothing() {
+        let dir = script_dir("fail");
+        let script =
+            write_script(&dir, r#"{"commands":[{"command":"text.insert","params":{"text":"x"}},{"command":"no.such.command"}],"save":["out.docx"]}"#);
+        let e = run(&args(&["run", "--script", &script])).unwrap_err().to_string();
+        assert!(e.contains("command 2") && e.contains("no.such.command"), "{e}");
+        assert!(!dir.join("out.docx").exists());
+    }
+
+    #[test]
+    fn script_rejects_junk_empty_missing_and_huge_input() {
+        let dir = script_dir("junk");
+        for text in [
+            "not json",
+            "[]",
+            "{}",
+            r#"{"commands":[]}"#,
+            r#"{"commands":[{"params":{}}]}"#,
+            r#"{"commands":[1]}"#,
+            r#"{"commands":[{"command":"a"}],"save":[1]}"#,
+        ] {
+            let script = write_script(&dir, text);
+            assert!(run(&args(&["run", "--script", &script])).is_err(), "{text}");
+        }
+        assert!(run(&args(&["run", "--script", &dir.join("missing.json").to_string_lossy()])).is_err());
+        let huge = write_script(&dir, &" ".repeat(5 * 1024 * 1024));
+        let e = run(&args(&["run", "--script", &huge])).unwrap_err().to_string();
+        assert!(e.contains("too large"), "{e}");
+    }
+
+    #[test]
+    fn script_parse_resolves_paths_against_the_base() {
+        let s = script::parse(r#"{"file":"in.docx","commands":[{"command":"edit.undo"}],"save":["/abs/o.pdf","o.docx"]}"#, Some(Path::new("/base")))
+            .unwrap();
+        let joined = |name: &str| Path::new("/base").join(name).to_string_lossy().into_owned();
+        assert_eq!(s.file, Some(joined("in.docx")));
+        assert_eq!(s.save, vec!["/abs/o.pdf".to_string(), joined("o.docx")]);
+        let s = script::parse(r#"{"commands":["caret.docEnd"],"save":["o.docx"]}"#, None).unwrap();
+        assert_eq!(s.save, vec!["o.docx".to_string()]);
+        assert_eq!(s.commands.len(), 1);
     }
 }

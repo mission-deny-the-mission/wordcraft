@@ -145,14 +145,33 @@ pub(crate) fn dispatch(s: &mut Session, id: &str, mutates: bool, run: fn(&mut Se
     // runs, then takes whole cells or rows the way Word does around tables.
     if id.starts_with("caret.") && p::bool(v, "extend") == Some(true) {
         let shown = s.sel.clone();
+        let cells = s.cell_range().cloned();
         s.sel = s.sel_ends().clone();
+        let ends = s.sel.clone();
         if let Err(e) = run(s, v) {
             s.sel = shown;
             return Err(e);
         }
         let to = s.sel.focus.clone();
-        super::table::extend_selection(s, to);
+        // Shift+Right out of a cell takes the cell alone first.
+        if !(matches!(id, "caret.right" | "caret.left") && super::table::select_cell_first(s, &ends, &to, cells.as_ref())) {
+            super::table::extend_selection(s, to);
+        }
         return super::sel_result(s);
+    }
+    // Backspace over whole rows, whole columns or the whole table deletes them, as in Word
+    // (Delete only clears them, as for any other cells).
+    if id == "text.backspace"
+        && let Some(r) = super::table::backspace_cells(s)
+    {
+        return r;
+    }
+    // Delete (and Backspace that doesn't delete them) empties whole cells to one paragraph each,
+    // as in Word (#2802).
+    if matches!(id, "text.delete" | "text.backspace" | "text.deleteWordBack" | "text.deleteWordForward")
+        && let Some(r) = super::table::clear_cells(s)
+    {
+        return r;
     }
     let Some(segs) = s.column_segments().map(<[(Pos, Pos)]>::to_vec) else { return run(s, v) };
     let cells = s.cell_range().is_some();
@@ -211,7 +230,7 @@ fn copy(s: &mut Session, segs: &[(Pos, Pos)]) -> CmdResult {
     }
     s.clipboard_text = rows.join("\n");
     s.clipboard = Some(Fragment { blocks, parts });
-    Ok(json!({"text": s.clipboard_text}))
+    Ok(super::edit::copy_result(s))
 }
 
 /// Delete each row's piece (bottom up, so earlier positions stay valid) and leave the caret at

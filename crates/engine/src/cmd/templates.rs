@@ -240,7 +240,7 @@ pub fn local_path(target: &str, base: Option<&Path>) -> Option<PathBuf> {
     Some(p)
 }
 
-fn is_network_path(p: &str) -> bool {
+pub(crate) fn is_network_path(p: &str) -> bool {
     let b = p.as_bytes();
     matches!((b.first(), b.get(1)), (Some(b'\\' | b'/'), Some(b'\\' | b'/')))
 }
@@ -368,7 +368,7 @@ fn import_num(doc: &mut Document, src: &Document, num: u32, map: &HashMap<String
     for l in &mut levels {
         l.style = l.style.as_deref().and_then(|s| map.get(s).cloned().or_else(|| doc.styles.get(s).map(|x| x.id.clone())));
     }
-    doc.numbering.abstracts.push(AbstractNum { id: new_abs, name: abs.name.clone(), levels });
+    doc.numbering.abstracts.push(AbstractNum { id: new_abs, name: abs.name.clone(), levels, ..Default::default() });
     doc.numbering.nums.push(Num { id: new_num, abstract_id: new_abs, ..n.clone() });
     done.insert(num, new_num);
     Some(new_num)

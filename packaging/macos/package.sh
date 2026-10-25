@@ -19,7 +19,7 @@ HERE="$ROOT/packaging/macos"
 
 ARCH=universal
 SKIP_BUILD=0
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
     --arch) ARCH="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
@@ -44,9 +44,9 @@ DMG="$DIST/wordcraft-$VERSION-macos-$ARCH.dmg"
 CLI_ZIP="$DIST/wordcraft-cli-$VERSION-macos-$ARCH.zip"
 
 NOTARIZE=0
-if [ "$IDENTITY" = "-" ]; then
+if [[ "$IDENTITY" = "-" ]]; then
   warn "macOS: ad-hoc signing (no MACOS_SIGN_IDENTITY); artifacts are not notarized"
-elif [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+elif [[ -n "${APPLE_ID:-}" ]] && [[ -n "${APPLE_PASSWORD:-}" ]] && [[ -n "${APPLE_TEAM_ID:-}" ]]; then
   NOTARIZE=1
 else
   warn "macOS: APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID incomplete; signed but not notarized"
@@ -55,7 +55,7 @@ fi
 echo "==> WordCraft $VERSION for macOS ($ARCH), identity: $IDENTITY, notarize: $NOTARIZE"
 
 # ---- build -------------------------------------------------------------------------------------
-if [ "$SKIP_BUILD" = 0 ]; then
+if [[ "$SKIP_BUILD" = 0 ]]; then
   args=()
   for t in "${TARGETS[@]}"; do args+=(--target "$t"); done
   (cd "$ROOT" && cargo build --release --locked -p wordcraft -p wordcraft-cli "${args[@]}")
@@ -74,9 +74,9 @@ done
 sign() {
   # Hardened runtime + secure timestamp for a real identity; ad-hoc can't be timestamped.
   local ts=(--timestamp)
-  [ "$IDENTITY" = "-" ] && ts=(--timestamp=none)
+  [[ "$IDENTITY" = "-" ]] && ts=(--timestamp=none)
   local kc=()
-  [ -n "${MACOS_KEYCHAIN:-}" ] && kc=(--keychain "$MACOS_KEYCHAIN")
+  [[ -n "${MACOS_KEYCHAIN:-}" ]] && kc=(--keychain "$MACOS_KEYCHAIN")
   codesign --force --sign "$IDENTITY" ${kc[@]+"${kc[@]}"} "${ts[@]}" "$@"
 }
 
@@ -88,8 +88,8 @@ notarize() {
   echo "$out"
   id="$(printf '%s' "$out" | plutil -extract id raw -o - - 2>/dev/null || true)"
   status="$(printf '%s' "$out" | plutil -extract status raw -o - - 2>/dev/null || true)"
-  if [ "$status" != "Accepted" ]; then
-    if [ -n "$id" ]; then
+  if [[ "$status" != "Accepted" ]]; then
+    if [[ -n "$id" ]]; then
       xcrun notarytool log "$id" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
     fi
     echo "error: notarization of $(basename "$file") failed (status: ${status:-unknown})" >&2
@@ -111,13 +111,17 @@ sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHORT_VERSION@/$SHORT_VERSION/g" \
 plutil -lint "$APP/Contents/Info.plist"
 printf 'APPL????' >"$APP/Contents/PkgInfo"
 
+# codesign --strict rejects extended attributes such as com.apple.FinderInfo or a resource fork
+# ("Finder information, or similar detritus not allowed"); a source file copied in can carry them.
+# Clear them before signing; nothing after this point may write xattrs onto the bundle (#525).
+xattr -cr "$APP"
 # Sign inside-out: nested code first, then the bundle itself (no --deep on the final signature).
 # Today the only nested code is the main executable; frameworks/helpers would be signed here too.
 sign --options runtime --entitlements "$HERE/entitlements.plist" "$APP/Contents/MacOS/WordCraft"
 sign --options runtime --entitlements "$HERE/entitlements.plist" "$APP"
 codesign --verify --strict --deep --verbose=2 "$APP"
 
-if [ "$NOTARIZE" = 1 ]; then
+if [[ "$NOTARIZE" = 1 ]]; then
   ditto -c -k --keepParent "$APP" "$WORK/WordCraft-notarize.zip"
   notarize "$WORK/WordCraft-notarize.zip"
   xcrun stapler staple "$APP"
@@ -135,16 +139,64 @@ ln -s /Applications "$STAGE/Applications"
 mkdir -p "$STAGE/.background"
 cp "$HERE/dmg/background.tiff" "$STAGE/.background/background.tiff"
 cp "$HERE/dmg/dmg-layout.DS_Store" "$STAGE/.DS_Store"
-rm -f "$DMG" "$WORK/raw.dmg"
-# makehybrid + convert builds the image without attaching a device, unlike `create -srcfolder`,
-# which is flaky on CI runners ("Resource busy") and hangs in sandboxed sessions.
-# The volume name has no version: .DS_Store finds the background through an alias that includes it.
-hdiutil makehybrid -hfs -hfs-volume-name "WordCraft" -hfs-openfolder "$STAGE" -o "$WORK/raw.dmg" "$STAGE"
-hdiutil convert "$WORK/raw.dmg" -format UDZO -imagekey zlib-level=9 -o "$DMG"
-rm -f "$WORK/raw.dmg"
+rm -f "$DMG"
+# Retries an hdiutil verb that attaches a device: on CI runners it fails now and then with
+# "Resource busy". Usage: hdiutil_retry <verb> <args...>; five tries with growing pauses.
+hdiutil_retry() {
+  local verb="$1"
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if hdiutil "$@"; then
+      return 0
+    fi
+    if [[ "$attempt" = 5 ]]; then
+      echo "error: hdiutil $verb failed 5 times" >&2
+      return 1
+    fi
+    warn "hdiutil $verb failed (attempt $attempt of 5); retrying in $((attempt * 10))s"
+    sleep $((attempt * 10))
+  done
+  return 1
+}
+# `hdiutil create -srcfolder` copies the staged files as they are. The previous
+# `makehybrid -hfs` + `convert` gave every file and folder in the image a com.apple.FinderInfo
+# (Finder location -1,-1), so the signed app failed `codesign --verify --deep --strict` inside the
+# mounted DMG and after copying it out (#525). The volume name has no version: .DS_Store finds the
+# background through an alias that includes it.
+hdiutil_retry create -srcfolder "$STAGE" -volname "WordCraft" -fs HFS+ -format UDZO \
+  -imagekey zlib-level=9 -ov "$DMG"
 sign "$DMG"
 codesign --verify --strict --verbose=2 "$DMG"
-if [ "$NOTARIZE" = 1 ]; then
+
+# Gate: the app inside the finished image, and a copy installed from it with ditto, must pass the
+# same strict check as the app before packaging, so a container signature can't hide a damaged app
+# signature (#525). Returns non-zero (set -e then stops the build) after detaching the image.
+verify_dmg_app() {
+  local dmg="$1" mount="$WORK/dmg-check" copy="$WORK/dmg-check-copy" rc=0
+  mkdir -p "$mount" "$copy"
+  hdiutil_retry attach -readonly -nobrowse -noautoopen -mountpoint "$mount" "$dmg" >/dev/null
+  echo "==> strict signature check of WordCraft.app inside $(basename "$dmg")"
+  codesign --verify --deep --strict --verbose=2 "$mount/WordCraft.app" || rc=1
+  if [[ "$rc" = 0 ]]; then
+    ditto "$mount/WordCraft.app" "$copy/WordCraft.app" || rc=1
+  fi
+  if [[ "$rc" = 0 ]]; then
+    echo "==> strict signature check of a ditto copy of it"
+    codesign --verify --deep --strict --verbose=2 "$copy/WordCraft.app" || rc=1
+  fi
+  if [[ "$rc" = 0 ]] && [[ "$NOTARIZE" = 1 ]]; then
+    spctl --assess --type execute -vvv "$copy/WordCraft.app" || rc=1
+  fi
+  if [[ "$rc" != 0 ]]; then
+    echo "error: WordCraft.app in $(basename "$dmg") fails strict verification; extended attributes:" >&2
+    xattr -lr "$mount/WordCraft.app" >&2 || true
+  fi
+  hdiutil_retry detach "$mount" >/dev/null || hdiutil detach "$mount" -force >/dev/null || rc=1
+  rm -rf "$copy"
+  return "$rc"
+}
+verify_dmg_app "$DMG"
+if [[ "$NOTARIZE" = 1 ]]; then
   notarize "$DMG"
   xcrun stapler staple "$DMG"
   xcrun stapler validate "$DMG"
@@ -162,7 +214,7 @@ codesign --verify --strict --verbose=2 "$CLI_DIR/wordcraft-cli"
 rm -f "$CLI_ZIP"
 ditto -c -k --norsrc --noextattr --keepParent "$CLI_DIR" "$CLI_ZIP"
 # A bare Mach-O can't carry a stapled ticket; Gatekeeper looks the notarization up online.
-if [ "$NOTARIZE" = 1 ]; then notarize "$CLI_ZIP"; fi
+if [[ "$NOTARIZE" = 1 ]]; then notarize "$CLI_ZIP"; fi
 
 "$WORK/bin/wordcraft-cli" --version
 echo "==> done"

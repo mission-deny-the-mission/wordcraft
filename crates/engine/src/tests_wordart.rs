@@ -76,6 +76,22 @@ fn moving_a_joined_shape_reroutes_its_connector() {
     assert_eq!(connector_ends(&mut s), ((172.0, 248.0), (300.0, 218.0)));
 }
 
+/// A command that changes nothing but reroutes a stale connector is still an edit: the
+/// reroute must not be left without an undo step (#23).
+#[test]
+fn a_rerouted_connector_is_still_undoable() {
+    let mut s = joined();
+    select(&mut s, 5);
+    let before = connector_ends(&mut s);
+    // A nudge by nothing moves nothing, but the connector is stale and gets rerouted.
+    run(&mut s, "arrange.nudge", json!({"dx": 0, "dy": 0}));
+    assert_ne!(connector_ends(&mut s), before, "the connector was rerouted");
+    assert_eq!(s.undo_depth(), 1, "the reroute is an undo step of its own");
+    // One undo takes the reroute back.
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(connector_ends(&mut s), before, "one undo takes the reroute back");
+}
+
 #[test]
 fn dragging_a_connector_end_glues_it_to_the_nearest_site() {
     let mut s = joined();
@@ -138,4 +154,28 @@ fn wordart_is_inserted_styled_and_bent() {
         Some(("textWave1".into(), Some(wordcraft_doc::wordart::MAX_ADJ_VALUE)))
     );
     run(&mut s, "wordArt.transform", json!({"preset": "none"}));
+}
+
+#[test]
+fn wordart_reflection_and_outline_none_options() {
+    let mut s = Session::new(Document::new());
+    let r = run(&mut s, "insert.wordArt", json!({"text": "Reflect", "style": "solid"}));
+    let id = r["story"].as_u64().unwrap() as u32;
+
+    // Setting reflection
+    run(&mut s, "format.textEffects", json!({"reflection": true}));
+    let props = s.doc.para_at(&s.doc.start_of(StoryRef::Part(id))).unwrap().props_at(0).clone();
+    assert!(props.text_effects.as_ref().unwrap().reflection.is_some());
+
+    // Clearing reflection using "none"
+    run(&mut s, "format.textEffects", json!({"reflection": "none"}));
+    let props = s.doc.para_at(&s.doc.start_of(StoryRef::Part(id))).unwrap().props_at(0).clone();
+    assert!(props.text_effects.as_ref().and_then(|fx| fx.reflection).is_none());
+
+    // Setting outline with color "none"
+    run(&mut s, "wordArt.textOutline", json!({"color": "none", "width": 1.5}));
+    let props = s.doc.para_at(&s.doc.start_of(StoryRef::Part(id))).unwrap().props_at(0).clone();
+    let outline = props.text_effects.as_ref().unwrap().outline.unwrap();
+    assert_eq!(outline.color, None);
+    assert_eq!(outline.width, 1.5);
 }

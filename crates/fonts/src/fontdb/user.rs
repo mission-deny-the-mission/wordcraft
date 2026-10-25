@@ -243,6 +243,21 @@ impl FontDb {
         Ok(Installed { font, warning })
     }
 
+    /// Add the fonts a document embeds (#1171) for this run: not recorded as user fonts, never
+    /// stored. Faces already available are kept. Lookups made while the family was missing are
+    /// forgotten ([`FontDb::generation`]), so text set in it now resolves to it. Each file comes
+    /// with the name the document's font table gives it, which its faces answer to as well: Word
+    /// embeds a subset ("embed only the characters used") under a made-up family
+    /// (`___WRD_EMBED_SUB_46`), and the text asks for it by the table's name (#2240). Returns how
+    /// many faces were added.
+    pub fn add_document_fonts(&self, files: Vec<(Vec<u8>, String)>) -> usize {
+        let added = self.add_fonts(files.into_iter().map(|(data, name)| (data, Some(name))).collect());
+        if added > 0 {
+            self.fonts_changed();
+        }
+        added
+    }
+
     /// Check the faces in `sfnt` and add the new ones, recording them as a user font.
     fn add_user_faces(&self, name: &str, sfnt: Vec<u8>, path: Option<PathBuf>) -> Result<UserFont, UserFontError> {
         if self.read_user().fonts.len() >= MAX_USER_FONTS {
@@ -353,7 +368,7 @@ impl FontDb {
             .flatten()
             .map(|e| e.path())
             .filter(|p| p.is_file())
-            .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| STORED_EXTS.contains(&e.to_ascii_lowercase().as_str())))
+            .filter(|p| p.extension().and_then(std::ffi::OsStr::to_str).is_some_and(|e| STORED_EXTS.contains(&e.to_ascii_lowercase().as_str())))
             .collect();
         paths.sort();
         for p in paths {
@@ -410,7 +425,7 @@ fn write_unique(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const FAMILY: &str = "Userfont Sans";

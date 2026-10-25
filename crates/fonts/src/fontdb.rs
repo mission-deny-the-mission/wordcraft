@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use kurbo::BezPath;
 use skrifa::instance::{Location, LocationRef, Size};
-use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::outline::{DrawSettings, Engine, HintingInstance, HintingOptions, OutlinePen, Target};
 use skrifa::raw::FileRef;
 use skrifa::string::StringId;
 use skrifa::{GlyphId, MetadataProvider};
 
-mod user;
+pub(crate) mod user;
 pub use user::{FONT_FILE_EXTS, FontFormat, Installed, MAX_FONT_FILE_BYTES, UserFont, UserFontError, decode_font_file, is_font_file_name, sniff};
 
 /// The family used when a requested family is unknown (the UI sans).
@@ -60,6 +60,10 @@ pub struct FontFace {
     /// The family's names in other languages (宋体 for SimSun), from the `name` table. Lookups by
     /// family name accept them; the font list shows them in a matching interface language.
     pub local_names: Vec<LocalName>,
+    /// Exact OpenType full name (name ID 4), distinct from family and style names.
+    full_name: Option<String>,
+    /// Exact OpenType PostScript name (name ID 6).
+    postscript: Option<String>,
     /// usWeightClass-style weight (400 = regular).
     pub weight: f32,
     pub italic: bool,
@@ -82,6 +86,8 @@ pub struct FontFace {
     pub instance: Option<harfrust::ShaperInstance>,
     /// Basic Multilingual Plane coverage bitset, built on first use.
     bmp: std::sync::OnceLock<Box<[u64]>>,
+    // Some legacy CJK fonts assemble their contours with TrueType instructions.
+    outline_hinter: std::sync::OnceLock<Option<HintingInstance>>,
 }
 
 /// A cheap `Copy` handle to a face. Faces are never unloaded, so the handle lives for the rest of
@@ -93,12 +99,12 @@ pub struct FaceRef(&'static FontFace);
 impl FaceRef {
     /// The handle for a loaded face (memoised per face).
     pub fn of(face: &Arc<FontFace>) -> FaceRef {
-        static LEAKED: RwLock<Vec<Option<&'static FontFace>>> = RwLock::new(Vec::new());
+        static LEAKED: RwLock<Vec<Option<&FontFace>>> = RwLock::new(Vec::new());
         let id = face.id as usize;
-        if let Some(Some(f)) = LEAKED.read().unwrap_or_else(|e| e.into_inner()).get(id) {
+        if let Some(Some(f)) = LEAKED.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) {
             return FaceRef(f);
         }
-        let mut w = LEAKED.write().unwrap_or_else(|e| e.into_inner());
+        let mut w = LEAKED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         if w.len() <= id {
             w.resize(id + 1, None);
         }
@@ -175,13 +181,37 @@ impl FontFace {
         if let Some(f) = self.skrifa()
             && let Some(g) = f.outline_glyphs().get(GlyphId::new(gid))
         {
-            let _ = g.draw(DrawSettings::unhinted(Size::unscaled(), self.location()), &mut pen);
+            let hinter = self.outline_hinter.get_or_init(|| {
+                let outlines = f.outline_glyphs();
+                if !outlines.require_interpreter() {
+                    return None;
+                }
+                // At UPEM pixels, hinted coordinates remain in font units. This
+                // executes contour assembly without tying the cache to view zoom.
+                HintingInstance::new(
+                    &outlines,
+                    Size::new(self.upem as f32),
+                    self.location(),
+                    HintingOptions { engine: Engine::Interpreter, target: Target::Mono },
+                )
+                .map_err(|e| log::warn!("Cannot initialize outline interpreter for {}: {e}", self.family))
+                .ok()
+            });
+            let settings =
+                hinter.as_ref().map_or_else(|| DrawSettings::unhinted(Size::unscaled(), self.location()), |h| DrawSettings::hinted(h, false));
+            if let Err(e) = g.draw(settings, &mut pen) {
+                log::warn!("Cannot draw glyph {gid} in {}: {e}", self.family);
+                return BezPath::new();
+            }
         }
         pen.0
     }
-    /// Is `family` this face's typographic or legacy family name?
+    /// Is `family` this face's typographic, legacy, full or PostScript name?
     pub fn named(&self, family: &str) -> bool {
-        self.family.eq_ignore_ascii_case(family) || self.legacy_family.eq_ignore_ascii_case(family)
+        self.family.eq_ignore_ascii_case(family)
+            || self.legacy_family.eq_ignore_ascii_case(family)
+            || self.full_name.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(family))
+            || self.postscript.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(family))
     }
     /// Does the face map `c` to a glyph?
     pub fn covers(&self, c: char) -> bool {
@@ -290,6 +320,8 @@ struct CatalogEntry {
     family: String,
     style: String,
     legacy: String,
+    full_name: Option<String>,
+    postscript: Option<String>,
     local: Vec<LocalName>,
     /// A Chinese, Japanese or Korean font ([`FontFace::is_east_asian`]).
     east_asian: bool,
@@ -305,7 +337,7 @@ pub struct FontDb {
     /// search sorts every loaded face, so without this text in a script the requested font lacks
     /// (Thai, #59) got slower with every font loaded.
     fallbacks: RwLock<FallbackCache>,
-    ea_fallbacks: RwLock<EaFallbackCache>,
+    run_fallbacks: RwLock<RunFallbackCache>,
     #[cfg(not(target_arch = "wasm32"))]
     catalog: RwLock<Vec<CatalogEntry>>,
     /// Fonts the user added at run time, and the folder they are stored in (#582).
@@ -349,6 +381,9 @@ struct SysFallback {
     tried: std::collections::HashSet<&'static str>,
 }
 
+/// The longest name a document's font table gives an embedded font that faces take on.
+const MAX_FAMILY_NAME: usize = 128;
+
 /// Characters remembered as covered by no installed font (a cap on memory: once full the set
 /// starts over, and the coverage index answers again quickly).
 #[cfg(not(target_arch = "wasm32"))]
@@ -371,6 +406,9 @@ struct CoverageIndex {
     files: Vec<IndexedFile>,
     /// Font files read by fallback searches (each at most once to index it, once more to load it).
     reads: usize,
+    /// Files loaded by family name ([`FontDb::load_cataloged`]), whether or not they are indexed
+    /// yet: a search never loads them a second time.
+    loaded: std::collections::HashSet<std::path::PathBuf>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -459,6 +497,11 @@ fn read_fallback_file(path: &std::path::Path) -> Option<Vec<u8>> {
 /// Families preferred for right-to-left scripts (Persian, Arabic, Urdu, Hebrew) when the
 /// document's font lacks them: open fonts with full Persian coverage first (the Persian-only
 /// letters پ چ ژ گ, the Persian digits), then the platforms' own.
+/// Right-to-left script fonts (Hebrew, Arabic, Persian, Syriac…) in fallback order.
+/// Windows prioritizes David/Miriam (Office) and Segoe UI (standard).
+/// macOS prioritizes Helvetica, Geeza Pro (system), and SF fonts.
+/// Linux uses Noto fonts.
+#[cfg(windows)]
 pub const RTL_FALLBACKS: &[&str] = &[
     "Vazirmatn",
     "Noto Naskh Arabic",
@@ -468,13 +511,31 @@ pub const RTL_FALLBACKS: &[&str] = &[
     "Shabnam",
     "Samim",
     "Noto Sans Hebrew",
+    "David",
+    "Miriam",
     "Segoe UI",
     "Tahoma",
-    "Geeza Pro",
-    "SF Arabic",
     "Arial",
     "DejaVu Sans",
 ];
+
+#[cfg(target_os = "macos")]
+pub const RTL_FALLBACKS: &[&str] = &[
+    "Helvetica",
+    "Vazirmatn",
+    "Noto Naskh Arabic",
+    "Noto Sans Arabic",
+    "Noto Sans Hebrew",
+    "Geeza Pro",
+    "SF Arabic",
+    "Arial",
+    "Tahoma",
+    "DejaVu Sans",
+];
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub const RTL_FALLBACKS: &[&str] =
+    &["Noto Naskh Arabic", "Noto Sans Arabic", "Noto Sans Hebrew", "Vazirmatn", "Segoe UI", "Arial", "Tahoma", "DejaVu Sans"];
 
 /// Families tried (when installed) for characters the loaded fonts lack: CJK, symbols, emoji.
 #[cfg(not(target_arch = "wasm32"))]
@@ -518,10 +579,10 @@ struct FallbackCache {
     map: HashMap<(char, u32), Option<Arc<FontFace>>>,
 }
 
-/// [`FontDb::fallback_for_east_asian`] results: (sorted, deduplicated chars, excluded face, bold,
+/// [`FontDb::fallback_for_run`] results: (sorted, deduplicated chars, excluded face, bold,
 /// italic) → face, valid while the loaded face count is `faces`.
 #[derive(Default)]
-struct EaFallbackCache {
+struct RunFallbackCache {
     faces: usize,
     /// Chars held in the keys (bounds memory: hostile runs can be long).
     chars: usize,
@@ -529,19 +590,24 @@ struct EaFallbackCache {
     map: HashMap<(Vec<char>, u32, bool, bool), Option<Arc<FontFace>>>,
 }
 
-/// Most cached run-level East Asian fallbacks, and most chars in their keys, before the cache is
-/// reset.
-const EA_FALLBACK_CACHE_MAX: usize = 4096;
-const EA_FALLBACK_CACHE_CHARS: usize = 1 << 20;
+/// Most cached run-level fallbacks, and most chars in their keys, before the cache is reset.
+const RUN_FALLBACK_CACHE_MAX: usize = 4096;
+const RUN_FALLBACK_CACHE_CHARS: usize = 1 << 20;
 
 /// Loaded faces other than `exclude`, in fallback order: for right-to-left text the fonts made
-/// for the script first (so a word isn't split across fonts, which breaks Arabic joining), then
-/// the fallback family, upright, nearest to regular weight.
-fn fallback_order(faces: &[Arc<FontFace>], exclude: u32, rtl: bool) -> Vec<&Arc<FontFace>> {
+/// for the script first (so a word isn't split across fonts, which breaks Arabic joining); for a
+/// complex-script character `complex` (Thai, Myanmar…) faces with OpenType layout tables, the
+/// script's own families first, as the per-character fallback ranks them; then the fallback
+/// family, upright, nearest to regular weight.
+fn fallback_order(faces: &[Arc<FontFace>], exclude: u32, rtl: bool, complex: Option<char>) -> Vec<&Arc<FontFace>> {
     let mut order: Vec<&Arc<FontFace>> = faces.iter().filter(|f| f.id != exclude).collect();
     let rank =
         |f: &FontFace| if rtl { RTL_FALLBACKS.iter().position(|n| f.family.eq_ignore_ascii_case(n)).unwrap_or(RTL_FALLBACKS.len()) } else { 0 };
-    order.sort_by_key(|f| (rank(f), !f.family.eq_ignore_ascii_case(FALLBACK_FAMILY), f.italic, (f.weight - 400.0).abs() as i32));
+    let shaping = |f: &FontFace| match complex {
+        Some(c) => (!f.has_layout_tables(), crate::fallback_rank(c, &f.family)),
+        None => (false, 0),
+    };
+    order.sort_by_key(|f| (rank(f), shaping(f), !f.family.eq_ignore_ascii_case(FALLBACK_FAMILY), f.italic, (f.weight - 400.0).abs() as i32));
     order
 }
 
@@ -601,12 +667,18 @@ pub(crate) fn legacy_family(family: &str, style: &str) -> String {
     if extra.is_empty() { family.to_string() } else { format!("{family} {}", extra.join(" ")) }
 }
 
+/// The color bitmap tables the renderer draws glyphs from ([`FontFace::color_glyph`]).
+#[cfg(not(target_arch = "wasm32"))]
+const COLOR_BITMAP_TABLES: [&[u8; 4]; 2] = [b"sbix", b"CBDT"];
+
 /// The names of every face in the font file at `path`, reading only its table directories and
 /// `name` and `fvar` tables: a scan opens hundreds of font files, many of them megabytes long
 /// (CJK collections run to 20 MB and more). A variable font yields one entry per named instance,
-/// as it does loaded.
+/// as it does loaded. Faces with none of the [`OUTLINE_TABLES`](crate::ui_fallback::OUTLINE_TABLES)
+/// and [`COLOR_BITMAP_TABLES`] are left out.
 #[cfg(not(target_arch = "wasm32"))]
 fn file_face_names(path: &std::path::Path) -> Vec<Found> {
+    use crate::ui_fallback::OUTLINE_TABLES;
     use std::io::{Read, Seek, SeekFrom};
     /// Caps on what a (possibly damaged) file can make the scan read.
     const MAX_FACES: u32 = 256;
@@ -633,6 +705,9 @@ fn file_face_names(path: &std::path::Path) -> Vec<Found> {
             let dir = read_at(start.into(), 12)?;
             let tables = u16::from_be_bytes(dir.get(4..6)?.try_into().ok()?) as usize;
             let records = read_at(u64::from(start) + 12, tables * 16)?;
+            if !records.as_chunks::<16>().0.iter().any(|r| OUTLINE_TABLES.iter().chain(&COLOR_BITMAP_TABLES).any(|t| r.starts_with(*t))) {
+                return None;
+            }
             let mut table = |tag: &[u8; 4]| -> Option<Vec<u8>> {
                 let rec = records.as_chunks::<16>().0.iter().find(|r| r.starts_with(tag))?;
                 let (offset, len) = (be32(rec, 8)?, be32(rec, 12)?);
@@ -713,6 +788,10 @@ pub fn system_font_dirs() -> Vec<std::path::PathBuf> {
             dirs.push(h.join(".fonts"));
             dirs.push(h.join(".local/share/fonts"));
         }
+        // Flatpak (#1937): the folders above are the runtime's, and the host's system, local and
+        // user fonts are mounted here instead (no filesystem permission needed). Flatpak after
+        // 1.19.2 also mounts ~/.fonts, at user-fonts-legacy when the XDG user font folder exists too.
+        dirs.extend(["/run/host/fonts", "/run/host/local-fonts", "/run/host/user-fonts", "/run/host/user-fonts-legacy"].map(Into::into));
     }
     dirs
 }
@@ -725,6 +804,10 @@ struct Found {
     style: String,
     /// The legacy family name ([`FontFace::legacy_family`]).
     legacy: String,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    full_name: Option<String>,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    postscript: Option<String>,
     /// The family's names in other languages ([`FontFace::local_names`]).
     local: Vec<LocalName>,
     /// A Chinese, Japanese or Korean font ([`FontFace::is_east_asian`]); the scan's catalog keeps it.
@@ -752,13 +835,23 @@ fn font_faces(f: &skrifa::FontRef<'_>, index: u32) -> Vec<Found> {
         let legacy = legacy_family(&family, &style);
         // Name ID 1 names the default instance only: keep the names of the whole family.
         let local = local.iter().filter(|n| n.english.eq_ignore_ascii_case(&family)).cloned().collect();
-        named.push(Found { index, family: family.clone(), style, legacy, local, east_asian, coords });
+        named.push(Found { index, family: family.clone(), style, legacy, full_name: None, postscript: None, local, east_asian, coords });
     }
     if !named.is_empty() {
         return named;
     }
     let legacy = id1.filter(|n| !n.eq_ignore_ascii_case(&family)).unwrap_or_else(|| legacy_family(&family, &style));
-    vec![Found { index, family, style, legacy, local, east_asian, coords: Vec::new() }]
+    vec![Found {
+        index,
+        family,
+        style,
+        legacy,
+        full_name: name(f, &[StringId::FULL_NAME]),
+        postscript: name(f, &[StringId::POSTSCRIPT_NAME]),
+        local,
+        east_asian,
+        coords: Vec::new(),
+    }]
 }
 
 /// Parse every face in `data` (a font file or collection); a variable font yields one face per
@@ -801,7 +894,9 @@ fn make_face(bytes: FontBytes, index: u32, family: String, style: String, legacy
     let instance = (!coords.is_empty())
         .then(|| harfrust::ShaperInstance::from_variations(&hb, settings.iter().map(|(t, v)| harfrust::Variation { tag: *t, value: *v })));
     let axis = |tag: &[u8; 4]| coords.iter().find(|(t, _)| t == tag).map(|(_, v)| *v);
-    let weight = axis(b"wght").unwrap_or(if coords.is_empty() { a.weight.value() } else { style_weight(&style) });
+    // Old releases of heavy faces (Arial Black in the core fonts) claim weight 400 where current
+    // ones say 900, which Word doesn't embolden: a family named for its weight is that heavy.
+    let weight = axis(b"wght").unwrap_or(if coords.is_empty() { static_weight(a.weight.value(), &legacy_family) } else { style_weight(&style) });
     let italic = axis(b"ital")
         .map(|v| v >= 0.5)
         .or(axis(b"slnt").map(|v| v.abs() > 0.1))
@@ -812,6 +907,8 @@ fn make_face(bytes: FontBytes, index: u32, family: String, style: String, legacy
         style,
         legacy_family,
         local_names: Vec::new(),
+        full_name: coords.is_empty().then(|| name(&f, &[StringId::FULL_NAME])).flatten(),
+        postscript: coords.is_empty().then(|| name(&f, &[StringId::POSTSCRIPT_NAME])).flatten(),
         weight,
         italic,
         upem: m.units_per_em.max(1) as f64,
@@ -826,6 +923,7 @@ fn make_face(bytes: FontBytes, index: u32, family: String, style: String, legacy
         bytes,
         index,
         bmp: std::sync::OnceLock::new(),
+        outline_hinter: std::sync::OnceLock::new(),
     })
 }
 
@@ -835,7 +933,7 @@ pub fn base_style(style: &str) -> &str {
 }
 
 fn norm(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
 /// Weight implied by a style name.
@@ -859,6 +957,19 @@ fn style_weight(style: &str) -> f32 {
     TABLE.iter().find(|(k, _)| s.contains(k)).map(|(_, w)| *w).unwrap_or(400.0)
 }
 
+/// A static face's weight: the file's, or the weight the last word of its family name stands
+/// for (`Arial Black`, `Franklin Gothic Heavy`) when the file says less than semibold.
+fn static_weight(file: f32, family: &str) -> f32 {
+    if file >= 600.0 {
+        return file;
+    }
+    match family.split_whitespace().next_back().unwrap_or("").to_ascii_lowercase().as_str() {
+        "black" | "heavy" => 900.0,
+        "extrabold" | "ultrabold" => 800.0,
+        _ => file,
+    }
+}
+
 fn style_italic(style: &str) -> bool {
     let s = norm(style);
     s.contains("italic") || s.contains("oblique") || s == "it"
@@ -867,11 +978,13 @@ fn style_italic(style: &str) -> bool {
 impl FontDb {
     /// A database holding the bundled fonts, then the craft-fonts Japanese faces (Mincho first,
     /// so they are the fallback for Japanese text after the requested and bundled fonts), then the
-    /// craft-fonts Simplified Chinese faces, for the ideographs the Japanese fonts lack (both empty
-    /// without `CRAFT_FONTS_DIR`), whose system font scan reads `font_dirs`.
+    /// other craft-fonts faces: Simplified Chinese, for the ideographs the Japanese fonts lack, and
+    /// Arabic, so Arabic and Persian text draws without system fonts (#1652) (all empty without
+    /// `CRAFT_FONTS_DIR`), whose system font scan reads `font_dirs`.
     pub fn with_font_dirs(font_dirs: Vec<std::path::PathBuf>) -> Self {
         let mut faces = Vec::new();
-        let craft = crate::japanese_document_fonts().into_iter().chain(crate::chinese_fonts()).map(|f| f.bytes);
+        let others = crate::CRAFT_FONTS.iter().filter(|f| !f.scripts.contains(&"Jpan"));
+        let craft = crate::japanese_document_fonts().into_iter().chain(others).map(|f| f.bytes);
         for data in BUNDLED.iter().copied().chain(craft) {
             for f in enumerate_faces(data) {
                 if let Some(mut face) = make_face(FontBytes::Static(data), f.index, f.family, f.style, f.legacy, f.coords) {
@@ -884,7 +997,7 @@ impl FontDb {
             faces: RwLock::new(faces),
             outlines: Mutex::new(HashMap::new()),
             fallbacks: RwLock::new(FallbackCache::default()),
-            ea_fallbacks: RwLock::new(EaFallbackCache::default()),
+            run_fallbacks: RwLock::new(RunFallbackCache::default()),
             #[cfg(not(target_arch = "wasm32"))]
             catalog: RwLock::new(Vec::new()),
             user: RwLock::new(user::UserFonts::default()),
@@ -910,11 +1023,11 @@ impl FontDb {
     pub fn set_system_fallback(&self, on: bool) {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.sys.lock().unwrap_or_else(|e| e.into_inner()).enabled = on;
+            self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).enabled = on;
         }
         // Misses remembered while it was off may be found now.
-        self.fallbacks.write().unwrap_or_else(|e| e.into_inner()).map.clear();
-        *self.ea_fallbacks.write().unwrap_or_else(|e| e.into_inner()) = EaFallbackCache::default();
+        self.fallbacks.write().unwrap_or_else(std::sync::PoisonError::into_inner).map.clear();
+        *self.run_fallbacks.write().unwrap_or_else(std::sync::PoisonError::into_inner) = RunFallbackCache::default();
         #[cfg(target_arch = "wasm32")]
         let _ = on;
     }
@@ -928,14 +1041,14 @@ impl FontDb {
     }
 
     fn read_faces(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<FontFace>>> {
-        self.faces.read().unwrap_or_else(|e| e.into_inner())
+        self.faces.read().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The system font catalog, scanned first if it hasn't been yet.
     #[cfg(not(target_arch = "wasm32"))]
     fn read_catalog(&self) -> std::sync::RwLockReadGuard<'_, Vec<CatalogEntry>> {
         self.ensure_catalog();
-        self.catalog.read().unwrap_or_else(|e| e.into_inner())
+        self.catalog.read().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Family names available (loaded plus cataloged system fonts), sorted and deduplicated. Like
@@ -1047,25 +1160,31 @@ impl FontDb {
     /// Add a user font (TTF/OTF/TTC bytes). Returns the number of faces added (0 if unparseable or
     /// every face was already present).
     pub fn add_font(&self, bytes: Vec<u8>) -> usize {
-        self.add_fonts(vec![bytes])
+        self.add_fonts(vec![(bytes, None)])
     }
 
     /// Add the faces of several font files at once: lookups see all of them or none, never a
     /// family with only some of its styles (which would resolve, and be cached as, the wrong
-    /// face). Faces already present (same family and style) are skipped. Returns how many were
-    /// added.
-    fn add_fonts(&self, files: Vec<Vec<u8>>) -> usize {
+    /// face). A file given a `name` its faces don't go by (a document's font table's, see
+    /// [`FontDb::add_document_fonts`]) has them go by that name instead. Faces already present
+    /// (same family and style) are skipped. Returns how many were added.
+    fn add_fonts(&self, files: Vec<(Vec<u8>, Option<String>)>) -> usize {
         let mut new = Vec::new();
-        for bytes in files {
+        for (bytes, name) in files {
             let data = Arc::new(bytes);
+            let name: Option<String> = name.map(|n| n.trim().chars().take(MAX_FAMILY_NAME).collect()).filter(|n: &String| !n.is_empty());
             for f in enumerate_faces(&data) {
                 if let Some(mut face) = make_face(FontBytes::Owned(data.clone()), f.index, f.family, f.style, f.legacy, f.coords) {
                     face.local_names = f.local;
+                    if let Some(n) = name.as_deref().filter(|n| !face.named(n) && !face.local_names.iter().any(|l| l.name.eq_ignore_ascii_case(n))) {
+                        face.family = n.to_string();
+                        face.legacy_family = n.to_string();
+                    }
                     new.push(Arc::new(face));
                 }
             }
         }
-        let mut faces = self.faces.write().unwrap_or_else(|e| e.into_inner());
+        let mut faces = self.faces.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut added = 0;
         for f in new {
             if !faces.iter().any(|g| g.family.eq_ignore_ascii_case(&f.family) && g.style.eq_ignore_ascii_case(&f.style)) {
@@ -1124,7 +1243,7 @@ impl FontDb {
                     stack.push(p);
                     continue;
                 }
-                let ext = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+                let ext = p.extension().and_then(std::ffi::OsStr::to_str).map(|e| e.to_ascii_lowercase());
                 if !matches!(ext.as_deref(), Some("ttf" | "otf" | "ttc" | "otc")) {
                     continue;
                 }
@@ -1133,6 +1252,8 @@ impl FontDb {
                         family: f.family,
                         style: f.style,
                         legacy: f.legacy,
+                        full_name: f.full_name,
+                        postscript: f.postscript,
                         local: f.local,
                         east_asian: f.east_asian,
                         path: p.clone(),
@@ -1142,7 +1263,7 @@ impl FontDb {
         }
         let n = found.len();
         log::debug!("cataloged {n} system font faces");
-        *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = found;
+        *self.catalog.write().unwrap_or_else(std::sync::PoisonError::into_inner) = found;
         self.catalog_gen.fetch_add(1, Ordering::AcqRel);
         n
     }
@@ -1152,31 +1273,47 @@ impl FontDb {
     /// its styles. Returns whether any face was added.
     #[cfg(not(target_arch = "wasm32"))]
     fn load_cataloged(&self, family: &str) -> bool {
-        let _loading = self.loading.lock().unwrap_or_else(|e| e.into_inner());
+        let _loading = self.loading.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Another lookup may have loaded it while this one waited.
         if self.is_loaded(family) {
             return true;
         }
-        let paths: Vec<std::path::PathBuf> = {
-            let cat = self.read_catalog();
-            let families: Vec<&str> = cat
-                .iter()
-                .filter(|c| c.family.eq_ignore_ascii_case(family) || c.legacy.eq_ignore_ascii_case(family))
-                .map(|c| c.family.as_str())
-                .collect();
-            let mut p: Vec<_> = cat.iter().filter(|c| families.iter().any(|f| c.family.eq_ignore_ascii_case(f))).map(|c| c.path.clone()).collect();
-            p.sort();
-            p.dedup();
-            p
-        };
-        let files = paths.iter().filter_map(|p| std::fs::read(p).ok()).collect();
-        self.add_fonts(files) > 0
+        let paths = self.family_paths(family);
+        let files = paths.iter().filter_map(|p| std::fs::read(p).ok()).map(|b| (b, None)).collect();
+        let added = self.add_fonts(files) > 0;
+        // The fallback searches' index: these files are loaded fonts now.
+        let mut index = self.coverage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for file in index.files.iter_mut().filter(|f| paths.contains(&f.path)) {
+            file.used = true;
+        }
+        index.loaded.extend(paths);
+        added
+    }
+
+    /// The cataloged files holding `family`'s faces (by typographic, legacy or full name), sorted.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn family_paths(&self, family: &str) -> Vec<std::path::PathBuf> {
+        let cat = self.read_catalog();
+        let families: Vec<&str> = cat
+            .iter()
+            .filter(|c| {
+                c.family.eq_ignore_ascii_case(family)
+                    || c.legacy.eq_ignore_ascii_case(family)
+                    || c.full_name.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(family))
+                    || c.postscript.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(family))
+            })
+            .map(|c| c.family.as_str())
+            .collect();
+        let mut p: Vec<_> = cat.iter().filter(|c| families.iter().any(|f| c.family.eq_ignore_ascii_case(f))).map(|c| c.path.clone()).collect();
+        p.sort();
+        p.dedup();
+        p
     }
 
     /// Resolve a family + style to a face, falling back to the closest style of the family, then to
     /// Source Sans 3 Regular. `family` is a typographic family ("Roboto") or a face's legacy family
     /// name ("Roboto Light", whose styles are Light and Light Italic). Installed system fonts are
-    /// found by name whatever ran before.
+    /// found by name whatever ran before. An exact full or PostScript name selects its face.
     pub fn face(&self, family: &str, style: &str) -> Arc<FontFace> {
         if let Some(f) = self.find(family, style) {
             return f;
@@ -1274,19 +1411,24 @@ impl FontDb {
     }
 
     /// Is `family` available (loaded, or installed on the system)? English and localized family
-    /// names both count.
+    /// names and exact full or PostScript face names count.
     pub fn has_family(&self, family: &str) -> bool {
         if self.is_loaded(family) {
             return true;
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if self.read_catalog().iter().any(|c| c.family.eq_ignore_ascii_case(family) || c.legacy.eq_ignore_ascii_case(family)) {
+        if self.read_catalog().iter().any(|c| {
+            c.family.eq_ignore_ascii_case(family)
+                || c.legacy.eq_ignore_ascii_case(family)
+                || c.full_name.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(family))
+                || c.postscript.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(family))
+        }) {
             return true;
         }
         self.english_family(family).is_some()
     }
 
-    /// Is a face named `family` (its typographic or legacy family) loaded?
+    /// Is a face named `family` (typographic, legacy, full or PostScript) loaded?
     pub fn is_loaded(&self, family: &str) -> bool {
         self.read_faces().iter().any(|f| f.named(family))
     }
@@ -1329,7 +1471,7 @@ impl FontDb {
         let mut f = make_face(base.bytes.clone(), base.index, base.family.clone(), style.to_string(), base.legacy_family.clone(), coords)?;
         f.local_names = base.local_names.clone();
         let f = Arc::new(f);
-        self.faces.write().unwrap_or_else(|e| e.into_inner()).push(f.clone());
+        self.faces.write().unwrap_or_else(std::sync::PoisonError::into_inner).push(f.clone());
         Some(f)
     }
 
@@ -1350,7 +1492,12 @@ impl FontDb {
             cands = faces.iter().filter(|f| f.legacy_family.eq_ignore_ascii_case(family)).collect();
         }
         if cands.is_empty() {
-            return None;
+            // Exact full names keep precedence over PostScript aliases; either selects one face.
+            return faces
+                .iter()
+                .find(|f| f.full_name.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(family)))
+                .or_else(|| faces.iter().find(|f| f.postscript.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(family))))
+                .cloned();
         }
         let ns = norm(style);
         if let Some(f) = cands.iter().find(|f| norm(&f.style) == ns) {
@@ -1393,7 +1540,7 @@ impl FontDb {
     fn cached_fallback(&self, c: char, exclude: u32) -> Option<Arc<FontFace>> {
         let n = self.read_faces().len();
         {
-            let cache = self.fallbacks.read().unwrap_or_else(|e| e.into_inner());
+            let cache = self.fallbacks.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             if cache.faces == n
                 && let Some(hit) = cache.map.get(&(c, exclude))
             {
@@ -1407,7 +1554,7 @@ impl FontDb {
         if n != self.read_faces().len() {
             return found;
         }
-        let mut cache = self.fallbacks.write().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.fallbacks.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache.faces != n || cache.map.len() >= FALLBACK_CACHE_MAX {
             cache.map.clear();
             cache.faces = n;
@@ -1418,6 +1565,9 @@ impl FontDb {
 
     /// The fallback face for `c`, and the number of loaded faces it was chosen from.
     fn search_fallback(&self, c: char, exclude: u32) -> (Option<Arc<FontFace>>, usize) {
+        if let Some(face) = self.circle_fallback(c, exclude) {
+            return (Some(face), self.read_faces().len());
+        }
         let (found, n) = self.loaded_fallback(c, exclude);
         if found.is_some() {
             return (found, n);
@@ -1425,11 +1575,31 @@ impl FontDb {
         self.system_search(c, exclude)
     }
 
+    fn circle_fallback(&self, c: char, exclude: u32) -> Option<Arc<FontFace>> {
+        if c != '\u{25CF}' {
+            return None;
+        }
+        // Word uses this text face for an uncovered black circle, before a UI sans.
+        const FAMILY: &str = "Times New Roman";
+        let find = || self.find(FAMILY, "Regular").filter(|f| f.id != exclude && f.covers(c));
+        if let Some(face) = find() {
+            return Some(face);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let enabled = self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).enabled;
+            if enabled {
+                self.load_cataloged(FAMILY);
+            }
+        }
+        find()
+    }
+
     /// [`Self::search_fallback`] when no loaded face covers `c`: load a system font that does,
     /// one search at a time.
     #[cfg(not(target_arch = "wasm32"))]
     fn system_search(&self, c: char, exclude: u32) -> (Option<Arc<FontFace>>, usize) {
-        let _searching = self.searching.lock().unwrap_or_else(|e| e.into_inner());
+        let _searching = self.searching.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // A search that held the lock first may have loaded a font covering `c`: choose among the
         // loaded faces again before loading more.
         let (found, n) = self.loaded_fallback(c, exclude);
@@ -1449,10 +1619,12 @@ impl FontDb {
         let faces = self.read_faces();
         let mut order: Vec<&Arc<FontFace>> = faces.iter().filter(|f| f.id != exclude).collect();
         // Right-to-left letters prefer a font made for the script, so a word isn't split across
-        // fonts (that breaks Arabic joining).
+        // fonts (that breaks Arabic joining). Emoji prefer a colour emoji font.
         let rank = |f: &FontFace| {
             if crate::is_rtl(c) || arabic_block(c) {
                 RTL_FALLBACKS.iter().position(|n| f.family.eq_ignore_ascii_case(n)).unwrap_or(RTL_FALLBACKS.len())
+            } else if crate::is_emoji(c) {
+                crate::fallback_rank(c, &f.family)
             } else {
                 0
             }
@@ -1465,16 +1637,20 @@ impl FontDb {
         (order.into_iter().find(|f| f.covers(c)).cloned(), faces.len())
     }
 
-    /// One fallback face for a run's East Asian characters: the first face in the fallback order
-    /// that covers **every** given character, so a whole run draws in a single CJK face instead of
-    /// mixing faces character by character (a bundled Japanese Mincho for JIS-covered ideographs
-    /// beside a Simplified-Chinese sans for the rest). Like [`Self::fallback_for`], a system font
-    /// is loaded lazily the first time no loaded face covers a character. `None` when no single
-    /// face covers them all, and the caller keeps the per-character fallback.
+    /// One fallback face for a run: the first face in the fallback order that covers **every**
+    /// given character, so a whole run draws in a single face instead of mixing faces character
+    /// by character. East Asian runs: a bundled Japanese Mincho for JIS-covered ideographs beside
+    /// a Simplified-Chinese sans for the rest. A missing Thai font (#1549): the Thai letters in
+    /// one face and the Latin letters and digits beside them in another, at another size; a Thai
+    /// face covers them all, so the run is given every character, Latin ones included.
+    /// Complex-script characters prefer the script's own families with OpenType layout tables, as
+    /// [`Self::fallback_for`] does. Like it, a system font is loaded lazily the first time no
+    /// loaded face covers a character. `None` when no single face covers them all, and the caller
+    /// keeps the per-character fallback.
     ///
     /// Cached per (character set, excluded face, bold, italic) and dropped when the loaded faces
     /// change, like [`Self::fallback_for`], so relayout doesn't repeat the search.
-    pub fn fallback_for_east_asian(&self, chars: &[char], exclude: u32, bold: bool, italic: bool) -> Option<Arc<FontFace>> {
+    pub fn fallback_for_run(&self, chars: &[char], exclude: u32, bold: bool, italic: bool) -> Option<Arc<FontFace>> {
         if chars.is_empty() {
             return None;
         }
@@ -1484,18 +1660,19 @@ impl FontDb {
         let key = (set, exclude, bold, italic);
         let n = self.read_faces().len();
         {
-            let cache = self.ea_fallbacks.read().unwrap_or_else(|e| e.into_inner());
+            let cache = self.run_fallbacks.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             if cache.faces == n
                 && let Some(hit) = cache.map.get(&key)
             {
                 return hit.clone();
             }
         }
-        let found = self.search_east_asian(&key.0, exclude, bold, italic);
-        // Keyed by the face count after the search (a system fallback may have loaded fonts).
-        let n = self.read_faces().len();
-        let mut cache = self.ea_fallbacks.write().unwrap_or_else(|e| e.into_inner());
-        if cache.faces != n || cache.map.len() >= EA_FALLBACK_CACHE_MAX || cache.chars.saturating_add(key.0.len()) > EA_FALLBACK_CACHE_CHARS {
+        // Keyed by the face count the search last looked at, not the count after it: a face loaded
+        // meanwhile by another thread (one its search, or a family named by a document) must make
+        // a miss count as stale, not as the answer for the new count.
+        let (found, n) = self.search_run(&key.0, exclude, bold, italic);
+        let mut cache = self.run_fallbacks.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.faces != n || cache.map.len() >= RUN_FALLBACK_CACHE_MAX || cache.chars.saturating_add(key.0.len()) > RUN_FALLBACK_CACHE_CHARS {
             cache.map.clear();
             cache.faces = n;
             cache.chars = 0;
@@ -1505,8 +1682,10 @@ impl FontDb {
         found
     }
 
-    fn search_east_asian(&self, chars: &[char], exclude: u32, bold: bool, italic: bool) -> Option<Arc<FontFace>> {
-        let mut base = self.loaded_covering(chars, exclude);
+    /// The face for a run, and the number of loaded faces the search last chose from.
+    fn search_run(&self, chars: &[char], exclude: u32, bold: bool, italic: bool) -> (Option<Arc<FontFace>>, usize) {
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let (mut base, mut checked) = self.loaded_covering(chars, exclude);
         #[cfg(not(target_arch = "wasm32"))]
         if base.is_none() {
             // A character no loaded face covers: load a system font for it, then retry (the run's
@@ -1515,17 +1694,26 @@ impl FontDb {
                 if self.read_faces().iter().any(|f| f.id != exclude && f.covers(*c)) {
                     continue;
                 }
-                if self.system_fallback(*c)
-                    && let Some(f) = self.loaded_covering(chars, exclude)
-                {
-                    base = Some(f);
-                    break;
+                if self.system_fallback(*c) {
+                    (base, checked) = self.loaded_covering(chars, exclude);
+                    if base.is_some() {
+                        break;
+                    }
                 }
             }
+            // Each character has a face now, but the families a script prefers may lack the
+            // run's other letters (Noto Sans Thai has no Latin): look for one installed font
+            // that maps the whole run.
+            if base.is_none() {
+                // Look again even when this search loaded nothing: another thread's may just have
+                // loaded the font (and taken its files off the index).
+                self.indexed_run_fallback(chars);
+                (base, checked) = self.loaded_covering(chars, exclude);
+            }
         }
-        let base = base?;
+        let Some(base) = base else { return (None, checked) };
         if !bold && !italic {
-            return Some(base);
+            return (Some(base), checked);
         }
         let style = match (bold, italic) {
             (true, true) => "Bold Italic",
@@ -1533,18 +1721,24 @@ impl FontDb {
             _ => "Italic",
         };
         let styled = self.face(&base.family, style);
-        Some(if styled.family.eq_ignore_ascii_case(&base.family) && chars.iter().all(|c| styled.covers(*c)) && styled.id != exclude {
+        let face = if styled.family.eq_ignore_ascii_case(&base.family) && chars.iter().all(|c| styled.covers(*c)) && styled.id != exclude {
             styled
         } else {
             base
-        })
+        };
+        (Some(face), checked)
     }
 
-    /// The first face in the fallback order that covers every char.
-    fn loaded_covering(&self, chars: &[char], exclude: u32) -> Option<Arc<FontFace>> {
+    /// The first face in the fallback order that covers every char, and the number of loaded
+    /// faces it was chosen from.
+    fn loaded_covering(&self, chars: &[char], exclude: u32) -> (Option<Arc<FontFace>>, usize) {
         let faces = self.read_faces();
         let rtl = chars.iter().any(|c| crate::is_rtl(*c) || arabic_block(*c));
-        fallback_order(&faces, exclude, rtl).into_iter().find(|f| chars.iter().all(|c| f.covers(*c))).cloned()
+        // A complex-script character picks the families its script prefers (the lowest one: the
+        // run's characters come sorted).
+        let complex = chars.iter().copied().find(|c| crate::needs_layout_tables(*c));
+        let found = fallback_order(&faces, exclude, rtl, complex).into_iter().find(|f| chars.iter().all(|c| f.covers(*c))).cloned();
+        (found, faces.len())
     }
 
     /// Load a system font covering `c` (preferred fallback families first, then any cataloged
@@ -1556,7 +1750,7 @@ impl FontDb {
             return false;
         }
         {
-            let sys = self.sys.lock().unwrap_or_else(|e| e.into_inner());
+            let sys = self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if !sys.enabled || sys.misses.contains(&c) {
                 return false;
             }
@@ -1570,7 +1764,7 @@ impl FontDb {
             if self.is_loaded(fam) || !cataloged.iter().any(|f| f.eq_ignore_ascii_case(fam)) {
                 continue;
             }
-            if !self.sys.lock().unwrap_or_else(|e| e.into_inner()).tried.insert(fam) {
+            if !self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tried.insert(fam) {
                 continue;
             }
             self.load_cataloged(fam);
@@ -1581,7 +1775,7 @@ impl FontDb {
         if self.indexed_fallback(c) {
             return true;
         }
-        let mut sys = self.sys.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sys = self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if sys.misses.len() >= SYS_MISSES_MAX {
             sys.misses.clear();
         }
@@ -1593,45 +1787,90 @@ impl FontDb {
     /// yet indexed as the search reaches it. Returns whether a loaded face now covers `c`.
     #[cfg(not(target_arch = "wasm32"))]
     fn indexed_fallback(&self, c: char) -> bool {
-        let cp = u32::from(c);
-        let mut index = self.coverage.lock().unwrap_or_else(|e| e.into_inner());
+        self.load_indexed(&[c], false)
+    }
+
+    /// Load the family of the first cataloged font file (in path order) that maps every char of a
+    /// run no loaded face covers whole: all its styles, as path order may reach the Bold file
+    /// before the Regular.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn indexed_run_fallback(&self, chars: &[char]) {
+        if !self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).enabled || chars.iter().any(|c| c.is_control()) {
+            return;
+        }
+        self.load_indexed(chars, true);
+    }
+
+    /// Load the cataloged font files (in path order) that map every char of `chars`, reading each
+    /// file not yet indexed as the search reaches it, until a loaded face covers them all; with
+    /// `whole_family`, each such file's family is loaded with it (whatever of it isn't loaded
+    /// yet). A collection's faces only together may map them: the search then goes on. Returns
+    /// whether a loaded face now covers them all.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_indexed(&self, chars: &[char], whole_family: bool) -> bool {
+        let covered = |db: &FontDb| db.read_faces().iter().any(|f| chars.iter().all(|c| f.covers(*c)));
+        let cps: Vec<u32> = chars.iter().map(|c| u32::from(*c)).collect();
+        let maps_all = |ranges: &[(u32, u32)]| cps.iter().all(|cp| ranges_hold(ranges, *cp));
+        let mut index = self.coverage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = self.catalog_gen.load(Ordering::Acquire);
         if index.generation != Some(generation) {
             // A new scan (or the first search): keep what is known of files still installed.
             let mut known: HashMap<std::path::PathBuf, IndexedFile> =
                 std::mem::take(&mut index.files).into_iter().map(|f| (f.path.clone(), f)).collect();
-            let mut paths: Vec<std::path::PathBuf> = self.catalog.read().unwrap_or_else(|e| e.into_inner()).iter().map(|e| e.path.clone()).collect();
+            let mut paths: Vec<std::path::PathBuf> =
+                self.catalog.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().map(|e| e.path.clone()).collect();
             paths.sort();
             paths.dedup();
-            index.files = paths.into_iter().map(|path| known.remove(&path).unwrap_or(IndexedFile { path, ranges: None, used: false })).collect();
+            let files = paths
+                .into_iter()
+                .map(|path| known.remove(&path).unwrap_or_else(|| IndexedFile { used: index.loaded.contains(&path), path, ranges: None }));
+            index.files = files.collect();
             index.generation = Some(generation);
         }
         let CoverageIndex { files, reads, .. } = &mut *index;
-        for file in files.iter_mut().filter(|f| !f.used) {
+        for i in 0..files.len() {
+            let Some(file) = files.get_mut(i).filter(|f| !f.used) else { continue };
             let mut data = None;
             match &file.ranges {
-                Some(r) if !ranges_hold(r, cp) => continue,
+                Some(r) if !maps_all(r) => continue,
                 Some(_) => {}
                 None => {
                     *reads += 1;
                     data = read_fallback_file(&file.path);
                     let ranges = data.as_deref().map(coverage_ranges).unwrap_or_default();
-                    let hit = ranges_hold(&ranges, cp);
+                    let hit = maps_all(&ranges);
                     file.ranges = Some(ranges);
                     if !hit {
                         continue;
                     }
                 }
             }
-            // The file maps `c`: load it (once; its faces are loaded fonts from now on).
+            // The file maps them: load it (once; its faces are loaded fonts from now on).
             file.used = true;
+            if whole_family && let Some(name) = self.read_catalog().iter().find(|e| e.path == file.path).map(|e| e.family.clone()) {
+                // With the rest of its family not loaded yet: path order may reach the Bold file
+                // before the Regular, and a single-character fallback may have loaded one style.
+                let this = file.path.clone();
+                let family = self.family_paths(&name);
+                let mut load = Vec::new();
+                for f in files.iter_mut().filter(|f| f.path == this || !f.used && family.contains(&f.path)) {
+                    f.used = true;
+                    load.push(f.path.clone());
+                }
+                let fonts: Vec<(Vec<u8>, Option<String>)> = load.iter().filter_map(|p| read_fallback_file(p)).map(|b| (b, None)).collect();
+                *reads += fonts.len();
+                if self.add_fonts(fonts) > 0 && covered(self) {
+                    return true;
+                }
+                continue;
+            }
             if data.is_none() {
                 *reads += 1;
                 data = read_fallback_file(&file.path);
             }
             if let Some(data) = data
                 && self.add_font(data) > 0
-                && self.read_faces().iter().any(|f| f.covers(c))
+                && covered(self)
             {
                 return true;
             }
@@ -1642,11 +1881,11 @@ impl FontDb {
     /// Glyph outline in font units, y-down (flipped), cached per (face, glyph).
     pub fn outline(&self, face: &FontFace, gid: u32) -> Arc<BezPath> {
         let key = (face.id, gid);
-        if let Some(p) = self.outlines.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        if let Some(p) = self.outlines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
             return p.clone();
         }
         let p = Arc::new(face.glyph_outline(gid));
-        let mut cache = self.outlines.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.outlines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache.len() >= OUTLINE_CACHE_MAX {
             cache.clear();
         }
@@ -1682,18 +1921,48 @@ mod tests_sysfonts;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a locally licensed kaiu.ttf; set WORDCRAFT_TEST_KAI_FONT"]
+    fn kai_contours_include_complete_character_body() {
+        use kurbo::Shape;
+        let path = std::env::var_os("WORDCRAFT_TEST_KAI_FONT").expect("set WORDCRAFT_TEST_KAI_FONT");
+        let db = super::FontDb::with_font_dirs(vec![]);
+        db.set_system_fallback(false);
+        assert!(db.add_font(std::fs::read(path).unwrap()) > 0);
+        let face = db.face("DFKai-SB", "Regular");
+        assert_eq!(face.family, "DFKai-SB");
+        for ch in ['中', '文', '契', '約'] {
+            let outline = face.glyph_outline(face.glyph_for(ch));
+            let bounds = outline.bounding_box();
+            eprintln!("{ch}: {bounds:?}, upem={}", face.upem);
+            assert!(bounds.width() > face.upem * 0.5, "{ch}: missing horizontal strokes");
+            assert!(bounds.height() > face.upem * 0.5, "{ch}: missing vertical strokes");
+            assert!(std::sync::Arc::ptr_eq(&db.outline(&face, face.glyph_for(ch)), &db.outline(&face, face.glyph_for(ch))));
+        }
+    }
+
     use super::*;
 
     #[test]
-    fn east_asian_run_fallback_is_cached_per_char_set() {
+    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    fn system_font_dirs_include_the_flatpak_host_folders() {
+        // Inside a Flatpak, /usr/share/fonts is the runtime's: the host's fonts are under /run/host (#1937).
+        let dirs = system_font_dirs();
+        for d in ["/usr/share/fonts", "/run/host/fonts", "/run/host/local-fonts", "/run/host/user-fonts", "/run/host/user-fonts-legacy"] {
+            assert!(dirs.contains(&std::path::PathBuf::from(d)), "{d} missing from {dirs:?}");
+        }
+    }
+
+    #[test]
+    fn run_fallback_is_cached_per_char_set() {
         let db = FontDb::with_font_dirs(Vec::new());
         db.set_system_fallback(false);
         let latin = db.face(FALLBACK_FAMILY, "Regular");
-        let a = db.fallback_for_east_asian(&['分', '类', '分'], latin.id(), false, false).map(|f| f.id());
+        let a = db.fallback_for_run(&['分', '类', '分'], latin.id(), false, false).map(|f| f.id());
         // The same set in another order (and without the repeat) is the same entry.
-        assert_eq!(db.fallback_for_east_asian(&['类', '分'], latin.id(), false, false).map(|f| f.id()), a);
+        assert_eq!(db.fallback_for_run(&['类', '分'], latin.id(), false, false).map(|f| f.id()), a);
         {
-            let cache = db.ea_fallbacks.read().unwrap();
+            let cache = db.run_fallbacks.read().unwrap();
             assert_eq!(cache.faces, db.read_faces().len());
             assert_eq!(cache.map.len(), 1);
             assert!(cache.map.contains_key(&(vec!['分', '类'], latin.id(), false, false)));
@@ -1701,14 +1970,59 @@ mod tests {
         // Long hostile runs keep the cache bounded.
         let many: Vec<char> = (0x4E00u32..0x4E00 + 50_000).filter_map(char::from_u32).collect();
         for i in 0..30 {
-            let _ = db.fallback_for_east_asian(many.get(i..).unwrap_or(&[]), latin.id(), false, false);
+            let _ = db.fallback_for_run(many.get(i..).unwrap_or(&[]), latin.id(), false, false);
         }
-        let cache = db.ea_fallbacks.read().unwrap();
-        assert!(cache.chars <= EA_FALLBACK_CACHE_CHARS, "{}", cache.chars);
+        let cache = db.run_fallbacks.read().unwrap();
+        assert!(cache.chars <= RUN_FALLBACK_CACHE_CHARS, "{}", cache.chars);
         // Turning the system fallback on or off forgets remembered misses.
         drop(cache);
         db.set_system_fallback(false);
-        assert!(db.ea_fallbacks.read().unwrap().map.is_empty());
+        assert!(db.run_fallbacks.read().unwrap().map.is_empty());
+    }
+
+    /// The issue's run (#1549): Thai letters and digits, Latin letters, digits and the baht sign.
+    const THAI_RUN: &str = "[D] น้ำ ค่ำ ปั้น ฝั่ง ปู่ ๑๒๓๔๕๖๗๘๙๐ ฿1,250.50";
+
+    #[test]
+    fn a_thai_run_with_latin_falls_back_to_one_face() {
+        let db = FontDb::global();
+        if db.fallback_for('น', 0).is_none() {
+            eprintln!("skipped: no Thai font installed");
+            return;
+        }
+        let latin = db.face(FALLBACK_FAMILY, "Regular");
+        let chars: Vec<char> = THAI_RUN.chars().filter(|c| !c.is_whitespace()).collect();
+        let f = db.fallback_for_run(&chars, latin.id(), false, false).expect("one face covers the run");
+        assert_ne!(f.id, latin.id);
+        for c in &chars {
+            assert!(f.covers(*c), "{} covers {c}", f.family);
+        }
+        // A Thai font with OpenType tables, as the per-character fallback prefers.
+        assert!(f.has_layout_tables(), "{} shapes Thai", f.family);
+        // Without system fonts and without craft-fonts' Thai face (built in since craft-fonts
+        // 3d9ab3a1) no bundled face covers Thai: the caller keeps the per-character path.
+        let bundled = FontDb::with_font_dirs(Vec::new());
+        bundled.set_system_fallback(false);
+        let latin = bundled.face(FALLBACK_FAMILY, "Regular");
+        // Expected from the embedded font list, not from the database under test.
+        let thai_bundled = crate::CRAFT_FONTS.iter().any(|f| f.scripts.contains(&"Thai"));
+        assert_eq!(bundled.fallback_for('น', 0).is_some(), thai_bundled);
+        assert_eq!(bundled.fallback_for_run(&chars, latin.id(), false, false).is_some(), thai_bundled);
+    }
+
+    #[test]
+    fn a_family_named_for_a_heavy_weight_is_that_heavy() {
+        let face = |bytes: &'static [u8], family: &str| {
+            make_face(FontBytes::Static(bytes), 0, family.into(), "Regular".into(), family.into(), Vec::new()).unwrap()
+        };
+        // The file says 400, as the core-fonts Arial Black does: bold must not embolden it again.
+        assert_eq!(face(BUNDLED[0], "Arial Black").weight, 900.0);
+        assert_eq!(face(BUNDLED[0], "Franklin Gothic Heavy ").weight, 900.0);
+        assert_eq!(face(BUNDLED[0], "Segoe UI ExtraBold").weight, 800.0);
+        assert_eq!(face(BUNDLED[0], "Blackadder ITC").weight, 400.0);
+        assert_eq!(face(BUNDLED[0], "Arial").weight, 400.0);
+        // A file that already says it is heavy keeps its own weight (Lato Heavy is 800, not 900).
+        assert_eq!(face(BUNDLED[1], "Source Sans 3 Heavy").weight, 600.0);
     }
 
     #[test]
@@ -1763,5 +2077,37 @@ mod tests {
         let b = db.face("Inter Medium", "Medium {wght:520}");
         assert_eq!(a.id(), b.id());
         assert_eq!(a.legacy_family, "Inter Medium");
+    }
+
+    #[test]
+    fn full_names_select_exact_faces() {
+        let db = FontDb::with_font_dirs(vec![]);
+        for style in ["Regular", "Bold", "Italic", "Bold Italic"] {
+            let expected = db.face("Source Serif 4", style);
+            let f = expected.skrifa().unwrap();
+            let full = name(&f, &[StringId::FULL_NAME]).unwrap();
+            assert!(db.has_family(&full), "{full}");
+            assert_eq!(db.face(&full, "Regular").id(), expected.id());
+            let bold = if full == expected.family { db.face(&full, "Bold") } else { expected.clone() };
+            assert_eq!(db.face(&full.to_ascii_lowercase(), "Bold").id(), bold.id());
+        }
+        assert!(!db.has_family("NotAFont Bold"));
+        assert_eq!(db.face("Source Serif 4", "Regular").style, "Regular");
+    }
+
+    #[test]
+    fn postscript_names_select_faces() {
+        let db = FontDb::with_font_dirs(vec![]);
+        for style in ["Regular", "Bold", "Italic", "Bold Italic"] {
+            let expected = db.face("Source Serif 4", style);
+            let f = expected.skrifa().unwrap();
+            let ps = name(&f, &[StringId::POSTSCRIPT_NAME]).unwrap();
+            assert!(db.has_family(&ps), "{ps}");
+            let actual = db.face(&ps, "Regular");
+            assert_eq!(actual.id(), expected.id(), "{ps}");
+            assert_eq!(db.face(&ps.to_ascii_lowercase(), "Bold").id(), expected.id());
+        }
+        assert!(!db.has_family("NotAFont-Bold"));
+        assert_eq!(db.face("Source Serif 4", "Regular").style, "Regular");
     }
 }

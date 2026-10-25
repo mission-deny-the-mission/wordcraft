@@ -98,7 +98,7 @@ pub fn preview(p: &Painter, r: Rect, layout: SmartArtLayout, colors: SmartArtCol
                 } else {
                     vec![at(0.5 - hw(y0), y0), at(0.5 + hw(y0), y0), at(0.5 + hw(y1), y1), at(0.5 - hw(y1), y1)]
                 };
-                p.add(egui::Shape::convex_polygon(pts, col(k), Stroke::new(1.0, Color32::WHITE)));
+                p.add(egui::Shape::convex_polygon(pts, col(k), Stroke::new(1.0, line)));
             }
         }
         SmartArtLayout::Radial => {
@@ -151,12 +151,24 @@ pub fn swatches(p: &Painter, r: Rect, colors: SmartArtColors, theme: &[Rgb]) {
     }
 }
 
+/// Height of the picker's three columns, points: three rows of 96 pt tiles and the gaps between them.
+const PICKER_HEIGHT: f32 = 3.0 * 96.0 + 2.0 * 8.0;
+
+/// The picker's columns side by side. A separator in a row takes all the height it is offered,
+/// which for a dialog is the whole window, so the row is offered only [`PICKER_HEIGHT`].
+fn picker_row(ui: &mut Ui, columns: impl FnOnce(&mut Ui)) {
+    ui.scope(|ui| {
+        ui.set_max_height(PICKER_HEIGHT);
+        ui.horizontal_top(columns);
+    });
+}
+
 /// The picker; returns true to close.
 pub fn picker_ui(app: &mut WordApp, ui: &mut Ui, f: &mut SmartArtForm) -> bool {
     let t = Tokens::get(ui.ctx());
     let theme = app.session.doc.settings.theme_colors.clone();
     let mut chosen = None;
-    ui.horizontal_top(|ui| {
+    picker_row(ui, |ui| {
         ui.vertical(|ui| {
             ui.set_width(120.0);
             for cat in CATEGORIES {
@@ -176,7 +188,7 @@ pub fn picker_ui(app: &mut WordApp, ui: &mut Ui, f: &mut SmartArtForm) -> bool {
             ui.set_min_height(2.0 * 96.0 + 8.0);
             egui::Grid::new("smart_art_layouts").spacing(vec2(8.0, 8.0)).show(ui, |ui| {
                 for (k, layout) in f.shown().into_iter().enumerate() {
-                    let (rect, resp) = ui.allocate_exact_size(vec2(96.0, 88.0), Sense::click());
+                    let (rect, resp) = ui.allocate_exact_size(vec2(96.0, 96.0), Sense::click());
                     let on = f.layout == layout;
                     let fill = if on {
                         t.checked
@@ -194,14 +206,28 @@ pub fn picker_ui(app: &mut WordApp, ui: &mut Ui, f: &mut SmartArtForm) -> bool {
                         &theme,
                         t.text_dim,
                     );
-                    ui.painter().text(
-                        pos2(rect.center().x, rect.bottom() - 11.0),
-                        egui::Align2::CENTER_CENTER,
-                        tl!(layout.label()),
-                        regular(10.5),
-                        t.text,
-                    );
-                    let resp = resp.on_hover_text(tl!(layout.label()));
+                    // A label wider than the tile (a long translation) breaks at its middle space.
+                    let label = tl!(layout.label());
+                    let width = |text: &str| ui.ctx().fonts_mut(|f| f.layout_no_wrap(text.to_string(), regular(10.5), t.text).size().x);
+                    let lines = if width(label) <= rect.width() - 6.0 {
+                        vec![label.to_string()]
+                    } else {
+                        let split = label
+                            .match_indices(' ')
+                            .map(|(i, _)| (label[..i].to_string(), label[i + 1..].to_string()))
+                            .min_by(|a, b| width(&a.0).max(width(&a.1)).total_cmp(&width(&b.0).max(width(&b.1))));
+                        split.map_or_else(|| vec![label.to_string()], |(a, b)| vec![a, b])
+                    };
+                    for (n, line) in lines.iter().rev().enumerate() {
+                        ui.painter().text(
+                            pos2(rect.center().x, rect.bottom() - 11.0 - 12.5 * n as f32),
+                            egui::Align2::CENTER_CENTER,
+                            line,
+                            regular(10.5),
+                            t.text,
+                        );
+                    }
+                    let resp = resp.on_hover_text(label);
                     if resp.clicked() {
                         f.layout = layout;
                     }
@@ -250,8 +276,55 @@ pub fn items_without(g: &SmartArtSpec, i: usize) -> Value {
     json!({"items": items})
 }
 
+/// The Text Pane button on the left edge of the selected graphic's frame, as in Word, while
+/// the pane is closed.
+pub fn frame_button(app: &mut WordApp, ctx: &egui::Context, layout: &wordcraft_layout::DocLayout, pages: &[Rect], scale: f32, clip: Rect) {
+    // The pane goes with the graphic: it opens again only on request.
+    if wordcraft_engine::cmd::smart_art::selected_smart_art(&app.session).is_none() {
+        app.session.view.smart_art_pane = false;
+        return;
+    }
+    if app.session.view.smart_art_pane {
+        return;
+    }
+    let Some((hit, _)) = crate::objects::active(app, layout) else { return };
+    let Some(page) = pages.get(hit.page) else { return };
+    let frame = crate::frame::to_screen(*page, scale, hit.rect);
+    let at = pos2(frame.min.x - 28.0, frame.center().y - 14.0);
+    if !clip.contains(at) {
+        return;
+    }
+    let t = Tokens::get(ctx);
+    egui::Area::new(egui::Id::new("smart_art_frame_button")).order(egui::Order::Foreground).fixed_pos(at).show(ctx, |ui| {
+        egui::Frame::NONE.fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(4).inner_margin(2).show(ui, |ui| {
+            if crate::widgets::icon_button(ui, "textPane", tl!("Text Pane")).clicked() {
+                let _ = app.run("smartArt.textPane", json!({"value": true}));
+            }
+        });
+    });
+}
+
+/// Text typed with a SmartArt graphic selected goes at the end of its current item (the first,
+/// before any is picked), and the Text Pane opens, as Word does; it never replaces the graphic.
+/// False when no graphic is selected.
+pub fn type_into(app: &mut WordApp, typed: &str) -> bool {
+    let Some(g) = wordcraft_engine::cmd::smart_art::selected_smart_art(&app.session) else { return false };
+    let Some(i) = app.smart_art_item.filter(|i| *i < g.items.len()).or((!g.items.is_empty()).then_some(0)) else { return true };
+    let text = g.items.get(i).map_or(String::new(), |it| it.text.clone()) + typed;
+    if app.smart_art_typing == Some(i) {
+        app.session.join_next_undo();
+    }
+    if app.run("smartArt.items", items_with(&g, i, &text)).is_ok() {
+        app.smart_art_item = Some(i);
+        app.smart_art_typing = Some(i);
+    }
+    let _ = app.run("smartArt.textPane", json!({"value": true}));
+    true
+}
+
 /// The Text Pane: a row per item, indented by level. Typing changes the graphic as you go (one
-/// undo step per item typed in); Enter adds an item after the current one.
+/// undo step per item typed in); Enter adds an item after the current one; Tab demotes the
+/// focused item and Shift+Tab promotes it, as Word's Text Pane does.
 pub fn text_pane(app: &mut WordApp, ui: &mut Ui) {
     let Some(g) = wordcraft_engine::cmd::smart_art::selected_smart_art(&app.session) else { return };
     let t = Tokens::get(ui.ctx());
@@ -260,6 +333,7 @@ pub fn text_pane(app: &mut WordApp, ui: &mut Ui) {
     let focus_id = egui::Id::new("smart_art_focus");
     let want_focus: Option<usize> = ui.data_mut(|d| d.remove_temp(focus_id));
     let mut typed = false;
+    app.smart_art_row_focused = false;
     egui::ScrollArea::vertical().id_salt("smart_art_items").max_height((ui.available_height() - 40.0).max(60.0)).show(ui, |ui| {
         for (i, it) in g.items.iter().enumerate() {
             ui.horizontal(|ui| {
@@ -272,6 +346,7 @@ pub fn text_pane(app: &mut WordApp, ui: &mut Ui) {
                 }
                 if r.has_focus() || r.gained_focus() {
                     app.smart_art_item = Some(i);
+                    app.smart_art_row_focused = true;
                 }
                 if r.changed() {
                     typed = true;
@@ -336,5 +411,24 @@ mod tests {
         let levels: Vec<u64> = v["items"].as_array().unwrap().iter().map(|i| i["level"].as_u64().unwrap()).collect();
         assert_eq!(levels, [0, 1, 1, 2, 2]);
         assert_eq!(items_with(&g, 0, "Boss")["items"][0]["text"], "Boss");
+    }
+
+    /// #2832: the separators between the picker's columns made the dialog as tall as the window.
+    #[test]
+    fn the_picker_row_stays_within_its_height() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1920.0, 1080.0))), ..Default::default() };
+        let mut height = f32::MAX;
+        ctx.run_ui(input, |ui| {
+            let top = ui.cursor().top();
+            picker_row(ui, |ui| {
+                ui.label("a");
+                ui.separator();
+                ui.label("b");
+            });
+            height = ui.min_rect().bottom() - top;
+        })
+        .drop_without_applying_deltas();
+        assert!(height <= PICKER_HEIGHT + 1.0, "the row is {height} pt tall");
     }
 }

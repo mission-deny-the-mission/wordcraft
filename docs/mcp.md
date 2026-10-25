@@ -13,7 +13,31 @@ Claude Code: `claude mcp add wordcraft -- wordcraft-cli mcp`.
 
 With `--connect`, the bridge sends the app's control key, which it reads from
 `WORDCRAFT_CONTROL_KEY` or from the key file the app writes at start. It sends the key only to
-loopback addresses; see [Keys](control-protocol.md#keys).
+loopback addresses; see [Keys](control-protocol.md#keys). The bridge serves even when the app
+isn't open yet: tool calls return "not reachable … will retry on each call" and succeed once the
+app's port opens (#4078), so a client that starts before WordCraft doesn't lose the server for
+its whole session.
+
+## Scripts from the command line
+
+`wordcraft-cli run --script job.json` (`--script -` reads standard input) runs the commands in a
+file, in order, exactly like repeated `--cmd`, and then saves. Use it to generate a DOCX and its
+PDF in one run without a window:
+
+```json
+{"template": "sample",
+ "commands": [{"command": "select.text", "params": {"text": "Membership"}},
+              {"command": "format.bold"},
+              "caret.docEnd"],
+ "save": ["out.docx", "out.pdf"]}
+```
+
+`file` (a document to open) and `template` are optional, and `--file` / `--template` on the command
+line win. A command is `{"command": id, "params": {…}}` or just the id. `save` is a path or a list;
+each output's format follows its extension. Relative `file` and `save` paths resolve against the
+script's folder (the working folder for stdin). `--cmd` flags run after the script's commands and
+`--save` after its outputs. A failing command stops the run with `command N (id): …` and exit
+status 1, and nothing is saved. Every output is checked (known extension, folder exists) before the first is written. Paths inside command params (a picture to insert, say) are relative to the working folder, not the script's. Scripts are capped at 4 MiB.
 
 ## Tracked changes by an agent
 
@@ -45,8 +69,8 @@ config works across the suite) keep the agent to the folders you give it:
   `styles.organizer` and `styles.copyFrom` read. The pictures an opened HTML file names are read
   from beside that file, so they are inside the read root too (a link that leads out is not followed).
 - Every file a command writes must lie inside the **write root**: `save_document`, `file.save`,
-  `file.saveAs`, `file.exportPdf`, `file.exportPng`, `file.printPdf`, `file.saveTemplate`, and `mailings.finish` with
-  a `path`.
+  `file.saveAs`, `file.rename` (the file and its new name), `file.exportPdf`, `file.exportPng`, `file.printPdf`,
+  `file.saveTemplate`, and `mailings.finish` with a `path`.
 - Read and write access are separate. Give the same folder twice for both; a root left out grants
   none of its access (with only `--automation-read-root`, nothing can be written to disk). Without
   either flag nothing changes.
@@ -87,12 +111,15 @@ files it was given rather than guarding against other software on the computer.
 | `batch` | run several commands in order |
 | `new_document` | blank, sample, letter, resume, report |
 | `open_document` / `save_document` | docx, doc (open only), odt, rtf, html, md, tex, txt, json; save also pdf, png |
-| `type_text` | type at the caret (`paragraphs: true` splits lines into paragraphs) |
+| `type_text` | type at the caret (`paragraphs: true` splits lines into paragraphs, in one command and one Undo step: 10,000 lines take ~10 ms; the line breaks are plain breaks, so AutoCorrect doesn't run on them) |
 | `select_text` | select the n-th occurrence of some text |
 | `get_text` / `inspect_document` | read the document back (verify without screenshots) |
 | `render_page` | a page as PNG |
 | `parity` | feature coverage |
 | `screenshot`, `click`, `key`, `ui_inspect` | app only (`--connect`) |
+
+`insert.picture` and `insert.icon` leave the caret after the new picture, so typing next doesn't
+replace it; Picture Format commands (`picture.*`, `arrange.*`) still act on it.
 
 Resources: `wordcraft://document` (inspect) and `wordcraft://commands`.
 
@@ -104,12 +131,12 @@ The acceptance test `crates/mcp/src/tests.rs` writes a formatted document using 
 `styles.modify {"style": …, "chr"?: CharProps, "para"?: ParaProps}` and the `para` of
 `table.newStyle` / `table.modifyStyle` take these two objects. Every field is optional: a field
 left out keeps what the style chain gives. A field name the object doesn't know is ignored, not
-refused, so check the spelling. Lengths are points; `[r, g, b]` is a colour as three numbers
-0–255.
+refused, so check the spelling. Lengths are points. A colour is a hex string `"RRGGBB"` or
+`"#RRGGBB"`, or `[r, g, b]` (three numbers 0–255); it reads back as `[r, g, b]` (#865).
 
 ```json
 {"command": "styles.modify", "params": {"style": "Heading1",
-  "chr": {"font": "Georgia", "size": 18, "bold": true, "color": {"Rgb": [27, 22, 17]}},
+  "chr": {"font": "Georgia", "size": 18, "bold": true, "color": "1B1611"},
   "para": {"spaceBefore": 12, "lineSpacing": {"rule": "multiple", "value": 1.15}, "keepNext": true}}}
 ```
 
@@ -122,10 +149,10 @@ refused, so check the spelling. Lengths are points; `[r, g, b]` is a colour as t
 | `size` | number | points |
 | `bold`, `italic`, `strike`, `doubleStrike`, `caps`, `smallCaps`, `hidden`, `outline`, `shadow`, `emboss`, `engrave`, `noProof` | bool | |
 | `underline` | string | `none`, `single`, `words`, `double`, `thick`, `dotted`, `dash`, `dotDash`, `dotDotDash`, `wave`, `doubleWave` |
-| `underlineColor` | `[r, g, b]` | |
-| `color` | `"Auto"`, a hex string `"RRGGBB"` or `"#RRGGBB"`, or `{"Rgb": [r, g, b]}` | `Auto` (also `"auto"`) is black on light backgrounds, white on dark; read back as `"Auto"` or `{"Rgb": …}` (#865) |
+| `underlineColor` | colour | |
+| `color` | `"Auto"`, a colour, or `{"Rgb": colour}` | `Auto` (also `"auto"`) is black on light backgrounds, white on dark; read back as `"Auto"` or `{"Rgb": …}` (#865) |
 | `highlight` | string | `none`, `yellow`, `brightGreen`, `turquoise`, `pink`, `blue`, `red`, `darkBlue`, `teal`, `green`, `violet`, `darkRed`, `darkYellow`, `gray50`, `gray25`, `black`, `white` |
-| `shading` | `[r, g, b]` | background fill |
+| `shading` | colour | background fill |
 | `border` | Border | character border; `"style": "none"` is explicitly no border |
 | `vertAlign` | string | `baseline`, `superscript`, `subscript` |
 | `spacing` | number | character spacing, points: positive expands, negative condenses |
@@ -146,7 +173,7 @@ refused, so check the spelling. Lengths are points; `[r, g, b]` is a colour as t
 `format.set` also applies `size`, `bold` and `italic` to `sizeCs`, `boldCs` and `italicCs` when
 those aren't given; `styles.modify` sets only what it is given.
 
-A **Border** is `{"style": …, "width": pt, "color": [r, g, b] | null, "space": pt}` (`space` is
+A **Border** is `{"style": …, "width": pt, "color": colour | null, "space": pt}` (`space` is
 the distance from the text). Missing fields are `none`, 0, no colour and 0, so a border needs a
 `width` above 0 to show. `style` is one of `none`, `single`, `double`, `dotted`, `dashed`,
 `thick`, `triple`, `dotDash`, `wave`.
@@ -168,7 +195,7 @@ the distance from the text). Missing fields are `none`, 0, no colour and 0, so a
 | `outlineLevel` | integer | 0–8 = Level 1–9, 9 = body text |
 | `numbering` | object | `{"num": n, "level": n}`, both required; `level` counts from 0; `num` 0 removes numbering a style gives |
 | `tabs` | array | `[{"pos": pt, "align"?: "left\|center\|right\|decimal\|bar\|clear", "leader"?: "none\|dot\|hyphen\|underscore\|middleDot"}]`; replaces the inherited stops, `clear` removes an inherited one at `pos` |
-| `shading` | `[r, g, b]` | background fill |
+| `shading` | colour | background fill |
 | `borders` | object | `{"top", "left", "bottom", "right", "between"}`, each a Border (`between`: between paragraphs; `inside_v` is used by tables) |
 | `suppressHyphens`, `suppressLineNumbers` | bool | |
 | `bidi` | bool | right-to-left paragraph |
@@ -176,3 +203,8 @@ the distance from the text). Missing fields are `none`, 0, no colour and 0, so a
 | `kinsoku`, `wordWrap`, `overflowPunct`, `autoSpaceDE`, `autoSpaceDN`, `snapToGrid` | bool | East Asian typography; unset = on |
 | `topLinePunct` | bool | East Asian typography; unset = off |
 | `numChange`, `fmtChange` | | Track Changes bookkeeping |
+
+`para.set` also takes `"onPage": {"align"?: "left|center|right|justify|distribute", "left"?: pt,
+"right"?: pt}`: the alignment and indents as seen on the page, which each selected paragraph turns
+into its own start and end once `props` (a `bidi` in it, say) is applied. The Paragraph dialog sends
+only the fields that changed this way, as one command and so one undo step.

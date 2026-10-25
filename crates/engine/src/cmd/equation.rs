@@ -803,6 +803,49 @@ mod tests {
     }
 
     #[test]
+    fn colour_survives_save_and_reopen() {
+        // #1467: a coloured equation came back black after saving and reopening.
+        let mut s = session();
+        s.run("insert.equation", &json!({"linear": "(a+b)/c"})).unwrap();
+        s.run("equation.exit", &json!({})).unwrap();
+        s.run("select.all", &json!({})).unwrap();
+        s.run("format.color", &json!({"color": "C00000"})).unwrap();
+        assert!(document_xml(&s).contains(r#"<w:color w:val="C00000"/></w:rPr><m:t"#), "the math runs carry the colour");
+        let mut back = Session::new(wordcraft_docx::read(&wordcraft_docx::write(&s.doc).unwrap()).unwrap());
+        back.run("equation.edit", &json!({})).unwrap();
+        let at = back.math.as_ref().unwrap().at.clone();
+        let p = back.doc.para_at(&at).unwrap();
+        let (_, props) = p.run_ranges().find(|(r, _)| r.contains(&at.off)).unwrap();
+        assert_eq!(props.color, Some(wordcraft_doc::props::TextColor::Rgb(wordcraft_doc::props::Rgb(0xC0, 0, 0))), "the equation's colour is back");
+        let Some(InlineObject::Equation { math, .. }) = p.object_at(at.off) else { panic!() };
+        let mut nodes = math.nodes.clone();
+        let mut runs = 0;
+        wordcraft_doc::math_edit::each_run_mut(&mut nodes, &mut |r| {
+            runs += 1;
+            assert_eq!(r.color, None, "the colour is the equation's, not stuck on each run");
+        });
+        assert!(runs > 0);
+        // Automatic again: no colour written.
+        back.run("select.all", &json!({})).unwrap();
+        back.run("format.color", &json!({"color": "auto"})).unwrap();
+        assert!(!document_xml(&back).contains("C00000"));
+    }
+
+    #[test]
+    fn imported_colour_keeps_source_omml_until_recoloured() {
+        // #1467: lifting a Word equation's colour must not drop the OMML the model can't hold.
+        let r = r#"<w:rPr><w:color w:val="FF0000"/></w:rPr>"#;
+        let ctrl = r#"<m:ctrlPr><w:rPr><w:color w:val="00FF00"/></w:rPr></m:ctrlPr>"#;
+        let mut s =
+            imported(&format!("<m:f><m:fPr>{ctrl}</m:fPr><m:num><m:r>{r}<m:t>a</m:t></m:r></m:num><m:den><m:r>{r}<m:t>b</m:t></m:r></m:den></m:f>"));
+        assert!(document_xml(&s).contains("00FF00"), "untouched: source OMML written back");
+        s.run("select.all", &json!({})).unwrap();
+        s.run("format.color", &json!({"color": "0000FF"})).unwrap();
+        let xml = document_xml(&s);
+        assert!(xml.contains("0000FF") && !xml.contains("FF0000"), "recoloured: runs rewritten");
+    }
+
+    #[test]
     fn navigation_keeps_imported_omml() {
         // #446: a Left move without any change dropped the fraction's imported control colour.
         let red = r#"<m:f><m:fPr><m:ctrlPr><w:rPr><w:color w:val="FF0000"/></w:rPr></m:ctrlPr></m:fPr><m:num><m:r><m:t>a</m:t></m:r></m:num><m:den><m:r><m:t>b</m:t></m:r></m:den></m:f>"#;
@@ -847,5 +890,55 @@ mod tests {
             s.run("insert.equation", &json!({"latex": tex})).unwrap();
             assert_eq!(s.run("equation.get", &json!({})).unwrap()["latex"], want, "{tex}");
         }
+    }
+
+    #[test]
+    fn typed_multi_letter_scripts_stay_whole() {
+        // #1609, Word for Mac 16.113.4: `V_dd` + Space leaves "dd" entirely in the subscript.
+        for typed in ["V_dd", "V_(dd)"] {
+            let mut s = session();
+            s.run("insert.equation", &json!({})).unwrap();
+            s.run("equation.type", &json!({"text": typed})).unwrap();
+            s.run("equation.type", &json!({"text": " "})).unwrap();
+            let nodes = nodes_of(&s, &s.math.as_ref().unwrap().at).unwrap();
+            assert_eq!(nodes.len(), 1, "{typed}: {nodes:#?}");
+            assert!(
+                matches!(&nodes[0], MNode::Script { sub, .. } if matches!(sub.as_slice(), [MNode::Run(r)] if r.text == "dd")),
+                "{typed}: {nodes:#?}"
+            );
+        }
+        let mut s = session();
+        s.run("insert.equation", &json!({})).unwrap();
+        s.run("equation.type", &json!({"text": "x^ab "})).unwrap();
+        let nodes = nodes_of(&s, &s.math.as_ref().unwrap().at).unwrap();
+        assert!(matches!(&nodes[0], MNode::Script { sup, .. } if matches!(sup.as_slice(), [MNode::Run(r)] if r.text == "ab")), "{nodes:#?}");
+    }
+
+    #[test]
+    fn a_built_script_keeps_the_letter_typed_after_it() {
+        // #1609 review: `x_i y ` built x_{iy}: the letter after a script is its own item.
+        let mut s = session();
+        s.run("insert.equation", &json!({})).unwrap();
+        s.run("equation.type", &json!({"text": "x_i y "})).unwrap();
+        let nodes = nodes_of(&s, &s.math.as_ref().unwrap().at).unwrap();
+        assert_eq!(nodes.len(), 2, "{nodes:#?}");
+        assert!(matches!(&nodes[0], MNode::Script { sub, .. } if matches!(sub.as_slice(), [MNode::Run(r)] if r.text == "i")), "{nodes:#?}");
+        assert!(matches!(&nodes[1], MNode::Run(r) if r.text.trim() == "y"), "{nodes:#?}");
+        let mut s = session();
+        s.run("insert.equation", &json!({})).unwrap();
+        s.run("equation.type", &json!({"text": "a_i b_j "})).unwrap();
+        let nodes = nodes_of(&s, &s.math.as_ref().unwrap().at).unwrap();
+        let subs: Vec<&str> = nodes
+            .iter()
+            .filter_map(|n| match n {
+                MNode::Script { sub, .. } => match sub.as_slice() {
+                    [MNode::Run(r)] => Some(r.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subs, ["i", "j"], "{nodes:#?}");
+        assert!(nodes.iter().all(|n| matches!(n, MNode::Script { .. }) || matches!(n, MNode::Run(r) if r.text.trim().is_empty())), "{nodes:#?}");
     }
 }

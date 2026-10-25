@@ -1,10 +1,10 @@
 //! Live oCIS round-trip: engine [`Session`][wordcraft_engine::Session] ↔ WebDAV Bearer backend.
 //!
-//! Runs only with `CRAFT_E2E_LIVE=1` and `CRAFT_DAV_TOKEN` set (a short-lived OIDC access
+//! Runs only with `CRAFT_E2E_LIVE=1`, `CRAFT_DAV_BASE`, `CRAFT_DAV_USER` and `CRAFT_DAV_TOKEN` set (a short-lived OIDC access
 //! token minted out of band); plain `cargo test` skips without touching the network, so this
 //! never blocks offline runs. The token is read from the environment and never printed.
 //!
-//! What it proves beyond the k8s curl harness (raw bytes): a `.docx` goes oCIS → engine
+//! What it proves beyond the raw-byte backend tests: a `.docx` goes oCIS → engine
 //! `Session` → oCIS with the backend carrying the bytes exactly (byte fidelity), and the
 //! parsed document keeps its text across both crossings.
 
@@ -20,10 +20,13 @@ fn live_backend() -> Option<(WebDavBackend, String)> {
     if std::env::var("CRAFT_E2E_LIVE").as_deref() != Ok("1") {
         return None;
     }
-    let base = std::env::var("CRAFT_DAV_BASE").unwrap_or_else(|_| "http://proxy.ocis.svc.cluster.local:9200".into());
-    let user = std::env::var("CRAFT_DAV_USER").unwrap_or_else(|_| "ocis-e2e-tmp".into());
+    let base = std::env::var("CRAFT_DAV_BASE").unwrap_or_default();
+    let user = std::env::var("CRAFT_DAV_USER").unwrap_or_default();
     let token = std::env::var("CRAFT_DAV_TOKEN").unwrap_or_default();
-    assert!(!token.is_empty(), "CRAFT_E2E_LIVE=1 needs CRAFT_DAV_TOKEN set");
+    assert!(
+        !base.is_empty() && !user.is_empty() && !token.is_empty(),
+        "CRAFT_E2E_LIVE=1 needs CRAFT_DAV_BASE (e.g. http://ocis.lan:9200), CRAFT_DAV_USER and CRAFT_DAV_TOKEN set"
+    );
     let url = format!("{}/remote.php/dav/files/{user}/", base.trim_end_matches('/'));
     let backend = WebDavBackend::with_bearer(&url, &token).expect("bearer backend builds");
     Some((backend, user))

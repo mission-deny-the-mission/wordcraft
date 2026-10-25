@@ -7,7 +7,7 @@
 //!
 //! Draw › Lasso Select picks the strokes (and drawings) inside a loop drawn on a page; the
 //! selection can then be moved, recoloured, deleted or turned into shapes. Ink to Shape replaces
-//! strokes that look like a line, rectangle, ellipse, triangle or polygon with that shape
+//! strokes that look like a line, arrow, rectangle, ellipse, triangle or polygon with that shape
 //! ([`ink_shape`](super::ink_shape)). Ink Replay plays the strokes back in the order they were
 //! drawn (each stroke keeps its place in that order). Add Pen keeps custom pens in a gallery.
 
@@ -22,7 +22,7 @@ use wordcraft_doc::{CharProps, Pos, StoryRef};
 use wordcraft_geom::Rect;
 use wordcraft_layout::{DocLayout, Placed};
 
-use super::ink_shape::{InkShape, recognise};
+use super::ink_shape::{ArrowParts, InkShape, arrow_parts, pair_parts, recognise};
 use super::pos_json;
 use crate::{CmdError, CmdResult, CommandSpec, Session, p};
 
@@ -460,20 +460,37 @@ fn stroke(s: &mut Session, v: &Value) -> CmdResult {
         effects: Default::default(),
         extra: Default::default(),
     };
-    let at = place(s, &layout, obj, page, (fx, fy), first[1])?;
-    // Ink to Shape: a stroke that looks like a shape becomes it (in the same undo step).
-    let shape = if s.view.draw.ink_to_shape && tool != InkTool::Highlighter { convert_at(s, &at)? } else { None };
-    Ok(json!({"pos": pos_json(&at), "page": page, "rect": [fx, fy, fw, fh], "shape": shape}))
+    let at = place(s, &layout, obj, page, (fx, fy), (first[0], first[1]))?;
+    // Ink to Shape: a stroke that looks like a shape becomes it, and a line and a head drawn as two
+    // strokes become one arrow (in the same undo step).
+    let (at, shape, rect) = if s.view.draw.ink_to_shape && tool != InkTool::Highlighter {
+        match pair_with_neighbour(s, page, &at)? {
+            Some(arrow) => {
+                // The arrow is the line drawn earlier (or just now): its frame, not the stroke's.
+                s.touch();
+                let r = s.layout().object(&arrow, page).map(|o| o.rect);
+                let rect = r.map_or([fx, fy, fw, fh], |r| [r.x, r.y, r.w, r.h]);
+                (arrow, Some("arrow"), rect)
+            }
+            None => {
+                let shape = convert_at(s, &at)?;
+                (at, shape, [fx, fy, fw, fh])
+            }
+        }
+    } else {
+        (at, None, [fx, fy, fw, fh])
+    };
+    Ok(json!({"pos": pos_json(&at), "page": page, "rect": rect, "shape": shape}))
 }
 
 /// Insert floating `obj` with its top-left at `(x, y)` on `page`, anchored to the body paragraph
-/// under `anchor_y` (positioned from its column and top), or, where no paragraph starts on the
+/// under `anchor` (positioned from its column and top), or, where no paragraph starts on the
 /// page, to the nearest line and positioned on the page. Returns where its character went.
-fn place(s: &mut Session, layout: &DocLayout, obj: InlineObject, page: usize, (x, y): (f32, f32), anchor_y: f32) -> Result<Pos, CmdError> {
-    let (at, on_page) = match super::objects::anchor_paragraph(layout, page, anchor_y, StoryRef::Body) {
+fn place(s: &mut Session, layout: &DocLayout, obj: InlineObject, page: usize, (x, y): (f32, f32), anchor: (f32, f32)) -> Result<Pos, CmdError> {
+    let (at, on_page) = match super::objects::anchor_paragraph(&s.doc, layout, page, anchor, StoryRef::Body) {
         Some(path) => (Pos { story: StoryRef::Body, path, off: 0 }, false),
         None => (
-            super::objects::nearest_line(layout, page, anchor_y, StoryRef::Body)
+            super::objects::nearest_line(layout, page, anchor.1, StoryRef::Body)
                 .ok_or_else(|| CmdError::Params("no text on that page to anchor to".into()))?,
             true,
         ),
@@ -513,6 +530,16 @@ pub fn lasso_selection(s: &Session) -> Option<&LassoSelection> {
 /// Keep `sel` selected after the mutating command running now (which bumps the revision once).
 fn keep_lasso(s: &mut Session, sel: LassoSelection) {
     s.view.draw.lasso = Some(LassoSelection { rev: s.rev().wrapping_add(1), ..sel });
+}
+
+/// After a command that changed nothing, which puts the revision back from `touched` to `rev`: a
+/// lasso selection the command kept for the revision it would have reached stays selected.
+pub(crate) fn rekey_lasso(s: &mut Session, touched: u64, rev: u64) {
+    if let Some(l) = s.view.draw.lasso.as_mut()
+        && (l.rev == touched || l.rev == touched.wrapping_add(1))
+    {
+        l.rev = rev;
+    }
 }
 
 /// Whether (`x`, `y`) is inside the closed loop `poly` (even–odd rule).
@@ -676,28 +703,141 @@ fn lasso_color(s: &mut Session, v: &Value) -> CmdResult {
 
 // --- Ink to Shape --------------------------------------------------------------------------
 
-/// Turn the lasso-selected strokes that look like shapes into those shapes (one undo step).
+/// Turn the lasso-selected strokes that look like shapes into those shapes, and a selected line
+/// and arrowhead drawn as two strokes into one arrow (one undo step).
 fn convert_selection(s: &mut Session, _: &Value) -> CmdResult {
     let sel = lasso_required(s)?;
-    let mut converted = Vec::new();
-    for pos in &sel.items {
+    let layout = s.layout();
+    let pieces = arrow_pieces(s, &layout, sel.page, |pos, _| sel.items.contains(pos));
+    let (mut used, mut heads, mut converted): (Vec<Pos>, Vec<Pos>, Vec<(Pos, &'static str)>) = (Vec::new(), Vec::new(), Vec::new());
+    // Each piece was recognised once; pairing them is cheap geometry, even for a crowded page.
+    for line in pieces.iter().filter(|k| k.parts.line.is_some()) {
+        for head in pieces.iter().filter(|k| !k.parts.heads.is_empty()) {
+            if line.pos == head.pos || used.contains(&line.pos) || used.contains(&head.pos) || !near(line.rect, head.rect) {
+                continue;
+            }
+            if let Some(arrow) = pair_parts(&line.parts, &head.parts) {
+                set_shape(s, &line.pos, &local_to(&arrow, line.rect))?;
+                used.extend([line.pos.clone(), head.pos.clone()]);
+                heads.push(head.pos.clone());
+                converted.push((line.pos.clone(), "arrow"));
+            }
+        }
+    }
+    for pos in sel.items.iter().filter(|p| !used.contains(p)) {
         if let Some(name) = convert_at(s, pos)? {
-            converted.push(json!({"pos": pos_json(pos), "shape": name}));
+            converted.push((pos.clone(), name));
         }
     }
     if converted.is_empty() {
         return Err(CmdError::Failed("none of the selected strokes looks like a shape".into()));
     }
-    keep_lasso(s, sel);
+    // The heads went into their arrows; last first, so the earlier ones keep their place.
+    heads.sort();
+    for pos in heads.iter().rev() {
+        delete_object(s, pos)?;
+    }
+    let items = sel.items.iter().filter(|p| !heads.contains(p)).map(|p| after_deleting(p, &heads)).collect();
+    let converted: Vec<Value> = converted.iter().map(|(p, name)| json!({"pos": pos_json(&after_deleting(p, &heads)), "shape": name})).collect();
+    keep_lasso(s, LassoSelection { items, ..sel });
     Ok(json!({"count": converted.len(), "converted": converted}))
+}
+
+/// Where `pos` is once the objects at `deleted` (none of them `pos`) are gone.
+fn after_deleting(pos: &Pos, deleted: &[Pos]) -> Pos {
+    let before = deleted.iter().filter(|d| d.story == pos.story && d.path == pos.path && d.off < pos.off).count();
+    Pos { off: pos.off.saturating_sub(before.saturating_mul(OBJ.len_utf8())), ..pos.clone() }
+}
+
+/// A stroke (or an Ink to Shape line or triangle) on a page that may be one half of a two-stroke
+/// arrow: where it is, when it was drawn (ink's drawing order) and what it can be in an arrow.
+struct ArrowPiece {
+    pos: Pos,
+    rect: Rect,
+    order: Option<u32>,
+    parts: ArrowParts,
+}
+
+/// Whether two objects laid out at `a` and `b` are close enough to make an arrow (a cheap test
+/// before recognising them).
+fn near(a: Rect, b: Rect) -> bool {
+    let reach = 0.2 * a.w.max(a.h).max(b.w).max(b.h);
+    reach.is_finite() && a.expand(reach).intersects(&b.expand(reach))
+}
+
+/// The pieces of two-stroke arrows on `page` that `keep` (given the position and laid-out rect)
+/// accepts: unturned, unflipped pen and pencil strokes, and the open two-point lines and closed
+/// triangles Ink to Shape makes. `keep` runs first, so only kept pieces are recognised.
+fn arrow_pieces(s: &Session, layout: &DocLayout, page: usize, keep: impl Fn(&Pos, &Rect) -> bool) -> Vec<ArrowPiece> {
+    let Some(pg) = layout.pages.get(page) else { return Vec::new() };
+    let mut out = Vec::new();
+    for it in &pg.items {
+        let Placed::Object { rect, spin, story, path, off, .. } = it else { continue };
+        let pos = Pos { story: *story, path: path.clone(), off: *off };
+        if !spin.is_identity() || !keep(&pos, rect) {
+            continue;
+        }
+        let Some(InlineObject::Shape { kind, freeform: Some(f), float, .. }) = s.doc.para_at(&pos).and_then(|p| p.object_at(*off)) else { continue };
+        let Some(fp) = f.paths.first().filter(|_| f.paths.len() == 1) else { continue };
+        let pen = matches!(f.ink, Some(InkTool::Pen | InkTool::Pencil)) && !s.view.hide_ink;
+        let shape = f.ink.is_none() && *kind == ShapeKind::Freeform && matches!((fp.pts.len(), fp.closed), (2, false) | (3, true));
+        if !(pen || shape) || float.rot != 0.0 || float.flip_h || float.flip_v {
+            continue;
+        }
+        let Some((mut pts, closed)) = f.placed(rect.x, rect.y, rect.w, rect.h).into_iter().next() else { continue };
+        if closed && let Some(&first) = pts.first() {
+            pts.push(first);
+        }
+        out.push(ArrowPiece { pos, rect: *rect, order: f.order, parts: arrow_parts(&pts) });
+    }
+    out
+}
+
+/// Ink to Shape while drawing: when the stroke just drawn at `new` and another on the page are a
+/// line and an arrowhead (either drawn first), make the line an arrow and drop the head. Returns
+/// where the arrow is.
+fn pair_with_neighbour(s: &mut Session, page: usize, new: &Pos) -> Result<Option<Pos>, CmdError> {
+    s.touch(); // lay out the new stroke where it was just placed
+    let layout = s.layout();
+    let Some(mine) = layout.object(new, page).map(|o| o.rect) else { return Ok(None) };
+    // Only the new stroke and its neighbours are recognised, not the whole page.
+    let mut pieces = arrow_pieces(s, &layout, page, |pos, rect| pos == new || near(mine, *rect));
+    let Some(at) = pieces.iter().position(|k| k.pos == *new) else { return Ok(None) };
+    let me = pieces.swap_remove(at);
+    // The most recently drawn first (ink records its drawing order; shapes and ink from files
+    // don't, and come after, latest on the page first), so the winner doesn't depend on layout.
+    pieces.sort_by(|a, b| b.order.cmp(&a.order).then_with(|| b.pos.cmp(&a.pos)));
+    for other in &pieces {
+        for (line, head) in [(other, &me), (&me, other)] {
+            if let Some(arrow) = pair_parts(&line.parts, &head.parts) {
+                set_shape(s, &line.pos, &local_to(&arrow, line.rect))?;
+                delete_object(s, &head.pos)?;
+                return Ok(Some(after_deleting(&line.pos, std::slice::from_ref(&head.pos))));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `shape` (in page points) in the frame of the object laid out at `rect`.
+fn local_to(shape: &InkShape, rect: Rect) -> InkShape {
+    let m = |[x, y]: [f32; 2]| [x - rect.x, y - rect.y];
+    match shape {
+        InkShape::Arrow { a, b, head_at_end, head_at_start } => {
+            InkShape::Arrow { a: m(*a), b: m(*b), head_at_end: *head_at_end, head_at_start: *head_at_start }
+        }
+        InkShape::Line { a, b } => InkShape::Line { a: m(*a), b: m(*b) },
+        InkShape::Rectangle { x, y, w, h } => InkShape::Rectangle { x: x - rect.x, y: y - rect.y, w: *w, h: *h },
+        InkShape::Ellipse { x, y, w, h } => InkShape::Ellipse { x: x - rect.x, y: y - rect.y, w: *w, h: *h },
+        InkShape::Polygon(c) => InkShape::Polygon(c.iter().copied().map(m).collect()),
+    }
 }
 
 /// Replace the ink stroke at `pos` by the shape it looks like, in its colour and thickness and
 /// where it was drawn. `None` (nothing changed) when it isn't a pen or pencil stroke, it is
 /// turned or flipped, or it doesn't look like a shape.
 fn convert_at(s: &mut Session, pos: &Pos) -> Result<Option<&'static str>, CmdError> {
-    let para = s.doc.para_mut(pos.story, &pos.path)?;
-    let Some(InlineObject::Shape { kind, w, h, fill, float, freeform, .. }) = para.object_at_mut(pos.off) else { return Ok(None) };
+    let Some(InlineObject::Shape { w, h, float, freeform, .. }) = s.doc.para_at(pos).and_then(|p| p.object_at(pos.off)) else { return Ok(None) };
     let Some(f) = freeform.as_deref().filter(|f| matches!(f.ink, Some(InkTool::Pen | InkTool::Pencil)) && f.paths.len() == 1) else {
         return Ok(None);
     };
@@ -707,27 +847,46 @@ fn convert_at(s: &mut Session, pos: &Pos) -> Result<Option<&'static str>, CmdErr
     // The stroke in its frame's own points (the frame may have been resized since).
     let Some((pts, _)) = f.placed(0.0, 0.0, *w, *h).into_iter().next() else { return Ok(None) };
     let Some(found) = recognise(&pts) else { return Ok(None) };
+    set_shape(s, pos, &found)?;
+    Ok(Some(found.name()))
+}
+
+/// Make the drawing at `pos` the shape `found` (given in the drawing's own frame), keeping its
+/// colour and thickness, where it is.
+fn set_shape(s: &mut Session, pos: &Pos, found: &InkShape) -> Result<(), CmdError> {
+    let para = s.doc.para_mut(pos.story, &pos.path)?;
+    let Some(InlineObject::Shape { kind, w, h, fill, float, freeform, extra, .. }) = para.object_at_mut(pos.off) else {
+        return Err(CmdError::Failed("no drawing there".into()));
+    };
     let [bx, by, bw, bh] = found.bounds();
     let (bw, bh) = (bw.max(1.0), bh.max(1.0));
     let outline = |pts: Vec<[f32; 2]>, closed: bool| {
         Some(Arc::new(Freeform { w: bw, h: bh, paths: vec![FreePath { pts, closed }], ..Default::default() }.sanitized()))
     };
     let local = |c: &[[f32; 2]]| c.iter().map(|[x, y]| [x - bx, y - by]).collect::<Vec<_>>();
-    let (new_kind, geometry) = match &found {
+    let (new_kind, geometry) = match found {
         InkShape::Rectangle { .. } => (ShapeKind::Rectangle, None),
         InkShape::Ellipse { .. } => (ShapeKind::Ellipse, None),
         InkShape::Line { a, b } => (ShapeKind::Freeform, outline(local(&[*a, *b]), false)),
         InkShape::Polygon(c) => (ShapeKind::Freeform, outline(local(c), true)),
+        // A straight connector runs from its frame's top-left to bottom-right; flips turn it.
+        InkShape::Arrow { a, b, head_at_end, head_at_start } => {
+            float.flip_h = b[0] < a[0];
+            float.flip_v = b[1] < a[1];
+            extra.arrow_end = *head_at_end;
+            extra.arrow_start = *head_at_start;
+            (ShapeKind::StraightConnector, None)
+        }
     };
     *kind = new_kind;
     *freeform = geometry;
     *fill = None;
-    *w = bw;
-    *h = bh;
+    let [_, _, raw_w, raw_h] = found.bounds();
+    (*w, *h) = if matches!(found, InkShape::Arrow { .. }) { (raw_w, raw_h) } else { (bw, bh) };
     float.x += bx;
     float.y += by;
     para.touch();
-    Ok(Some(found.name()))
+    Ok(())
 }
 
 // --- Ink Replay ----------------------------------------------------------------------------
@@ -932,6 +1091,15 @@ mod tests {
         let objs = ink(&s);
         let blue = objs.iter().filter(|o| matches!(o, InlineObject::Shape { stroke: Some(c), .. } if c.hex() == "0070C0")).count();
         assert_eq!(blue, 1);
+        // Recolouring to the colour it has changes nothing, and the selection stays; an edit
+        // elsewhere ends it.
+        s.run("draw.lassoColor", &json!({"color": "0070C0"})).unwrap();
+        assert_eq!(s.undo_depth(), steps + 2);
+        assert_eq!(super::lasso_selection(&s).map(|l| l.items.clone()), Some(vec![sel.clone()]));
+        s.run("text.insert", &json!({"text": "x"})).unwrap();
+        assert!(super::lasso_selection(&s).is_none());
+        let r = s.run("draw.lasso", &json!({"page": 0, "points": [[80, 80], [260, 80], [260, 180], [80, 180]]})).unwrap();
+        assert_eq!(r["count"], 1);
         // Deleted: only the selected stroke goes, and the selection with it.
         s.run("draw.lassoDelete", &json!({})).unwrap();
         assert_eq!(ink(&s).len(), 1);
@@ -973,6 +1141,186 @@ mod tests {
         assert_eq!(r["converted"][0]["shape"], "ellipse");
         assert_eq!(ink(&s).len(), 1);
         assert!(!s.view.draw.ink_to_shape, "converting the selection doesn't turn the mode on");
+    }
+
+    #[test]
+    fn ink_to_shape_turns_an_arrow_stroke_into_a_line_shape_with_a_head_that_survives_docx() {
+        let mut s = session();
+        s.run("draw.inkToShape", &json!({"value": true})).unwrap();
+        // Right to left and downwards: shaft, then both barbs of the head at the tip (100, 300).
+        let tail = [300.0f32, 200.0];
+        let tip = [100.0f32, 300.0];
+        let back = (tail[1] - tip[1]).atan2(tail[0] - tip[0]);
+        let barb = |sign: f32| [tip[0] + 30.0 * (back + sign * 0.5).cos(), tip[1] + 30.0 * (back + sign * 0.5).sin()];
+        let mut pts: Vec<[f32; 2]> =
+            (0..20).map(|i| i as f32 / 20.0).map(|t| [tail[0] + (tip[0] - tail[0]) * t, tail[1] + (tip[1] - tail[1]) * t]).collect();
+        pts.extend([tip, barb(1.0), tip, barb(-1.0)]);
+        let r = s.run("draw.stroke", &json!({"page": 0, "points": pts, "color": "C00000", "width": 2})).unwrap();
+        assert_eq!(r["shape"], "arrow");
+        let at: wordcraft_doc::Pos = serde_json::from_value(r["pos"].clone()).unwrap();
+        let obj = s.doc.para_at(&at).and_then(|p| p.object_at(at.off)).cloned().unwrap();
+        let InlineObject::Shape { kind, w, h, stroke, stroke_width, freeform, extra, float, .. } = obj else { panic!("{obj:?}") };
+        assert_eq!((kind, stroke, stroke_width, freeform.is_none()), (ShapeKind::StraightConnector, Some(wordcraft_doc::Rgb(0xC0, 0, 0)), 2.0, true));
+        assert!(extra.arrow_end && !extra.arrow_start);
+        // Tail at the top right, tip at the bottom left: the frame is flipped across.
+        assert!(float.flip_h && !float.flip_v, "{float:?}");
+        assert!((w - 200.0).abs() < 1.0 && (h - 100.0).abs() < 1.0, "{w} x {h}");
+        // It survives a DOCX save and open.
+        let bytes = wordcraft_docx::write(&s.doc).unwrap();
+        let back = wordcraft_docx::read(&bytes).unwrap();
+        let again: Vec<_> = back.body.iter().filter_map(|b| b.as_para()).flat_map(|p| p.objects.iter()).collect();
+        let Some(InlineObject::Shape { extra, float, .. }) =
+            again.iter().find(|o| matches!(o, InlineObject::Shape { kind: ShapeKind::StraightConnector, .. }))
+        else {
+            panic!("{again:?}")
+        };
+        assert!(extra.arrow_end && !extra.arrow_start && float.flip_h, "{extra:?} {float:?}");
+    }
+
+    /// Every drawing in the body, in document order.
+    fn drawings(s: &Session) -> Vec<InlineObject> {
+        s.doc
+            .body
+            .iter()
+            .filter_map(|b| b.as_para())
+            .flat_map(|p| p.objects.iter())
+            .filter(|o| matches!(o, InlineObject::Shape { .. }))
+            .cloned()
+            .collect()
+    }
+
+    /// A straight stroke from (100, 300) to (300, 300).
+    fn shaft_stroke() -> Vec<[f32; 2]> {
+        (0..=40).map(|i| [100.0 + i as f32 * 5.0, 300.0]).collect()
+    }
+
+    #[test]
+    fn ink_to_shape_turns_a_line_and_a_head_drawn_after_it_into_one_arrow_in_one_undo_step() {
+        let mut s = session();
+        s.run("draw.inkToShape", &json!({"value": true})).unwrap();
+        let r = s.run("draw.stroke", &json!({"page": 0, "points": shaft_stroke(), "color": "C00000", "width": 2})).unwrap();
+        assert_eq!(r["shape"], "line");
+        let steps = s.undo_depth();
+        // An open V at the right-hand end, drawn as a second stroke.
+        let head = [[274.0, 285.0], [287.0, 292.5], [300.0, 300.0], [287.0, 307.5], [274.0, 315.0]];
+        let r = s.run("draw.stroke", &json!({"page": 0, "points": head})).unwrap();
+        assert_eq!(r["shape"], "arrow");
+        assert_eq!(s.undo_depth(), steps + 1, "paired in one undo step");
+        assert!(ink(&s).is_empty(), "the head stroke is gone");
+        let all = drawings(&s);
+        let [InlineObject::Shape { kind, w, stroke, stroke_width, extra, float, .. }] = all.as_slice() else { panic!("one arrow: {all:?}") };
+        assert_eq!((*kind, *stroke, *stroke_width), (ShapeKind::StraightConnector, Some(wordcraft_doc::Rgb(0xC0, 0, 0)), 2.0));
+        assert!(extra.arrow_end && !extra.arrow_start && !float.flip_h && !float.flip_v, "{extra:?} {float:?}");
+        assert!((w - 200.0).abs() < 1.0, "{w}");
+        let at: wordcraft_doc::Pos = serde_json::from_value(r["pos"].clone()).unwrap();
+        assert!(matches!(s.doc.para_at(&at).and_then(|p| p.object_at(at.off)), Some(InlineObject::Shape { kind: ShapeKind::StraightConnector, .. })));
+        let rect = s.layout().object(&at, 0).unwrap().rect;
+        assert!((rect.x - 100.0).abs() < 1.0 && (rect.y - 300.0).abs() < 1.0, "where the line was: {rect:?}");
+        let got: Vec<f32> = r["rect"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+        assert!(
+            got.len() == 4 && [rect.x, rect.y, rect.w, rect.h].iter().zip(&got).all(|(a, b)| (a - b).abs() < 0.5),
+            "the arrow's rect, not the deleted head's: {got:?} vs {rect:?}"
+        );
+        // It survives a DOCX save and open.
+        let back = wordcraft_docx::read(&wordcraft_docx::write(&s.doc).unwrap()).unwrap();
+        let again: Vec<_> = back.body.iter().filter_map(|b| b.as_para()).flat_map(|p| p.objects.iter()).collect();
+        assert!(
+            again
+                .iter()
+                .any(|o| matches!(o, InlineObject::Shape { kind: ShapeKind::StraightConnector, extra, .. } if extra.arrow_end && !extra.arrow_start)),
+            "{again:?}"
+        );
+        // Undo brings back the line, without the head.
+        s.run("edit.undo", &json!({})).unwrap();
+        let all = drawings(&s);
+        let [InlineObject::Shape { kind: ShapeKind::Freeform, extra, .. }] = all.as_slice() else { panic!("the line: {all:?}") };
+        assert!(!extra.arrow_end);
+        assert!(ink(&s).is_empty());
+    }
+
+    #[test]
+    fn ink_to_shape_pairs_a_closed_triangle_head_at_the_start_and_a_head_drawn_first() {
+        let mut s = session();
+        s.run("draw.inkToShape", &json!({"value": true})).unwrap();
+        s.run("draw.stroke", &json!({"page": 0, "points": shaft_stroke()})).unwrap();
+        // A closed triangle at the left end, where the line began: the arrow points left.
+        let tri = [[100.0, 300.0], [113.0, 292.5], [126.0, 285.0], [126.0, 300.0], [126.0, 315.0], [113.0, 307.5], [100.0, 300.0]];
+        let r = s.run("draw.stroke", &json!({"page": 0, "points": tri})).unwrap();
+        assert_eq!(r["shape"], "arrow");
+        let all = drawings(&s);
+        let [InlineObject::Shape { kind: ShapeKind::StraightConnector, extra, float, .. }] = all.as_slice() else { panic!("one arrow: {all:?}") };
+        assert!(extra.arrow_end && float.flip_h && !float.flip_v, "tip at the left: {extra:?} {float:?}");
+        // Head first (it stays ink on its own), then the shaft that ends at its apex.
+        let mut s = session();
+        s.run("draw.inkToShape", &json!({"value": true})).unwrap();
+        let r = s.run("draw.stroke", &json!({"page": 0, "points": [[274.0, 285.0], [300.0, 300.0], [274.0, 315.0]]})).unwrap();
+        assert!(r["shape"].is_null());
+        let r = s.run("draw.stroke", &json!({"page": 0, "points": shaft_stroke()})).unwrap();
+        assert_eq!(r["shape"], "arrow");
+        assert!(ink(&s).is_empty());
+        let all = drawings(&s);
+        let [InlineObject::Shape { kind: ShapeKind::StraightConnector, extra, float, .. }] = all.as_slice() else { panic!("one arrow: {all:?}") };
+        assert!(extra.arrow_end && !float.flip_h, "{extra:?} {float:?}");
+        // A V far from the line's ends stays ink, and the line stays a line.
+        let mut s = session();
+        s.run("draw.inkToShape", &json!({"value": true})).unwrap();
+        s.run("draw.stroke", &json!({"page": 0, "points": shaft_stroke()})).unwrap();
+        let r = s.run("draw.stroke", &json!({"page": 0, "points": [[174.0, 385.0], [200.0, 400.0], [174.0, 415.0]]})).unwrap();
+        assert!(r["shape"].is_null());
+        assert_eq!(ink(&s).len(), 1);
+        assert!(drawings(&s).iter().all(|o| !matches!(o, InlineObject::Shape { kind: ShapeKind::StraightConnector, .. })));
+    }
+
+    #[test]
+    fn converting_a_lasso_selection_pairs_a_line_and_a_head_stroke_into_an_arrow() {
+        let mut s = session();
+        s.run("draw.stroke", &json!({"page": 0, "points": shaft_stroke(), "color": "0070C0"})).unwrap();
+        s.run("draw.stroke", &json!({"page": 0, "points": [[274.0, 285.0], [300.0, 300.0], [274.0, 315.0]]})).unwrap();
+        s.run("draw.stroke", &json!({"page": 0, "points": rect_stroke(100.0, 400.0, 120.0, 60.0)})).unwrap();
+        assert_eq!(ink(&s).len(), 3);
+        let steps = s.undo_depth();
+        s.run("draw.lasso", &json!({"page": 0, "points": [[80, 260], [340, 260], [340, 480], [80, 480]]})).unwrap();
+        let r = s.run("draw.inkToShape", &json!({})).unwrap();
+        let names: Vec<&str> = r["converted"].as_array().unwrap().iter().filter_map(|c| c["shape"].as_str()).collect();
+        assert!(names.contains(&"arrow") && names.contains(&"rectangle"), "{names:?}");
+        assert!(ink(&s).is_empty(), "the head stroke went into the arrow");
+        let all = drawings(&s);
+        assert_eq!(all.len(), 2, "{all:?}");
+        let arrow = all.iter().find(|o| matches!(o, InlineObject::Shape { kind: ShapeKind::StraightConnector, .. }));
+        let Some(InlineObject::Shape { extra, stroke, .. }) = arrow else { panic!("{all:?}") };
+        assert!(extra.arrow_end && *stroke == Some(wordcraft_doc::Rgb(0, 0x70, 0xC0)));
+        // The selection still holds what's left: deleting it removes both shapes.
+        s.run("draw.lassoDelete", &json!({})).unwrap();
+        assert!(drawings(&s).is_empty());
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(drawings(&s).len(), 2);
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(ink(&s).len(), 3, "one undo step brings all three strokes back");
+        assert_eq!(s.undo_depth(), steps);
+    }
+
+    #[test]
+    fn converting_a_crowded_lasso_selection_recognises_each_stroke_a_bounded_number_of_times() {
+        let mut s = session();
+        s.run("draw.stroke", &json!({"page": 0, "points": shaft_stroke()})).unwrap();
+        s.run("draw.stroke", &json!({"page": 0, "points": [[274.0, 285.0], [300.0, 300.0], [274.0, 315.0]]})).unwrap();
+        // A stack of 40 lines close together: every pair is near, none makes an arrow.
+        let n = 40;
+        for i in 0..n {
+            let y = 420.0 + i as f32 * 2.0;
+            let pts: Vec<[f32; 2]> = (0..=40).map(|k| [100.0 + k as f32 * 5.0, y]).collect();
+            s.run("draw.stroke", &json!({"page": 0, "points": pts})).unwrap();
+        }
+        s.run("draw.lasso", &json!({"page": 0, "points": [[80, 260], [340, 260], [340, 560], [80, 560]]})).unwrap();
+        super::super::ink_shape::RECOGNISED.with(|c| c.set(0));
+        let r = s.run("draw.inkToShape", &json!({})).unwrap();
+        let calls = super::super::ink_shape::RECOGNISED.with(|c| c.get());
+        let strokes = n + 2;
+        assert!(calls <= 2 * strokes, "{calls} recognitions for {strokes} strokes");
+        let names: Vec<&str> = r["converted"].as_array().unwrap().iter().filter_map(|c| c["shape"].as_str()).collect();
+        assert_eq!(names.iter().filter(|n| **n == "arrow").count(), 1, "{names:?}");
+        assert_eq!(names.iter().filter(|n| **n == "line").count(), n, "{names:?}");
+        assert!(ink(&s).is_empty());
     }
 
     #[test]

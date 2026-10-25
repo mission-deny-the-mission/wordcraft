@@ -162,21 +162,26 @@ fn fallback_lookups_are_remembered_until_fonts_load() {
     let db = FontDb::with_font_dirs(vec![dir]);
     db.set_system_fallback(false);
     let latin = db.face(FALLBACK_FAMILY, "Regular");
-    let thai = 'ก';
-    assert!(db.fallback_for(thai, latin.id()).is_none(), "no bundled Thai font");
+    // A cache-miss fixture must stay absent even when Thai Craft fonts are embedded.
+    // The coverage-index regression below also uses this supplementary private-use range.
+    let missing = '\u{F0001}';
+    assert!(db.fallback_for(missing, latin.id()).is_none(), "no bundled font covers the cache-miss fixture");
+    if crate::CRAFT_FONTS.iter().any(|font| font.scripts.contains(&"Thai")) {
+        assert!(db.fallback_for('ก', latin.id()).is_some(), "the embedded Thai face supplies its glyph");
+    }
     let a = db.fallback_for('A', latin.id()).unwrap();
     assert_eq!(db.fallback_for('A', latin.id()).unwrap().id(), a.id(), "the same answer from the cache");
     {
         let cache = db.fallbacks.read().unwrap();
         assert_eq!(cache.faces, db.read_faces().len());
-        assert!(cache.map.contains_key(&(thai, latin.id())) && cache.map.contains_key(&('A', latin.id())));
+        assert!(cache.map.contains_key(&(missing, latin.id())) && cache.map.contains_key(&('A', latin.id())));
     }
     // Loading fonts (here, the installed family) makes the remembered answers stale.
     assert_eq!(db.face(FAMILY, "Regular").family, FAMILY);
     assert_eq!(db.fallback_for('A', latin.id()).unwrap().id(), a.id());
     let cache = db.fallbacks.read().unwrap();
     assert_eq!(cache.faces, db.read_faces().len());
-    assert!(!cache.map.contains_key(&(thai, latin.id())), "entries from before the fonts loaded are dropped");
+    assert!(!cache.map.contains_key(&(missing, latin.id())), "entries from before the fonts loaded are dropped");
 }
 
 #[test]
@@ -186,6 +191,45 @@ fn the_scan_reads_names_without_loading_the_font() {
     assert!(file_face_names(&dir.join("damaged.ttf")).is_empty());
     assert!(file_face_names(&dir.join("readme.txt")).is_empty());
     assert!(file_face_names(&dir.join("missing.ttf")).is_empty());
+}
+
+/// [`renamed`]`(file)` with its `glyf` table record tagged `tag`.
+fn with_glyf_as(file: &str, tag: &[u8; 4]) -> Vec<u8> {
+    let mut data = renamed(file);
+    let tables = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let glyf = (0..tables).map(|r| 12 + r * 16).find(|&at| &data[at..at + 4] == b"glyf").unwrap();
+    data[glyf..glyf + 4].copy_from_slice(tag);
+    data
+}
+
+#[test]
+fn faces_without_outlines_are_not_cataloged() {
+    // The Bold's `glyf` table is tagged `hvgl` here, as in a face with outlines only in Apple's
+    // `hvgl` table. Its cmap maps characters, and skrifa reads no outline from it.
+    let hvgl = with_glyf_as("SourceSans3-Bold.ttf", b"hvgl");
+    let font = skrifa::FontRef::new(&hvgl).unwrap();
+    assert!(font.outline_glyphs().get(font.charmap().map('A').unwrap()).is_none());
+    let dir = font_dir("outlines");
+    std::fs::write(dir.join("Sub/Sysfont-Bold.TTF"), &hvgl).unwrap();
+    assert!(file_face_names(&dir.join("Sub/Sysfont-Bold.TTF")).is_empty());
+    // In a collection, the Semibold, which has outlines, is listed.
+    std::fs::write(dir.join("Sysfont.ttc"), collection(&[hvgl, renamed("SourceSans3-Semibold.ttf")])).unwrap();
+    let semibold = format!("{FAMILY} Semibold");
+    assert_eq!(names(&dir.join("Sysfont.ttc")), [(FAMILY.to_string(), "Semibold".to_string(), semibold)]);
+    let db = FontDb::with_font_dirs(vec![dir]);
+    assert_eq!(db.styles(FAMILY), ["Regular", "Semibold"]);
+    assert_eq!(db.load_system_fonts(), 2);
+}
+
+#[test]
+fn faces_with_color_bitmaps_are_cataloged_without_outlines() {
+    // A face with a `CBDT` or `sbix` table, the color bitmap tables the renderer draws, and no
+    // outline table is listed.
+    let dir = font_dir("color-bitmaps");
+    std::fs::write(dir.join("Sysfont-Regular.ttf"), with_glyf_as("SourceSans3-Regular.ttf", b"CBDT")).unwrap();
+    std::fs::write(dir.join("Sub/Sysfont-Bold.TTF"), with_glyf_as("SourceSans3-Bold.ttf", b"sbix")).unwrap();
+    let db = FontDb::with_font_dirs(vec![dir]);
+    assert_eq!(db.styles(FAMILY), ["Regular", "Bold"]);
 }
 
 #[test]
@@ -243,8 +287,12 @@ fn fallback_cache_is_dropped_when_a_face_loads_by_its_legacy_family_name() {
     let db = FontDb::with_font_dirs(vec![dir]);
     db.set_system_fallback(false);
     let latin = db.face(FALLBACK_FAMILY, "Regular");
-    let thai = 'ก';
-    assert!(db.fallback_for(thai, latin.id()).is_none());
+    // Keep the negative cache entry independent of the optional Thai font input.
+    let missing = '\u{F0001}';
+    assert!(db.fallback_for(missing, latin.id()).is_none());
+    if crate::CRAFT_FONTS.iter().any(|font| font.scripts.contains(&"Thai")) {
+        assert!(db.fallback_for('ก', latin.id()).is_some(), "the embedded Thai face supplies its glyph");
+    }
     let before = db.read_faces().len();
     let semibold = format!("{FAMILY} Semibold");
     let f = db.face(&semibold, "Regular");
@@ -253,7 +301,7 @@ fn fallback_cache_is_dropped_when_a_face_loads_by_its_legacy_family_name() {
     assert!(db.fallback_for('A', f.id()).is_some_and(|g| g.id() != f.id()));
     let cache = db.fallbacks.read().unwrap();
     assert_eq!(cache.faces, db.read_faces().len());
-    assert!(!cache.map.contains_key(&(thai, latin.id())), "answers from before the load are dropped");
+    assert!(!cache.map.contains_key(&(missing, latin.id())), "answers from before the load are dropped");
 }
 
 #[test]
@@ -285,6 +333,91 @@ fn fallback_reads_each_installed_font_file_once_however_many_characters_miss() {
     let index = db.coverage.lock().unwrap();
     assert_eq!(index.files.len(), 2, "Regular and Bold are cataloged");
     assert_eq!(index.reads, 2, "each file read once");
+}
+
+/// A bundled Source Sans 3 `file` renamed `family` whose last cmap group (the single character
+/// U+1F916) maps `first..=last` instead.
+fn mapping(file: &str, family: &str, first: u32, last: u32) -> Vec<u8> {
+    let mut data = renamed_to(file, family);
+    let from = [0x0001_F916_u32.to_be_bytes(); 2].concat();
+    let to = [first.to_be_bytes(), last.to_be_bytes()].concat();
+    let mut patched = 0;
+    while let Some(at) = data.windows(from.len()).position(|w| w == from) {
+        data[at..at + to.len()].copy_from_slice(&to);
+        patched += 1;
+    }
+    assert!(patched > 0);
+    data
+}
+
+#[test]
+fn a_run_no_preferred_face_covers_whole_loads_an_installed_font_that_does() {
+    // A Thai run with Latin on Linux: the per-character fallback loads Noto Sans Thai (no Latin)
+    // and stopped there, though another installed font maps the whole run.
+    let dir = font_dir("run");
+    let regular = "SourceSans3-Regular.ttf";
+    std::fs::write(dir.join("1-first.ttf"), mapping(regular, "Sysfont Part1", 0xF_0001, 0xF_0001)).unwrap();
+    std::fs::write(dir.join("2-second.ttf"), mapping(regular, "Sysfont Part2", 0xF_0002, 0xF_0002)).unwrap();
+    // The family's Bold file comes first in path order.
+    std::fs::write(dir.join("3-both-bold.ttf"), mapping("SourceSans3-Bold.ttf", "Sysfont Both3", 0xF_0001, 0xF_0002)).unwrap();
+    std::fs::write(dir.join("3-both.ttf"), mapping(regular, "Sysfont Both3", 0xF_0001, 0xF_0002)).unwrap();
+    let db = FontDb::with_font_dirs(vec![dir]);
+    let latin = db.face(FALLBACK_FAMILY, "Regular");
+    let run = ['\u{F0001}', '\u{F0002}'];
+    // Each character alone falls back to the first file (in path order) that maps it.
+    assert_eq!(db.fallback_for(run[0], latin.id()).map(|f| f.family.clone()).as_deref(), Some("Sysfont Part1"));
+    assert_eq!(db.fallback_for(run[1], latin.id()).map(|f| f.family.clone()).as_deref(), Some("Sysfont Part2"));
+    let f = db.fallback_for_run(&run, latin.id(), false, false).expect("one installed font maps the run");
+    assert_eq!((f.family.as_str(), f.style.as_str()), ("Sysfont Both3", "Regular"));
+    let bold = db.fallback_for_run(&run, latin.id(), true, false).expect("its Bold too");
+    assert_eq!((bold.family.as_str(), bold.style.as_str()), ("Sysfont Both3", "Bold"));
+    // The family loaded once, whole: no file of it is loaded again.
+    let both = || db.read_faces().iter().filter(|f| f.family == "Sysfont Both3").count();
+    assert_eq!(both(), 2);
+    // Nothing maps this run: the answer is none, and asking again reads no file.
+    let none = ['\u{F0001}', '\u{F0003}'];
+    assert!(db.fallback_for_run(&none, latin.id(), false, false).is_none());
+    let reads = db.coverage.lock().unwrap().reads;
+    assert!(db.fallback_for_run(&none, latin.id(), false, false).is_none());
+    assert_eq!(db.coverage.lock().unwrap().reads, reads);
+    assert_eq!(both(), 2);
+}
+
+#[test]
+fn a_collection_whose_faces_only_together_map_a_run_does_not_end_the_search() {
+    // The index keeps one coverage per file: a collection's faces together may map a run that
+    // none of them covers alone. The search goes on to the font that does.
+    let dir = font_dir("run-collection");
+    let regular = "SourceSans3-Regular.ttf";
+    std::fs::write(dir.join("1-first.ttf"), mapping(regular, "Sysfont Part1", 0xF_0001, 0xF_0001)).unwrap();
+    std::fs::write(dir.join("2-second.ttf"), mapping(regular, "Sysfont Part2", 0xF_0002, 0xF_0002)).unwrap();
+    let split = collection(&[mapping(regular, "Sysfont Coll1", 0xF_0001, 0xF_0001), mapping(regular, "Sysfont Coll2", 0xF_0002, 0xF_0002)]);
+    std::fs::write(dir.join("3-split.ttc"), split).unwrap();
+    std::fs::write(dir.join("4-both.ttf"), mapping(regular, "Sysfont Both4", 0xF_0001, 0xF_0002)).unwrap();
+    let db = FontDb::with_font_dirs(vec![dir]);
+    let latin = db.face(FALLBACK_FAMILY, "Regular");
+    let f = db.fallback_for_run(&['\u{F0001}', '\u{F0002}'], latin.id(), false, false).expect("the font after the collection maps the run");
+    assert_eq!(f.family, "Sysfont Both4");
+}
+
+#[test]
+fn a_family_partly_loaded_by_a_character_fallback_is_loaded_whole_for_a_run() {
+    // A character's fallback loads one file of a family (its Italic); a run that the family maps
+    // must still get the Regular, not the Bold file the search reaches first.
+    let dir = font_dir("run-partly-loaded");
+    std::fs::write(dir.join("1-fam-it.ttf"), mapping("SourceSans3-It.ttf", "Sysfont Famly", 0xF_0005, 0xF_0005)).unwrap();
+    std::fs::write(dir.join("1b-other.ttf"), mapping("SourceSans3-Regular.ttf", "Sysfont Other", 0xF_0006, 0xF_0006)).unwrap();
+    std::fs::write(dir.join("2-fam-bold.ttf"), mapping("SourceSans3-Bold.ttf", "Sysfont Famly", 0xF_0005, 0xF_0006)).unwrap();
+    std::fs::write(dir.join("3-fam.ttf"), mapping("SourceSans3-Regular.ttf", "Sysfont Famly", 0xF_0005, 0xF_0006)).unwrap();
+    let db = FontDb::with_font_dirs(vec![dir]);
+    let latin = db.face(FALLBACK_FAMILY, "Regular");
+    // The character fallback loads the family's Italic file only.
+    let it = db.fallback_for('\u{F0005}', latin.id()).expect("the Italic file maps it");
+    assert_eq!((it.family.as_str(), it.style.as_str()), ("Sysfont Famly", "Italic"));
+    let f = db.fallback_for_run(&['\u{F0005}', '\u{F0006}'], latin.id(), false, false).expect("the family maps the run");
+    assert_eq!((f.family.as_str(), f.style.as_str()), ("Sysfont Famly", "Regular"));
+    // Each of its files loaded once.
+    assert_eq!(db.read_faces().iter().filter(|f| f.family == "Sysfont Famly").count(), 3);
 }
 
 #[test]
@@ -455,4 +588,121 @@ fn font_list_previews_load_nothing_for_good() {
     }
     assert_eq!(db.loaded_font_bytes(), used, "memory stays bounded across previews");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn catalog_full_names() {
+    let dir = font_dir("full-name");
+    let db = FontDb::with_font_dirs(vec![dir.clone()]);
+    assert!(!db.is_loaded("Sysfont Sans3 Bold"));
+    assert!(db.has_family("Sysfont Sans3 Bold"));
+    let face = db.face("Sysfont Sans3 Bold", "Regular");
+    assert_eq!((face.family.as_str(), face.style.as_str()), (FAMILY, "Bold"));
+    assert_eq!(db.face("sysfont sans3 bold", "Italic").id(), face.id());
+    assert!(db.is_loaded("Sysfont Sans3 Bold"));
+    assert!(!db.families().iter().any(|n| n == "Sysfont Sans3 Bold"));
+    assert_eq!(db.face(FAMILY, "Regular").style, "Regular");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Give an OFL test face a complete synthetic name table without adding a font asset.
+fn named_face(file: &str, family: &str) -> Vec<u8> {
+    let mut data = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts").join(file)).unwrap();
+    let style = if file.contains("Bold") { "Bold" } else { "Regular" };
+    let names =
+        [(1, family.to_string()), (2, style.to_string()), (4, format!("{family} {style}")), (6, format!("{}-{style}", family.replace(' ', "")))];
+    let mut table = Vec::new();
+    table.extend_from_slice(&0u16.to_be_bytes());
+    table.extend_from_slice(&(names.len() as u16).to_be_bytes());
+    table.extend_from_slice(&(6u16 + 12 * names.len() as u16).to_be_bytes());
+    let mut strings = Vec::new();
+    for (id, value) in names {
+        let bytes: Vec<_> = value.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        for n in [3, 1, 0x409, id, bytes.len() as u16, strings.len() as u16] {
+            table.extend_from_slice(&n.to_be_bytes());
+        }
+        strings.extend_from_slice(&bytes);
+    }
+    table.extend_from_slice(&strings);
+    data.resize(data.len().next_multiple_of(4), 0);
+    let offset = data.len() as u32;
+    let count = u16::from_be_bytes(data[4..6].try_into().unwrap()) as usize;
+    let entry = (0..count).map(|i| 12 + i * 16).find(|i| &data[*i..*i + 4] == b"name").unwrap();
+    data[entry + 8..entry + 12].copy_from_slice(&offset.to_be_bytes());
+    data[entry + 12..entry + 16].copy_from_slice(&(table.len() as u32).to_be_bytes());
+    data.extend_from_slice(&table);
+    data
+}
+
+#[test]
+fn circle_uses_installed_face() {
+    let dir = font_dir("circle-fallback");
+    std::fs::write(dir.join("Text-Regular.ttf"), named_face("SourceSans3-Regular.ttf", "Times New Roman")).unwrap();
+    std::fs::write(dir.join("Text-Bold.ttf"), named_face("SourceSans3-Bold.ttf", "Times New Roman")).unwrap();
+    let db = FontDb::with_font_dirs(vec![dir]);
+    let primary = db.face("Source Serif 4", "Regular");
+    assert!(!primary.covers('●'), "the requested face lacks the marker");
+    assert!(!db.is_loaded("Times New Roman"), "fallback must find a cataloged face");
+    db.set_system_fallback(false);
+    assert_eq!(db.fallback_for('●', primary.id()).unwrap().family, FALLBACK_FAMILY);
+    assert!(!db.is_loaded("Times New Roman"));
+    db.set_system_fallback(true);
+    let found = db.fallback_for('●', primary.id()).unwrap();
+    assert_eq!(found.family, "Times New Roman");
+    assert!(found.covers('●'));
+    assert_ne!(db.fallback_for('●', found.id()).unwrap().id(), found.id(), "the excluded face cannot be reused");
+    assert_eq!(db.fallback_for('●', primary.id()).unwrap().id(), found.id());
+    let bold = db.fallback_styled('●', primary.id(), true, false).unwrap();
+    assert_eq!(bold.family, "Times New Roman");
+    assert!(bold.weight >= 600.0 && bold.covers('●'));
+    assert_eq!(db.fallback_for('A', primary.id()).unwrap().family, FALLBACK_FAMILY, "ordinary character fallback is unchanged");
+}
+
+#[test]
+fn circle_without_text_face() {
+    let db = FontDb::with_font_dirs(Vec::new());
+    db.set_system_fallback(false);
+    let primary = db.face("Source Serif 4", "Regular");
+    let found = db.fallback_for('●', primary.id()).unwrap();
+    assert_eq!(found.family, FALLBACK_FAMILY);
+    assert!(found.covers('●'));
+}
+
+#[test]
+fn circle_checks_face_coverage() {
+    let db = FontDb::with_font_dirs(Vec::new());
+    db.set_system_fallback(false);
+    db.add_document_fonts(vec![(named_face("SourceSerif4-Regular.ttf", "Times New Roman"), "Times New Roman".to_string())]);
+    let preferred = db.face("Times New Roman", "Regular");
+    assert!(!preferred.covers('●'));
+    let primary = db.face("Source Serif 4", "Regular");
+    assert_eq!(db.fallback_for('●', primary.id()).unwrap().family, FALLBACK_FAMILY);
+}
+
+#[test]
+fn catalog_postscript_names() {
+    let dir = font_dir("postscript");
+    for path in [dir.join("Sysfont-Regular.ttf"), dir.join("Sub/Sysfont-Bold.TTF")] {
+        let mut bytes = std::fs::read(&path).unwrap();
+        for (from, to) in [
+            (b"SourceSans3".to_vec(), b"SysfontSans".to_vec()),
+            ("SourceSans3".encode_utf16().flat_map(u16::to_be_bytes).collect(), "SysfontSans".encode_utf16().flat_map(u16::to_be_bytes).collect()),
+        ] {
+            let mut offset = 0;
+            while let Some(at) = bytes[offset..].windows(from.len()).position(|w| w == from) {
+                bytes[offset + at..offset + at + to.len()].copy_from_slice(&to);
+                offset += at + to.len();
+            }
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+    let db = FontDb::with_font_dirs(vec![dir.clone()]);
+    assert!(!db.is_loaded("SysfontSans-Bold"));
+    assert!(db.has_family("SysfontSans-Bold"));
+    let face = db.face("SysfontSans-Bold", "Regular");
+    assert_eq!((face.family.as_str(), face.style.as_str()), (FAMILY, "Bold"));
+    assert_eq!(db.face("sysfontsans-bold", "Italic").id(), face.id());
+    assert_eq!(db.face(FAMILY, "Regular").style, "Regular");
+    assert!(!has(&db.families(), "SysfontSans-Bold"));
+    std::fs::remove_dir_all(dir).unwrap();
 }

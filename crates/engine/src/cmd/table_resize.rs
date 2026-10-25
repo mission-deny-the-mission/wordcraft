@@ -210,30 +210,20 @@ impl ResizeTarget {
         }
     }
 
-    /// When the selection runs across cells of this table (Word selects them whole) and the
-    /// column border grabbed at page y `y` is one of theirs, in one of their rows, the drag
-    /// moves it only in those rows (`only`), as Word does with selected cells' borders. Not the
-    /// table's left edge, which moves the whole table, nor a border of a cell merged down into
-    /// rows outside the selection. Text selected within one cell isn't a cell selection.
+    /// When cells of this table are selected whole (one cell too) or the selection runs across
+    /// cells of it (Word selects them whole), and the column border grabbed at page y `y` is one
+    /// of theirs, in one of their rows, the drag moves it only in those rows (`only`), as Word
+    /// does with selected cells' borders. Not the table's left edge, which moves the whole table,
+    /// nor a border of a cell merged down into rows outside the selection. Text selected within
+    /// one cell isn't a cell selection.
     pub fn limit_to_selection(&mut self, s: &Session, y: f32) {
         self.only.clear();
         let Edge::Column(line) = self.edge else { return };
-        let (a, b) = s.sel.ordered();
-        if line == 0 || s.sel.is_collapsed() || a.story != self.story || b.story != self.story {
+        if line == 0 {
             return;
         }
-        let (Some(t), Some((ra, ca)), Some((rb, cb))) =
-            (s.doc.table(self.story, &self.table), cell_in(&self.table, &a.path), cell_in(&self.table, &b.path))
-        else {
-            return;
-        };
-        if (ra, ca) == (rb, cb) {
-            return;
-        }
-        let span = |r: usize, c: usize| t.rows.get(r).and_then(|row| row.cells.get(c)).map_or(1, Cell::span);
-        let (ga, gb) = (t.grid_col(ra, ca), t.grid_col(rb, cb));
-        let (lo, hi) = (ga.min(gb), (ga + span(ra, ca)).max(gb + span(rb, cb)));
-        let (r0, r1) = (ra.min(rb), ra.max(rb));
+        let Some(t) = s.doc.table(self.story, &self.table) else { return };
+        let Some(((r0, r1), (lo, hi))) = self.selected_block(s, t) else { return };
         let here = self.rows.iter().find(|r| y >= r.top && y <= r.bottom).map(|r| r.row);
         if line < lo || line > hi || !here.is_some_and(|r| (r0..=r1).contains(&r)) {
             return;
@@ -257,6 +247,30 @@ impl ResizeTarget {
             only.push((r, lines));
         }
         self.only = only;
+    }
+
+    /// The selected cells of this table, as their rows (first, last) and the grid lines of
+    /// their outer borders (left, right): whole cells (`Session::cell_range`), or a selection
+    /// running from one of its cells into another. `None` for text within one cell.
+    fn selected_block(&self, s: &Session, t: &Table) -> Option<((usize, usize), (usize, usize))> {
+        let lines = |cells: &[(usize, usize)]| -> Option<(usize, usize)> {
+            let span = |r: usize, c: usize| t.rows.get(r).and_then(|row| row.cells.get(c)).map_or(1, Cell::span);
+            let lo = cells.iter().map(|&(r, c)| t.grid_col(r, c)).min()?;
+            let hi = cells.iter().map(|&(r, c)| t.grid_col(r, c).saturating_add(span(r, c))).max()?;
+            Some((lo, hi))
+        };
+        if let Some(range) = s.cell_range().filter(|c| c.story == self.story && c.table == self.table) {
+            return Some((range.rows, lines(&range.cells(t))?));
+        }
+        let (a, b) = s.sel.ordered();
+        if s.sel.is_collapsed() || a.story != self.story || b.story != self.story {
+            return None;
+        }
+        let ((ra, ca), (rb, cb)) = (cell_in(&self.table, &a.path)?, cell_in(&self.table, &b.path)?);
+        if (ra, ca) == (rb, cb) {
+            return None;
+        }
+        Some(((ra.min(rb), ra.max(rb)), lines(&[(ra, ca), (rb, cb)])?))
     }
 }
 
@@ -524,15 +538,16 @@ fn resize_drag(s: &mut Session, v: &Value) -> CmdResult {
         return sel_result(s);
     }
     // An "at least" height leaves out the cells' margins and border bands, which the layout adds
-    // (and which depend on the table style): measure what the rows came to and take the extra
-    // off once. A row its text holds taller keeps the dragged height.
+    // (and which depend on the table style), and an exact one the bottom margin: measure what the
+    // rows came to and take the extra off once. A row its text holds taller keeps the dragged
+    // height.
     let drawn = drawn_heights(&s.layout(), &s.doc, page, &target);
     let mut fixed = Vec::new();
     let t = s.doc.table_mut(target.story, &target.table)?;
     for (r, want) in &plan.heights {
         let Some(got) = drawn.iter().find(|(i, _)| i == r).map(|(_, h)| *h) else { continue };
         if let Some(row) = t.rows.get_mut(*r)
-            && row.props.height_rule == HeightRule::AtLeast
+            && matches!(row.props.height_rule, HeightRule::AtLeast | HeightRule::Exact)
             && got > want + 0.05
         {
             row.props.height = Some((want - (got - want)).max(1.0));
@@ -758,6 +773,32 @@ mod tests {
         assert_eq!(t.rows[1].props.height, None, "the other row is untouched");
     }
 
+    /// An exact row stays exact when its border is dragged: the stored height leaves out the
+    /// 4pt bottom margin the layout adds below it, and the drawn row is what was dragged.
+    #[test]
+    fn an_exact_row_border_drag_leaves_out_the_bottom_margin() {
+        let mut s = table_session(2, 2);
+        let t = s.doc.body.iter_mut().find_map(|b| match std::sync::Arc::make_mut(b) {
+            wordcraft_doc::Block::Table(t) => Some(t),
+            _ => None,
+        });
+        let t = t.unwrap();
+        t.props.cell_margins = Some([0.0, 5.4, 4.0, 5.4]);
+        t.rows[0].props.height = Some(30.0);
+        t.rows[0].props.height_rule = HeightRule::Exact;
+        s.touch();
+        let a = cell_rect(&mut s, 0, 0);
+        assert!((a.h - 34.0).abs() < 0.1, "{a:?}");
+        let x = a.x + a.w / 2.0;
+        s.run("table.resizeDrag", &json!({"page": 0, "x": x, "y": a.bottom(), "toX": x, "toY": a.bottom() + 20.0})).unwrap();
+        let t = first_table(&s);
+        assert_eq!(t.rows[0].props.height_rule, HeightRule::Exact);
+        let stored = t.rows[0].props.height.unwrap();
+        assert!((stored - 50.0).abs() < 0.1, "stored {stored}");
+        let h = cell_rect(&mut s, 0, 0).h;
+        assert!((h - 54.0).abs() < 0.1, "drawn {h}");
+    }
+
     /// The handle past the bottom-right corner scales every column and row.
     #[test]
     fn the_corner_handle_scales_the_table() {
@@ -937,6 +978,27 @@ mod tests {
         assert_eq!(first_table(&s), start, "one undo step each");
     }
 
+    /// One selected cell (Select Cell, unlike its text) is a cell selection too: its border
+    /// moves in its row only (#962).
+    #[test]
+    fn a_selected_cells_border_moves_only_in_its_row() {
+        let mut s = table_session(3, 3);
+        let (b, c) = (cell_rect(&mut s, 1, 1), cell_rect(&mut s, 1, 2));
+        let y = b.y + b.h / 2.0;
+        s.run("caret.set", &json!({"page": 0, "x": b.x + b.w / 2.0, "y": y})).unwrap();
+        s.run("table.selectCell", &json!({})).unwrap();
+        assert!(s.cell_range().is_some());
+        let start = first_table(&s);
+        s.run("table.resizeDrag", &json!({"page": 0, "x": b.right(), "y": y, "toX": b.right() + 30.0, "toY": y})).unwrap();
+        let (b1, c1) = (cell_rect(&mut s, 1, 1), cell_rect(&mut s, 1, 2));
+        assert!((b1.w - (b.w + 30.0)).abs() < 1.0 && (c1.w - (c.w - 30.0)).abs() < 1.0, "{b1:?} {c1:?}");
+        for r in [0, 2] {
+            assert!((cell_rect(&mut s, r, 1).right() - b.right()).abs() < 0.5, "row {r} keeps its border");
+        }
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(first_table(&s), start, "one undo step");
+    }
+
     /// A cell merged down past the selection keeps one width: a border of it moves in the whole
     /// column.
     #[test]
@@ -953,5 +1015,131 @@ mod tests {
         s.run("table.resizeDrag", &json!({"page": 0, "x": c.x, "y": y, "toX": c.x + 20.0, "toY": y})).unwrap();
         assert_eq!(first_table(&s).grid.len(), 3, "no new grid line");
         assert!((cell_rect(&mut s, 0, 2).x - (c.x + 20.0)).abs() < 1.0, "the first row follows");
+    }
+
+    /// Selects the cell at (row, cell) one of the ways Word does: Select Cell, the left-edge
+    /// arrow, or a triple-click on its text.
+    fn select_one_cell(s: &mut Session, how: &str, r: usize, c: usize) {
+        let b = cell_rect(s, r, c);
+        let y = b.y + b.h / 2.0;
+        match how {
+            "arrow" => {
+                s.run("table.selectAt", &json!({"page": 0, "x": b.x + 4.5, "y": y})).unwrap();
+            }
+            "triple" => {
+                s.run("caret.set", &json!({"page": 0, "x": b.x + b.w / 2.0, "y": y})).unwrap();
+                s.run("select.paragraph", &json!({"cell": true})).unwrap();
+            }
+            _ => {
+                s.run("caret.set", &json!({"page": 0, "x": b.x + b.w / 2.0, "y": y})).unwrap();
+                s.run("table.selectCell", &json!({})).unwrap();
+            }
+        }
+    }
+
+    /// Each way of selecting one cell makes its right and its left border move in its row
+    /// only; the neighbour on that side gives up or gains the room and the row keeps its width.
+    #[test]
+    fn a_single_selected_cells_borders_move_only_in_its_row() {
+        for how in ["cell", "arrow", "triple"] {
+            for left in [false, true] {
+                let mut s = table_session(3, 3);
+                let (a, b, c) = (cell_rect(&mut s, 1, 0), cell_rect(&mut s, 1, 1), cell_rect(&mut s, 1, 2));
+                let y = b.y + b.h / 2.0;
+                select_one_cell(&mut s, how, 1, 1);
+                let start = first_table(&s);
+                let x = if left { b.x } else { b.right() };
+                s.run("table.resizeDrag", &json!({"page": 0, "x": x, "y": y, "toX": x + 30.0, "toY": y})).unwrap();
+                let (a1, b1, c1) = (cell_rect(&mut s, 1, 0), cell_rect(&mut s, 1, 1), cell_rect(&mut s, 1, 2));
+                if left {
+                    assert!((b1.w - (b.w - 30.0)).abs() < 1.0 && (a1.w - (a.w + 30.0)).abs() < 1.0, "{how} left: {a1:?} {b1:?}");
+                    assert!((c1.w - c.w).abs() < 0.5, "{how} left");
+                } else {
+                    assert!((b1.w - (b.w + 30.0)).abs() < 1.0 && (c1.w - (c.w - 30.0)).abs() < 1.0, "{how} right: {b1:?} {c1:?}");
+                    assert!((a1.w - a.w).abs() < 0.5, "{how} right");
+                }
+                assert!((c1.right() - c.right()).abs() < 0.5, "{how}: the row keeps its width");
+                for r in [0, 2] {
+                    assert!(
+                        (cell_rect(&mut s, r, 1).x - b.x).abs() < 0.5 && (cell_rect(&mut s, r, 1).right() - b.right()).abs() < 0.5,
+                        "{how}: row {r} unchanged"
+                    );
+                }
+                s.run("edit.undo", &json!({})).unwrap();
+                assert_eq!(first_table(&s), start, "{how}: one undo step");
+            }
+        }
+    }
+
+    /// A caret, a part of a cell's text, or another cell's border with a cell selected: the
+    /// whole column moves.
+    #[test]
+    fn without_that_cell_selected_the_whole_column_moves() {
+        let mut s = table_session(3, 3);
+        let b = cell_rect(&mut s, 1, 1);
+        let y = b.y + b.h / 2.0;
+        s.run("caret.set", &json!({"page": 0, "x": b.x + b.w / 2.0, "y": y})).unwrap();
+        s.run("table.resizeDrag", &json!({"page": 0, "x": b.right(), "y": y, "toX": b.right() + 30.0, "toY": y})).unwrap();
+        assert!((cell_rect(&mut s, 0, 1).w - (b.w + 30.0)).abs() < 1.0, "caret only");
+        s.run("edit.undo", &json!({})).unwrap();
+        select_one_cell(&mut s, "arrow", 2, 2);
+        s.run("table.resizeDrag", &json!({"page": 0, "x": b.right(), "y": y, "toX": b.right() + 30.0, "toY": y})).unwrap();
+        assert!((cell_rect(&mut s, 0, 1).w - (b.w + 30.0)).abs() < 1.0, "another cell selected");
+        s.run("edit.undo", &json!({})).unwrap();
+        // All of a cell's text, picked as a range (no cell mark): not a cell selection.
+        s.run("caret.set", &json!({"page": 0, "x": b.x + b.w / 2.0, "y": y})).unwrap();
+        s.run("text.insert", &json!({"text": "Wide"})).unwrap();
+        s.run("select.text", &json!({"text": "Wide"})).unwrap();
+        let (anchor, focus) = (serde_json::to_value(&s.sel.anchor).unwrap(), serde_json::to_value(&s.sel.focus).unwrap());
+        s.run("select.range", &json!({"anchor": anchor, "focus": focus})).unwrap();
+        assert!(s.cell_range().is_none());
+        let b = cell_rect(&mut s, 1, 1);
+        s.run("table.resizeDrag", &json!({"page": 0, "x": b.right(), "y": y, "toX": b.right() + 30.0, "toY": y})).unwrap();
+        assert!((cell_rect(&mut s, 0, 1).w - (b.w + 30.0)).abs() < 1.0, "all of a cell's text selected");
+    }
+
+    /// The jagged row a single cell's drag leaves is saved to .docx and read back the same.
+    #[test]
+    fn a_jagged_row_survives_a_docx_round_trip() {
+        let mut s = table_session(3, 3);
+        let b = cell_rect(&mut s, 1, 1);
+        let y = b.y + b.h / 2.0;
+        select_one_cell(&mut s, "arrow", 1, 1);
+        s.run("table.resizeDrag", &json!({"page": 0, "x": b.right(), "y": y, "toX": b.right() + 30.0, "toY": y})).unwrap();
+        let t = first_table(&s);
+        let bytes = crate::io::save_bytes("jagged.docx", &s.doc).unwrap();
+        let doc = crate::io::open_bytes("jagged.docx", &bytes).unwrap();
+        let back = doc.body.iter().find_map(|b| b.as_table()).cloned().unwrap();
+        let spans = |t: &Table| t.rows.iter().map(|r| r.cells.iter().map(Cell::span).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(spans(&back), spans(&t));
+        let mut s2 = Session::new(doc);
+        for c in 0..spans(&t)[1].len() {
+            assert!((cell_rect(&mut s2, 1, c).w - cell_rect(&mut s, 1, c).w).abs() < 1.0, "cell {c}");
+        }
+    }
+
+    /// In a cell of two paragraphs, a triple-click on the last one selects the cell (its border
+    /// then moves in its row only); on the first one it selects text, and the whole column moves.
+    #[test]
+    fn triple_click_selects_a_cell_only_on_its_last_paragraph() {
+        for last in [true, false] {
+            let mut s = table_session(3, 3);
+            let b = cell_rect(&mut s, 1, 1);
+            s.run("caret.set", &json!({"page": 0, "x": b.x + b.w / 2.0, "y": b.y + b.h / 2.0})).unwrap();
+            s.run("text.insert", &json!({"text": "One"})).unwrap();
+            s.run("text.newParagraph", &json!({})).unwrap();
+            s.run("text.insert", &json!({"text": "Two"})).unwrap();
+            s.run("select.text", &json!({"text": if last { "Two" } else { "One" }})).unwrap();
+            s.run("select.paragraph", &json!({})).unwrap();
+            assert!(s.cell_range().is_none(), "the ribbon's Select Paragraph never selects the cell");
+            s.run("select.text", &json!({"text": if last { "Two" } else { "One" }})).unwrap();
+            s.run("select.paragraph", &json!({"cell": true})).unwrap();
+            assert_eq!(s.cell_range().is_some(), last);
+            let b = cell_rect(&mut s, 1, 1);
+            let y = b.y + b.h / 2.0;
+            s.run("table.resizeDrag", &json!({"page": 0, "x": b.right(), "y": y, "toX": b.right() + 30.0, "toY": y})).unwrap();
+            let moved = (cell_rect(&mut s, 0, 1).w - (b.w + 30.0)).abs() < 1.0;
+            assert_eq!(moved, !last, "last paragraph {last}: the column moves only without a cell selection");
+        }
     }
 }

@@ -70,6 +70,30 @@ fn alignment_buttons_mean_what_they_show_in_rtl_paragraphs() {
 }
 
 #[test]
+fn para_set_on_page_follows_each_paragraphs_own_direction() {
+    // The Paragraph dialog's alignment and indents are as seen on the page (#1346): over a
+    // right-to-left and a left-to-right paragraph, Left is each one's own left side.
+    let mut s = session("سلام دنیا\nHello", false);
+    run(&mut s, "caret.docStart", json!({}));
+    run(&mut s, "para.rtl", json!({}));
+    run(&mut s, "select.all", json!({}));
+    let depth = s.undo_depth();
+    run(&mut s, "para.set", json!({"props": {"spaceAfter": 6}, "onPage": {"align": "left", "left": 36}}));
+    assert_eq!(s.undo_depth(), depth + 1, "one undo step");
+    let (rtl, ltr) = (props(&s, 0), props(&s, 1));
+    assert_eq!((rtl.align, rtl.indent_right, rtl.indent_left, rtl.space_after), (Some(Align::Right), Some(36.0), None, Some(6.0)));
+    assert_eq!((ltr.align, ltr.indent_left, ltr.indent_right, ltr.space_after), (Some(Align::Left), Some(36.0), None, Some(6.0)));
+    // A direction in `props` comes first: both are right to left now, so Right is their start.
+    run(&mut s, "para.set", json!({"props": {"bidi": true}, "onPage": {"right": 18}}));
+    assert_eq!((props(&s, 1).bidi, props(&s, 1).indent_left, props(&s, 1).indent_right), (Some(true), Some(18.0), None));
+    assert!(s.run("para.set", &json!({"props": {}, "onPage": {"align": "middle"}})).is_err());
+    // Undo takes each command back whole.
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!((props(&s, 0).align, props(&s, 0).indent_right, props(&s, 1).indent_left), (None, None, None));
+}
+
+#[test]
 fn font_commands_reach_persian_text() {
     let mut s = session("کتاب خوب", true);
     run(&mut s, "select.all", json!({}));
@@ -244,4 +268,57 @@ fn typing_kurdish_in_new_document_advances_caret_smoothly() {
     }
     assert!(last_x < first_x.unwrap(), "caret should advance leftwards overall");
     assert_eq!(props(&s, 0).bidi, Some(true), "paragraph auto-detected as right-to-left");
+}
+
+/// The runs of the first paragraph in a saved DOCX: (has `w:rtl`, text).
+fn saved_runs(s: &Session) -> Vec<(bool, String)> {
+    use std::io::Read;
+    let bytes = crate::io::save_bytes("x.docx", &s.doc).unwrap();
+    let mut xml = String::new();
+    zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap().by_name("word/document.xml").unwrap().read_to_string(&mut xml).unwrap();
+    let para = xml.split("<w:body>").nth(1).unwrap().split("</w:p>").next().unwrap().to_string();
+    para.split("<w:r>")
+        .skip(1)
+        .map(|r| {
+            let r = r.split("</w:r>").next().unwrap();
+            let text: String = r.split("<w:t xml:space=\"preserve\">").skip(1).filter_map(|t| t.split("</w:t>").next()).collect();
+            (r.contains("<w:rtl/>"), text)
+        })
+        .collect()
+}
+
+#[test]
+fn latin_typed_into_reopened_hebrew_is_saved_left_to_right() {
+    // #1543: a saved file's Hebrew runs say `w:rtl`. Latin typed next to them after reopening
+    // takes its direction from its own letters, as on screen, so it's saved in a run of its own
+    // without `w:rtl` (Word would otherwise lay it out right to left again).
+    let s = session("לפני אחרי", true);
+    let bytes = crate::io::save_bytes("x.docx", &s.doc).unwrap();
+    let mut s = Session::new(crate::io::open_bytes("x.docx", &bytes).unwrap());
+    assert!(s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().runs.iter().all(|r| r.props.rtl == Some(true)));
+    s.sel = crate::Selection::caret(Pos::new(StoryRef::Body, wordcraft_doc::Path::top(0), "לפני ".len()));
+    run(&mut s, "text.insert", json!({"text": "Foo Bar 2026 "}));
+    let runs = saved_runs(&s);
+    assert!(runs.contains(&(false, "Foo Bar 2026".to_string())), "{runs:?}");
+    assert!(runs.iter().all(|(rtl, t)| !rtl || !t.chars().any(|c| c.is_ascii_alphanumeric())), "{runs:?}");
+    assert_eq!(runs.iter().map(|(_, t)| t.as_str()).collect::<String>(), "לפני Foo Bar 2026 אחרי");
+}
+
+#[test]
+fn a_latin_link_inserted_into_reopened_hebrew_is_saved_left_to_right() {
+    // Other insertions start from the caret's formatting too (#1543): a link's Latin text
+    // inserted between reopened Hebrew words isn't saved as right-to-left.
+    let s = session("לפני אחרי", true);
+    let bytes = crate::io::save_bytes("x.docx", &s.doc).unwrap();
+    let mut s = Session::new(crate::io::open_bytes("x.docx", &bytes).unwrap());
+    s.sel = crate::Selection::caret(Pos::new(StoryRef::Body, wordcraft_doc::Path::top(0), "לפני ".len()));
+    run(&mut s, "insert.link", json!({"url": "https://example.com", "text": "WordCraft site"}));
+    let runs = saved_runs(&s);
+    assert!(runs.contains(&(false, "WordCraft site".to_string())), "{runs:?}");
+    // The caret's own formatting, as Reveal Formatting shows it, still says right to left.
+    s.sel = crate::Selection::caret(Pos::new(StoryRef::Body, wordcraft_doc::Path::top(0), "לפ".len()));
+    s.pending = None; // moving the caret by hand doesn't drop the link's pending formatting
+    assert_eq!(s.caret_props().rtl, Some(true));
+    assert_eq!(s.typing_props().rtl, None);
+    assert_eq!(s.typing_props().lang_bidi.as_deref(), Some("he-IL"), "the bidi language stays");
 }

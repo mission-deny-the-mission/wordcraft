@@ -18,7 +18,13 @@ pub fn specs() -> Vec<CommandSpec> {
             .pure(),
         CommandSpec::new("font.list", "Added Fonts", "Home › Font", list).params(r#"{"all"?: bool (also every available family)}"#).pure(),
         CommandSpec::new("font.remove", "Remove Added Font", "Home › Font", remove).params(r#"{"family": string}"#).pure(),
+        CommandSpec::new("font.loadSystem", "Load System Installed Fonts…", "Home › Font", load_system).pure(),
     ]
+}
+
+fn load_system(s: &mut Session, _v: &Value) -> CmdResult {
+    s.push_ui_request(json!({"open": "loadSystemFonts"}));
+    Ok(json!({"pending": true}))
 }
 
 fn font_json(f: &UserFont) -> Value {
@@ -62,7 +68,7 @@ fn add(s: &mut Session, v: &Value) -> CmdResult {
         }
     } else {
         // From the ribbon: the UI shows a file picker and runs this again with the file.
-        s.ui_requests.push(json!({"open": "addFont"}));
+        s.push_ui_request(json!({"open": "addFont"}));
         return Ok(json!({"pending": true}));
     };
     let r = FontDb::global().install_font(&name, &bytes).map_err(|e| CmdError::Failed(e.to_string()))?;

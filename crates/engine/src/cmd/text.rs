@@ -17,6 +17,9 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("text.columnBreak", "Column Break", "Layout › Breaks", |s, _| ins_char(s, COLUMN_BREAK)).key("Mod+Shift+Enter"),
         CommandSpec::new("text.tab", "Tab", "Editing", tab).key("Tab"),
         CommandSpec::new("text.backTab", "Shift+Tab", "Editing", back_tab).key("Shift+Tab"),
+        // A tab character even in a table cell, where Tab moves to the next cell (#3137); ⌥Tab on macOS.
+        CommandSpec::new("text.insertTab", "Tab Character", "Editing", |s, _| ins_char(s, '\t'))
+            .key(if cfg!(target_os = "macos") { "Alt+Tab" } else { "Mod+Tab" }),
         CommandSpec::new("text.backspace", "Backspace", "Editing", backspace).key("Backspace"),
         CommandSpec::new("text.delete", "Delete", "Editing", delete).key("Delete"),
         CommandSpec::new("text.deleteWordBack", "Delete Previous Word", "Editing", delete_word_back).key("Mod+Backspace / Alt+Backspace"),
@@ -30,6 +33,9 @@ pub fn specs() -> Vec<CommandSpec> {
         } else {
             "Alt+X"
         }),
+        // Alt+numpad codes: the shell collects the keypad digits while Alt is held (#961).
+        CommandSpec::new("text.typeCode", "Type Character Code", "Editing", insert_code)
+            .params(r#"{"code": string (decimal digits as typed on the keypad, e.g. "0233"), "ansi"?: 874 | 1250–1258 (the leading-0 code page, default 1252), "oem"?: 437 | 737 | 850 | 852 | 857 | 866 (default from the locale)}"#),
         CommandSpec::new("text.emDash", "Em Dash", "Insert › Symbols", |s, _| ins_char(s, '—')).key("Mod+Alt+-"),
         // On macOS Option+G / R / 2 / ; type these directly, so Word for Mac has no Cmd shortcut.
         CommandSpec::new("text.copyright", "Copyright Sign", "Insert › Symbols", |s, _| ins_char(s, '©')).key(non_mac("Mod+Alt+C")),
@@ -52,7 +58,12 @@ fn autoformat(s: &mut Session, text: &str) -> Option<String> {
     let para = s.doc.para_at(f)?;
     let before = para.text.get(..f.off)?;
     let prev = before.chars().next_back();
-    let opening = prev.is_none_or(|p| p.is_whitespace() || "([{<\u{2014}\u{2013}".contains(p));
+    let opening = prev.is_none_or(|p| {
+        p.is_whitespace()
+            || "([{<\u{2014}\u{2013}\u{00AB}\u{2039}\u{201E}\u{201A}".contains(p)
+            || (c == '"' && p == '\u{2018}')
+            || (c == '\'' && p == '\u{201C}')
+    });
     match c {
         '"' => Some(if opening { "\u{201C}" } else { "\u{201D}" }.into()),
         '\'' => Some(if opening { "\u{2018}" } else { "\u{2019}" }.into()),
@@ -101,10 +112,10 @@ fn insert(s: &mut Session, v: &Value) -> CmdResult {
     // A list label ("a. ") becomes a list before AutoCorrect could capitalise it.
     let listed = text == " " && s.prefs.autocorrect.enabled && list_autoformat(s)?;
     if !listed {
-        super::tools::autocorrect(s)?;
+        super::tools::autocorrect(s).inspect_err(|_| s.autocap = None)?;
     }
     if text == " " && !listed && s.prefs.autocorrect.enabled && s.prefs.autocorrect.dashes {
-        dash_autoformat(s)?;
+        dash_autoformat(s).inspect_err(|_| s.autocap = None)?;
     }
     if let Some((para, sel)) = typed
         && s.doc.para_at(&f) != Some(&para)
@@ -114,19 +125,31 @@ fn insert(s: &mut Session, v: &Value) -> CmdResult {
             *p = para;
             p.touch();
             s.push_undo("AutoFormat", doc, sel);
+            // Undo right after it makes the capitalised word an exception.
+            let depth = s.undo_steps_so_far();
+            if let Some(c) = s.autocap.as_mut().filter(|c| c.depth == u64::MAX) {
+                c.depth = depth;
+            }
         }
     }
+    s.autocap.take_if(|c| c.depth == u64::MAX);
     sel_result(s)
 }
 
-/// "* " / "- " / "> " → bullets, "1. " / "a) " → numbering, typed at the start of a paragraph.
+/// "* " / "- " / "> " → bullets, "1. " / "a) " → numbering, typed at the start of a paragraph
+/// (Word triggers on the paragraph's first characters, whatever text already follows the caret,
+/// not only when the trigger is the paragraph's entire content — #3352).
 fn list_autoformat(s: &mut Session) -> Result<bool, CmdError> {
     let f = s.sel.focus.clone();
     let Some(para) = s.doc.para_at(&f) else { return Ok(false) };
-    if para.props.numbering.is_some_and(|n| n.num != 0) || f.off != para.len() {
+    // A style-linked list (a heading-linked Multilevel List preset, #1793) numbers the paragraph
+    // without `props.numbering` itself being set: resolve it, so autoformat doesn't paper over an
+    // already-numbered heading with a fresh bullet.
+    if s.doc.styles.resolve_para(&para.props).numbering.is_some_and(|n| n.num != 0) {
         return Ok(false);
     }
-    let kind = match para.text.as_str() {
+    let Some(prefix) = para.text.get(..f.off) else { return Ok(false) };
+    let kind = match prefix {
         "* " => ListKind::Bullet,
         "- " => ListKind::BulletChar('-'),
         // Arrow bullets (Word draws these from a symbol font; we use the Unicode arrows).
@@ -149,12 +172,17 @@ fn list_autoformat(s: &mut Session) -> Result<bool, CmdError> {
     // Bullets join an existing bullet list; typing "1. " always starts numbering again at 1,
     // as in Word.
     let found = if kind.is_bullet() { s.doc.numbering.find_kind(kind) } else { None };
-    let num = found.unwrap_or_else(|| s.doc.numbering.add_list(kind));
+    let num = match found {
+        Some(n) => n,
+        None => s.doc.numbering.try_add_list(kind)?,
+    };
     let para = s.doc.para_mut(f.story, &f.path)?;
-    let len = para.len();
-    para.delete(0, len)?;
+    para.delete(0, f.off)?;
     para.props.numbering = Some(NumRef { num, level: 0 });
-    para.props.style = Some("ListParagraph".into());
+    // A heading stays a heading (Word: "1. " in a Heading 1 gives a numbered Heading 1).
+    if para.props.style.as_deref().is_none_or(|st| st == "Normal") {
+        para.props.style = Some("ListParagraph".into());
+    }
     s.sel = Selection::caret(Pos { off: 0, ..f });
     Ok(true)
 }
@@ -170,7 +198,7 @@ fn dash_autoformat(s: &mut Session) -> Result<(), CmdError> {
     {
         // "word -- word" → "word – word" once the next word is typed.
         let p = s.doc.para_mut(f.story, &f.path)?;
-        let props = p.props_at(i + 1).clone();
+        let props = p.props_at(i + 1).clone().without_symbol();
         p.delete(i + 1, i + 3)?;
         p.insert_text(i + 1, "\u{2013}", &props)?;
         s.sel = Selection::caret(Pos { off: f.off + 1, ..f });
@@ -179,17 +207,17 @@ fn dash_autoformat(s: &mut Session) -> Result<(), CmdError> {
         && !before.trim_end()[i + 3..].contains(' ')
     {
         let p = s.doc.para_mut(f.story, &f.path)?;
-        let props = p.props_at(i + 1).clone();
+        let props = p.props_at(i + 1).clone().without_symbol();
         p.delete(i + 1, i + 2)?;
         p.insert_text(i + 1, "\u{2013}", &props)?;
         s.sel = Selection::caret(Pos { off: f.off + 2, ..f });
     } else if before.ends_with(' ')
         && let Some(i) = before.trim_end().rfind("--")
         && i > 0
-        && before.trim_end().get(i - 1..i).is_some_and(|c| c != " ")
+        && before.trim_end()[..i].chars().next_back().is_some_and(|c| c != ' ')
     {
         let p = s.doc.para_mut(f.story, &f.path)?;
-        let props = p.props_at(i).clone();
+        let props = p.props_at(i).clone().without_symbol();
         p.delete(i, i + 2)?;
         p.insert_text(i, "\u{2014}", &props)?;
         s.sel = Selection::caret(Pos { off: f.off + 1, ..f });
@@ -203,9 +231,12 @@ enum EnterAutoFormat {
     Border(Border),
     /// "+---+-----+": a one-row table; the dash count of each column.
     Table(Vec<usize>),
+    /// A short line before an empty paragraph: Heading 1, 2 or 3.
+    Heading(u8),
 }
 
-/// AutoFormat border lines: Enter after "---", "___", "===", "***", "~~~" or "###".
+/// AutoFormat border lines: Enter after "---", "___", "===", "***", "~~~" or "###". A line
+/// holding a tracked deletion stays as it is.
 fn border_line(s: &Session, at: &Pos) -> Option<Border> {
     let para = s.doc.para_at(at)?;
     let text = para.text.as_str();
@@ -215,7 +246,8 @@ fn border_line(s: &Session, at: &Pos) -> Option<Border> {
         || at.off != text.len()
         || text.len() < 3
         || !text.chars().all(|x| x == c)
-        || para.props.numbering.is_some_and(|n| n.num != 0)
+        || s.doc.styles.resolve_para(&para.props).numbering.is_some_and(|n| n.num != 0)
+        || para.run_ranges().any(|(_, r)| r.del.is_some())
     {
         return None;
     }
@@ -232,8 +264,8 @@ fn border_line(s: &Session, at: &Pos) -> Option<Border> {
 }
 
 /// AutoFormat tables: a body paragraph that is exactly "+---+-----+" (plus signs around runs
-/// of hyphens). Returns the hyphen count of each column; more columns than a table can hold
-/// leave the text alone.
+/// of hyphens). Returns the hyphen count of each column; more columns than a table can hold,
+/// or a line holding a tracked deletion, leave the text alone.
 fn table_line(s: &Session, at: &Pos) -> Option<Vec<usize>> {
     let para = s.doc.para_at(at)?;
     let text = para.text.as_str();
@@ -241,7 +273,8 @@ fn table_line(s: &Session, at: &Pos) -> Option<Vec<usize>> {
         || at.story != StoryRef::Body
         || at.path.0.len() != 1
         || at.off != text.len()
-        || para.props.numbering.is_some_and(|n| n.num != 0)
+        || s.doc.styles.resolve_para(&para.props).numbering.is_some_and(|n| n.num != 0)
+        || para.run_ranges().any(|(_, c)| c.del.is_some())
     {
         return None;
     }
@@ -256,8 +289,76 @@ fn table_line(s: &Session, at: &Pos) -> Option<Vec<usize>> {
     Some(cols)
 }
 
+/// AutoFormat Built-in Heading styles: Enter in an empty body paragraph whose previous paragraph
+/// is a line of Normal text with one to five words that ends in a letter or digit and holds no
+/// tracked deletion. The line becomes Heading 1, or Heading 2 or 3 when it starts with one or
+/// two tabs.
+fn heading_line(s: &Session, at: &Pos) -> Option<u8> {
+    let ac = &s.prefs.autocorrect;
+    let cur = s.doc.para_at(at)?;
+    let i = at.path.last();
+    if !ac.enabled || !ac.heading_styles || at.story != StoryRef::Body || at.path.0.len() != 1 || i == 0 || !cur.is_empty() {
+        return None;
+    }
+    let Some(Block::Para(prev)) = s.doc.block(at.story, &at.path.with_last(i - 1)) else { return None };
+    // Normal and outside a list, also one the style sheet gives (a numbered Normal style).
+    let plain = |p: &wordcraft_doc::Paragraph| {
+        let r = s.doc.styles.resolve_para(&p.props);
+        p.props.style.as_deref().is_none_or(|st| st == "Normal") && r.numbering.is_none_or(|n| n.num == 0) && r.outline_level.is_none_or(|l| l >= 9)
+    };
+    let text = prev.text.trim_start_matches('\t');
+    let tabs = prev.text.len() - text.len();
+    if !plain(cur)
+        || !plain(prev)
+        || !prev.objects.is_empty()
+        || prev.section.is_some()
+        || prev.run_ranges().any(|(_, c)| c.del.is_some())
+        || tabs > 2
+        || !(1..=5).contains(&text.split_whitespace().count())
+        || text.starts_with(char::is_whitespace)
+        || text.contains(char::is_control)
+        || !text.ends_with(char::is_alphanumeric)
+    {
+        return None;
+    }
+    let level = tabs as u8 + 1;
+    // Formatting limited to the document's styles: a locked heading style isn't applied.
+    let id = format!("Heading{level}");
+    if super::protect::enforced(&s.doc) && s.doc.settings.protect_formatting && s.doc.styles.get(&id).is_some_and(|st| st.locked) {
+        return None;
+    }
+    Some(level)
+}
+
+/// Give the paragraph before the empty one at `at` Heading `level` without its leading tabs;
+/// the caret stays in the empty paragraph. With Track Changes on, the tabs are marked deleted
+/// (or removed, when this author typed them) and the style change is a formatting revision.
+fn apply_heading_line(s: &mut Session, at: &Pos, level: u8) -> Result<(), CmdError> {
+    let prev = at.path.with_last(at.path.last().saturating_sub(1));
+    let Some(before) = s.doc.para(at.story, &prev).cloned() else { return Ok(()) };
+    let tabs = before.text.len() - before.text.trim_start_matches('\t').len();
+    let start = Pos { story: at.story, path: prev.clone(), off: 0 };
+    s.sel = Selection { anchor: start.clone(), focus: Pos { off: tabs, ..start } };
+    delete_selection(s)?;
+    super::para::set_heading(s, at.story, &prev, Some(level))?;
+    // Removed tabs change the text, and the formatting comparison after the command only looks
+    // at paragraphs that keep theirs, so the style change is recorded here.
+    if s.doc.settings.track_changes
+        && s.prefs.markup.track_formatting
+        && s.doc.para(at.story, &prev).is_some_and(|p| p.text != before.text && p.props.fmt_change.is_none())
+    {
+        let rev = super::new_revision(s, wordcraft_doc::RevisionKind::Format);
+        let p = s.doc.para_mut(at.story, &prev)?;
+        p.props.fmt_change = wordcraft_doc::props::PropChange::boxed(rev, before.props.formatting());
+        p.touch();
+    }
+    s.sel = Selection::caret(at.clone());
+    Ok(())
+}
+
 /// Turn the border-line characters into a bottom border on the paragraph above (or this one
-/// at the top of a story).
+/// at the top of a story). With Track Changes on, the characters are marked deleted (or
+/// removed, when this author typed them) and the border is a formatting revision.
 fn apply_border_line(s: &mut Session, at: &Pos, line: Border) -> Result<(), CmdError> {
     let set_bottom = |p: &mut wordcraft_doc::Paragraph| {
         let mut b = p.props.borders.unwrap_or_default();
@@ -267,31 +368,52 @@ fn apply_border_line(s: &mut Session, at: &Pos, line: Border) -> Result<(), CmdE
     };
     let i = at.path.last();
     let prev = if i > 0 { Some(at.path.with_last(i - 1)) } else { None };
-    let cur = s.doc.para_mut(at.story, &at.path)?;
-    let len = cur.len();
-    cur.delete(0, len)?;
-    let start = Pos { off: 0, ..at.clone() };
+    let end = delete_typed_line(s, at)?;
     match prev.filter(|q| matches!(s.doc.block(at.story, q), Some(Block::Para(_)))) {
         Some(q) => {
             // The characters' paragraph becomes the one typing continues in.
             set_bottom(s.doc.para_mut(at.story, &q)?);
-            s.sel = Selection::caret(start);
+            s.sel = Selection::caret(end);
         }
         None => {
+            let before = s.doc.para(at.story, &at.path).map(|p| p.props.clone());
             set_bottom(s.doc.para_mut(at.story, &at.path)?);
-            let new = split_para(s, &start)?;
+            let new = split_para(s, &end)?;
             let p = s.doc.para_mut(new.story, &new.path)?;
             p.props.borders = None;
             p.touch();
+            // The split changes the block count, and the formatting comparison after the command
+            // skips a container whose block count changed, so the border is recorded here.
+            if s.doc.settings.track_changes
+                && s.prefs.markup.track_formatting
+                && let Some(before) = before.filter(|b| b.fmt_change.is_none())
+            {
+                let rev = super::new_revision(s, wordcraft_doc::RevisionKind::Format);
+                let p = s.doc.para_mut(at.story, &at.path)?;
+                p.props.fmt_change = wordcraft_doc::props::PropChange::boxed(rev, before.formatting());
+                p.touch();
+            }
             s.sel = Selection::caret(new);
         }
     }
     Ok(())
 }
 
+/// Delete the AutoFormat characters of the paragraph at `at`, tracked when Track Changes is on.
+/// Returns the end of what is left: the paragraph's end, after any characters marked deleted.
+fn delete_typed_line(s: &mut Session, at: &Pos) -> Result<Pos, CmdError> {
+    let len = s.doc.para(at.story, &at.path).map_or(0, |p| p.len());
+    s.sel = Selection { anchor: Pos { off: 0, ..at.clone() }, focus: Pos { off: len, ..at.clone() } };
+    delete_selection(s)?;
+    let left = s.doc.para(at.story, &at.path).map_or(0, |p| p.len());
+    Ok(Pos { off: left, ..at.clone() })
+}
+
 /// Replace the "+---+" characters with a one-row table across the text width, each column as
 /// wide as its share of the hyphens; the emptied paragraph stays after the table and the caret
-/// goes into the first cell.
+/// goes into the first cell. With Track Changes on, the characters are marked deleted (or
+/// removed, when this author typed them); the table is inserted untracked, as Insert › Table
+/// inserts one.
 fn apply_table_line(s: &mut Session, at: &Pos, cols: &[usize]) -> Result<(), CmdError> {
     let total = cols.iter().sum::<usize>().max(1) as f32;
     let block = at.path.0.first().copied().unwrap_or(0) as usize;
@@ -306,9 +428,7 @@ fn apply_table_line(s: &mut Session, at: &Pos, cols: &[usize]) -> Result<(), Cmd
             c.props.width = Some(w);
         }
     }
-    let p = s.doc.para_mut(at.story, &at.path)?;
-    let len = p.len();
-    p.delete(0, len)?;
+    delete_typed_line(s, at)?;
     s.doc.insert_block(at.story, &at.path, Block::Table(t))?;
     let mut first = at.path.0.clone();
     first.extend([0, 0, 0]);
@@ -361,6 +481,112 @@ fn toggle_unicode(s: &mut Session, _: &Value) -> CmdResult {
     sel_result(s)
 }
 
+/// Alt+numpad entry: type the character a decimal code names at the caret, as typed text (one
+/// undo step, AutoFormat as for a typed character). `ansi` and `oem` are the system's code pages
+/// (Windows-1252 and the locale's OEM page by default). The result's `char` is the character.
+fn insert_code(s: &mut Session, v: &Value) -> CmdResult {
+    use wordcraft_doc::encoding::{OEM_CODE_PAGES, SINGLE_BYTE_CODE_PAGES};
+    let code = p::req_str(v, "code")?;
+    let page = |key: &str, known: &[u16], default: u16| match p::u64(v, key) {
+        Some(cp) => u16::try_from(cp).ok().filter(|cp| known.contains(cp)).ok_or_else(|| CmdError::Params(format!("{key} must be one of {known:?}"))),
+        None => Ok(default),
+    };
+    let ansi = page("ansi", &SINGLE_BYTE_CODE_PAGES, 1252)?;
+    let oem = page("oem", &OEM_CODE_PAGES, system_oem_code_page())?;
+    let c = alt_code_char(code, ansi, oem).ok_or_else(|| CmdError::Failed(format!("{code:?} isn't a character code")))?;
+    let mut r = insert(s, &serde_json::json!({"text": c.to_string()}))?;
+    if let Value::Object(m) = &mut r {
+        m.insert("char".into(), Value::String(c.to_string()));
+    }
+    Ok(r)
+}
+
+/// The character Word on Windows types for an Alt+numpad code (decimal digits, as typed):
+/// - with a leading 0 and a value up to 255, the ANSI code page's character (`ansi`, one of
+///   [`wordcraft_doc::encoding::SINGLE_BYTE_CODE_PAGES`]): `0233` → é and `0128` → € in
+///   Windows-1252, `0185` → ą in 1250;
+/// - without one, 1–255 is the OEM code page's character (`oem`, one of
+///   [`wordcraft_doc::encoding::OEM_CODE_PAGES`]): `233` → Θ in 437, Ú in 850 (é is `130` in
+///   both), `165` → ą in 852; 1–31 and 127 are the code page's glyphs (`1` → ☺, `7` → •);
+/// - above 255, with or without the 0, the Unicode character with that decimal value
+///   (`8364` → €), as Word inserts it.
+///
+/// `None` for an empty or non-numeric code, 0, a control character, a byte the code page leaves
+/// unassigned or a value past Unicode.
+pub fn alt_code_char(code: &str, ansi: u16, oem: u16) -> Option<char> {
+    if code.is_empty() || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let digits = code.trim_start_matches('0');
+    // More than seven significant digits is past U+10FFFF (1114111).
+    if digits.len() > 7 {
+        return None;
+    }
+    let value: u32 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
+    let c = match u8::try_from(value) {
+        Ok(0) => return None,
+        Ok(b) if code.starts_with('0') => wordcraft_doc::encoding::windows_byte(ansi, b),
+        Ok(b) => wordcraft_doc::encoding::oem_byte(oem, b),
+        Err(_) => char::from_u32(value)?,
+    };
+    Some(c).filter(|c| codeable(*c) && *c != '\u{FFFD}')
+}
+
+/// The OEM code page for the system locale the shell reported (437 headless).
+pub fn system_oem_code_page() -> u16 {
+    oem_code_page(crate::session::system_locale())
+}
+
+/// The (ANSI, OEM) code pages of the system locale the shell reported, as Windows sets them
+/// ([`windows_code_pages`]).
+pub fn system_code_pages() -> (u16, u16) {
+    windows_code_pages(crate::session::system_locale())
+}
+
+/// The OEM code page `text.typeCode` assumes for a locale (BCP 47 tag) when the shell names
+/// none: 850 for Western European languages and English outside the US, 437 otherwise. The
+/// other pages come only from the shell (Windows passes [`windows_code_pages`]).
+pub fn oem_code_page(locale: Option<&str>) -> u16 {
+    match windows_code_pages(locale) {
+        (_, 850) => 850,
+        _ => 437,
+    }
+}
+
+/// The (ANSI, OEM) code pages Windows uses for a locale (BCP 47 tag or POSIX name), limited to
+/// the pages `text.typeCode` decodes: Windows-1252 and OEM 437 for US English, unknown locales
+/// and those with other pages (Asian double-byte pages, OEM 775/720/862…).
+pub fn windows_code_pages(locale: Option<&str>) -> (u16, u16) {
+    let Some(tag) = locale else { return (1252, 437) };
+    let parts: Vec<&str> = tag.split(['-', '_', '.', '@']).collect();
+    let lang = parts.first().copied().unwrap_or_default().to_ascii_lowercase();
+    let rest = parts.get(1..).unwrap_or_default();
+    let region = rest.iter().find(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_alphabetic())).map(|r| r.to_ascii_uppercase());
+    let script = rest.iter().find(|p| p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic())).map(|r| r.to_ascii_lowercase());
+    const WESTERN: [&str; 18] = ["ca", "da", "de", "es", "eu", "fi", "fo", "fr", "ga", "gl", "is", "it", "nb", "nl", "nn", "no", "pt", "sv"];
+    match lang.as_str() {
+        "en" => match region.as_deref() {
+            None | Some("US") => (1252, 437),
+            Some(_) => (1252, 850),
+        },
+        l if WESTERN.contains(&l) => (1252, 850),
+        "pl" | "cs" | "sk" | "hu" | "sl" | "hr" | "ro" | "sq" | "bs" => (1250, 852),
+        "sr" if script.as_deref() == Some("latn") => (1250, 852),
+        "ru" | "uk" | "be" | "bg" => (1251, 866),
+        // Macedonian and Cyrillic Serbian use OEM 855, which isn't decoded.
+        "sr" | "mk" => (1251, 437),
+        "el" => (1253, 737),
+        "az" if script.as_deref() == Some("cyrl") => (1251, 866),
+        "tr" | "az" => (1254, 857),
+        "he" => (1255, 437),
+        "ar" | "fa" | "ur" => (1256, 437),
+        "et" | "lv" | "lt" => (1257, 437),
+        "vi" => (1258, 437),
+        "th" => (874, 437),
+        _ => (1252, 437),
+    }
+}
+
 /// The character a hex code (1–6 digits) names, if it is one Alt+X makes.
 fn hex_char(code: &str) -> Option<char> {
     if code.is_empty() || code.len() > 6 || !code.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -385,14 +611,75 @@ fn ins_char(s: &mut Session, c: char) -> CmdResult {
     sel_result(s)
 }
 
+/// Exact sample-text formulas; bounded counts keep typed input from allocating without limit.
+fn sample_text(s: &Session) -> Option<String> {
+    let at = &s.sel.focus;
+    let para = s.doc.para_at(at)?;
+    if !s.sel.is_collapsed() || at.off != para.len() {
+        return None;
+    }
+    let (args, sentences) = if let Some(args) = para.text.strip_prefix("=rand(") {
+        (
+            args,
+            [
+                "A blank page leaves room for a new idea.",
+                "The morning light falls across a notebook on the desk.",
+                "Small changes in spacing can give a story a different rhythm.",
+            ],
+        )
+    } else {
+        (
+            para.text.strip_prefix("=lorem(")?,
+            [
+                "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+                "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
+                "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.",
+            ],
+        )
+    };
+    let args = args.strip_suffix(')')?;
+    if args.contains(['(', ')']) {
+        return None;
+    }
+    let count = |arg: &str| arg.trim().parse::<usize>().ok().filter(|n| (1..=200).contains(n));
+    let counts = if args.is_empty() {
+        Some((5, 3))
+    } else if let Some((p, s)) = args.split_once(',') {
+        count(p).zip(count(s))
+    } else {
+        count(args).map(|p| (p, 3))
+    };
+    let (paragraphs, lines) = counts.unwrap_or((5, 3));
+    let mut text = String::new();
+    for _ in 0..paragraphs {
+        for sentence in sentences.iter().cycle().take(lines) {
+            if !text.is_empty() && !text.ends_with('\r') {
+                text.push(' ');
+            }
+            text.push_str(sentence);
+        }
+        text.push('\r');
+    }
+    Some(text)
+}
+
 fn new_paragraph(s: &mut Session, _: &Value) -> CmdResult {
     // Enter in a one-line plain text control (or a check box or list) does nothing, as in Word.
     if super::controls::refuses_paragraph(s) {
         return sel_result(s);
     }
     super::controls::prepare_edit(s)?;
+    if let Some(text) = sample_text(s) {
+        let end = s.sel.focus.clone();
+        s.sel = Selection { anchor: Pos { off: 0, ..end.clone() }, focus: end };
+        type_text(s, &text)?;
+        return sel_result(s);
+    }
     let mut at = delete_selection(s)?;
-    let auto = border_line(s, &at).map(EnterAutoFormat::Border).or_else(|| table_line(s, &at).map(EnterAutoFormat::Table));
+    let auto = border_line(s, &at)
+        .map(EnterAutoFormat::Border)
+        .or_else(|| table_line(s, &at).map(EnterAutoFormat::Table))
+        .or_else(|| heading_line(s, &at).map(EnterAutoFormat::Heading));
     if let Some(auto) = auto {
         // Word: Undo right after reverts only the AutoFormat, so the typed characters come back
         // and the Enter stays. Record that plain Enter as its own undo step.
@@ -404,6 +691,7 @@ fn new_paragraph(s: &mut Session, _: &Value) -> CmdResult {
         match auto {
             EnterAutoFormat::Border(line) => apply_border_line(s, &at, line)?,
             EnterAutoFormat::Table(cols) => apply_table_line(s, &at, &cols)?,
+            EnterAutoFormat::Heading(level) => apply_heading_line(s, &at, level)?,
         }
         s.goal_x = None;
         s.push_undo("AutoFormat", plain_doc, plain_sel);
@@ -411,7 +699,33 @@ fn new_paragraph(s: &mut Session, _: &Value) -> CmdResult {
     }
     // Enter finishes a word like a space does ("teh" → "the", sentence capitals, links).
     if s.sel.is_collapsed() && at.off > 0 {
+        // A `*bold*` or `_italic_` word: like the border lines above, Undo right after brings
+        // the marks back and the Enter stays.
+        let plain = super::tools::has_emphasis(s, true).then(|| (s.doc.clone(), s.sel.clone()));
+        if let Some((doc, sel)) = plain {
+            // Removes the marks, then AutoCorrects the word as without them.
+            super::tools::autocorrect_word(s, true)?;
+            s.autocap.take_if(|c| c.depth == u64::MAX);
+            let (done_doc, done_sel) = (std::mem::replace(&mut s.doc, doc), std::mem::replace(&mut s.sel, sel));
+            let new = split_para(s, &at)?;
+            let c = s.doc.para_at(&new).map(|p| p.mark.clone()).unwrap_or_default();
+            s.sel = Selection::caret(new);
+            let plain_doc = std::mem::replace(&mut s.doc, done_doc);
+            let plain_sel = std::mem::replace(&mut s.sel, done_sel);
+            let new = split_para(s, &s.sel.focus.clone())?;
+            let p = s.doc.para_mut(new.story, &new.path)?;
+            // The new paragraph is formatted as after a plain Enter (the closing mark's
+            // formatting, or none when the next style starts afresh); its mark keeps its revisions.
+            let (ins, del, fmt_change) = (p.mark.ins, p.mark.del, p.mark.fmt_change.take());
+            p.mark = wordcraft_doc::props::CharProps { ins, del, fmt_change, ..c };
+            p.touch();
+            s.sel = Selection::caret(new);
+            s.goal_x = None;
+            s.push_undo("AutoFormat", plain_doc, plain_sel);
+            return sel_result(s);
+        }
         super::tools::autocorrect_word(s, true)?;
+        s.autocap.take_if(|c| c.depth == u64::MAX);
         at = s.sel.focus.clone();
     }
     let new = split_para(s, &at)?;
@@ -420,7 +734,9 @@ fn new_paragraph(s: &mut Session, _: &Value) -> CmdResult {
     sel_result(s)
 }
 
-/// In a table: next cell (adds a row at the end). At the start of a list item: demote. Else a tab.
+/// In a table: next cell (adds a row at the end). At the start of a list item: demote. With "Set
+/// left- and first-indent with tabs and backspaces" on, at the start of a line of a paragraph with
+/// text: indent. Else a tab.
 fn tab(s: &mut Session, _: &Value) -> CmdResult {
     if let Some((tpath, r, c)) = s.sel.focus.path.cell() {
         let story = s.sel.focus.story;
@@ -450,15 +766,64 @@ fn tab(s: &mut Session, _: &Value) -> CmdResult {
         && n.num != 0
     {
         let para = s.doc.para_mut(f.story, &f.path)?;
-        para.props.numbering = Some(NumRef { num: n.num, level: (n.level + 1).min(8) });
+        para.props.numbering = Some(NumRef { num: n.num, level: n.level.saturating_add(1).min(8) });
         para.touch();
         return sel_result(s);
+    }
+    if s.sel.is_collapsed() && tab_indent_on(s) && tab_indents(s, &f) {
+        return indent_by_tab(s, &f);
     }
     if !s.sel.is_collapsed() && s.sel.anchor.path != s.sel.focus.path {
         // Multiple paragraphs selected: increase indent.
         return super::para::indent(s, &Value::Null);
     }
     ins_char(s, '\t')
+}
+
+/// Is AutoFormat As You Type's "Set left- and first-indent with tabs and backspaces" on? Not
+/// while the document limits formatting to its styles: the indents are direct formatting.
+fn tab_indent_on(s: &Session) -> bool {
+    let ac = &s.prefs.autocorrect;
+    ac.enabled && ac.tab_indent && !(super::protect::enforced(&s.doc) && s.doc.settings.protect_formatting)
+}
+
+/// Does Tab at `f` indent instead of typing a tab? Only at the start of a line of a paragraph
+/// with text. Not before the first line of a list item numbered by its style, where Tab types a
+/// tab character as with the option off.
+fn tab_indents(s: &mut Session, f: &Pos) -> bool {
+    let Some(para) = s.doc.para_at(f).filter(|p| !p.is_empty()) else { return false };
+    if f.off == 0 {
+        return !s.doc.styles.resolve_para(&para.props).numbering.is_some_and(|n| n.num != 0);
+    }
+    let l = s.layout();
+    l.line_bounds(f, s.page_hint).is_some_and(|(a, _)| a == *f)
+}
+
+/// Tab before the first line indents the first line by one default tab stop; before any other
+/// line, or when the first line is indented or hanging already, it indents the whole paragraph.
+/// Before a later line of a list item, numbered directly or by its style, it takes the item down
+/// a level.
+fn indent_by_tab(s: &mut Session, f: &Pos) -> CmdResult {
+    let Some(para) = s.doc.para_at(f) else { return sel_result(s) };
+    let r = s.doc.styles.resolve_para(&para.props);
+    if f.off > 0
+        && para.props.numbering.is_none()
+        && let Some(n) = r.numbering.filter(|n| n.num != 0)
+    {
+        let p = s.doc.para_mut(f.story, &f.path)?;
+        p.props.numbering = Some(NumRef { num: n.num, level: n.level.saturating_add(1).min(8) });
+        p.touch();
+        return sel_result(s);
+    }
+    if f.off == 0 && r.indent_first == 0.0 && r.indent_chars[2] == 0.0 {
+        let tab = s.doc.settings.default_tab.max(1.0);
+        let p = s.doc.para_mut(f.story, &f.path)?;
+        p.props.indent_first = Some(tab);
+        p.props.cancel_char_indents(false, false, true);
+        p.touch();
+        return sel_result(s);
+    }
+    super::para::indent(s, &Value::Null)
 }
 
 fn back_tab(s: &mut Session, _: &Value) -> CmdResult {
@@ -503,6 +868,9 @@ fn backspace_inner(s: &mut Session, _: &Value) -> CmdResult {
     let Some(para) = s.doc.para_at(&f) else { return sel_result(s) };
     if f.off > 0 {
         let a = Pos { off: para.backspace_from(f.off), ..f.clone() };
+        if let Some(c) = s.autocap.as_mut() {
+            c.note_backspace(&a, &f);
+        }
         s.sel = Selection { anchor: a, focus: f };
         delete_selection(s)?;
         return sel_result(s);
@@ -537,6 +905,11 @@ fn backspace_inner(s: &mut Session, _: &Value) -> CmdResult {
         p.touch();
         return sel_result(s);
     }
+    if tab_indent_on(s) && (para.props.indent_left.is_some_and(|x| x > 0.0) || para.props.indent_left_chars.is_some_and(|x| x > 0.0)) {
+        // Set left- and first-indent with tabs and backspaces: the paragraph's own left indent
+        // (in points or characters) goes back one tab stop at a time before the paragraphs join.
+        return super::para::outdent(s, &Value::Null);
+    }
     let i = f.path.last();
     if i == 0 {
         return sel_result(s); // start of a story or cell
@@ -557,8 +930,9 @@ fn backspace_inner(s: &mut Session, _: &Value) -> CmdResult {
             s.sel = Selection::caret(at);
         }
         Some(Block::Table(_)) => {
-            // Move into the table's last cell.
-            let last = s.doc.para_paths(f.story).into_iter().rfind(|q| q.0.first() == prev_path.0.first() && q.0.len() > 1);
+            // Move into the table's last cell. The table is matched by its whole path: a table
+            // nested in a cell shares only its first index with the table around it.
+            let last = s.doc.para_paths(f.story).into_iter().rfind(|q| q.0.len() > prev_path.0.len() && q.0.starts_with(&prev_path.0));
             if let Some(q) = last {
                 let off = s.doc.para(f.story, &q).map(|x| x.len()).unwrap_or(0);
                 if s.doc.para_at(&f).is_some_and(|x| x.is_empty()) && s.doc.container(f.story, &f.path).is_some_and(|c| c.len() > i + 1) {
@@ -621,6 +995,10 @@ fn delete_inner(s: &mut Session, _: &Value) -> CmdResult {
             path.extend([0, 0, 0]);
             s.sel = Selection::caret(Pos { story: f.story, path: wordcraft_doc::Path(path), off: 0 });
         }
+    } else if f.story == StoryRef::Body && f.path.0.len() == 1 && !s.doc.settings.track_changes {
+        // The last paragraph: no paragraph to join, but a section break on its mark (the last
+        // section then holds no paragraph) still goes, as in Word (#2127).
+        s.doc.remove_section_break(f.path.last());
     }
     sel_result(s)
 }

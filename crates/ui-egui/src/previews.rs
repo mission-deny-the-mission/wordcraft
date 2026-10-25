@@ -17,6 +17,7 @@ pub struct Previews {
     tex: HashMap<String, TextureHandle>,
     /// The font list, for the interface language it was made in.
     families: Option<(&'static str, Vec<String>)>,
+    font_gen: u64,
     /// Lowercase English family → its name in that language (simsun → 宋体), and back.
     local_names: HashMap<String, String>,
     english_names: HashMap<String, String>,
@@ -26,6 +27,129 @@ pub struct Previews {
     /// Previews rendered this frame (rendering is spread over frames).
     budget: std::cell::Cell<u32>,
     frame: u64,
+    /// The Equation tab's pictures, packed into one texture (#1002).
+    math: MathAtlas,
+}
+
+/// Side of each square texture page the equation pictures share, in pixels.
+const MATH_ATLAS: usize = 2048;
+/// At most this many pages: enough for a frame's pictures at a high display scale (the 22
+/// built-in equations alone take two pages at 3×), still a handful of textures in all.
+const MATH_ATLAS_PAGES: usize = 4;
+/// Transparent pixels between pictures, so linear filtering never bleeds one into the next.
+const MATH_ATLAS_GAP: usize = 2;
+
+/// Every equation picture (gallery tiles, structure buttons, symbols) packed into a few shared
+/// textures ("pages"), row by row, and drawn as a part of one (#1002).
+///
+/// They used to be a texture each: hundreds of small textures, created as galleries opened and
+/// all freed at once when the preview cache filled. On Windows (DirectX 12) the tiles then
+/// showed other textures' memory: inverted pictures, red and teal fills, and even damaged
+/// interface letters. A texture written in place is what egui does for its own glyphs; the
+/// atlas creates at most [`MATH_ATLAS_PAGES`] textures and frees none while galleries are
+/// browsed. When every page is full, the page least recently drawn from starts over, but never
+/// one drawn from in the current frame (its pictures are already on screen): a frame whose
+/// pictures don't fit shows the rest as linear text.
+#[derive(Default)]
+struct MathAtlas {
+    pages: Vec<AtlasPage>,
+    /// Picture key → its page and part of that page's texture (UV coordinates).
+    uv: HashMap<String, (usize, Rect)>,
+    /// How many times a page started over (for tests).
+    wipes: u64,
+}
+
+#[derive(Default)]
+struct AtlasPage {
+    tex: Option<TextureHandle>,
+    /// Where the next picture goes: the current row's left edge and top, and the row's height.
+    x: usize,
+    y: usize,
+    row_h: usize,
+    /// The last frame a picture of this page was handed out in.
+    used: u64,
+}
+
+impl AtlasPage {
+    /// A free spot for a `w`×`h` picture, or `None` when the page is full or it can't fit.
+    fn place(&mut self, w: usize, h: usize) -> Option<[usize; 2]> {
+        if w == 0 || h == 0 || w > MATH_ATLAS || h > MATH_ATLAS {
+            return None;
+        }
+        let (mut x, mut y, mut row_h) = (self.x, self.y, self.row_h);
+        if x.saturating_add(w) > MATH_ATLAS {
+            x = 0;
+            y = y.saturating_add(row_h).saturating_add(MATH_ATLAS_GAP);
+            row_h = 0;
+        }
+        if y.saturating_add(h) > MATH_ATLAS {
+            return None;
+        }
+        self.x = x.saturating_add(w).saturating_add(MATH_ATLAS_GAP);
+        self.y = y;
+        self.row_h = row_h.max(h);
+        Some([x, y])
+    }
+
+    /// Forget the page's layout and clear its texture.
+    fn reset(&mut self) {
+        self.x = 0;
+        self.y = 0;
+        self.row_h = 0;
+        if let Some(tex) = &mut self.tex {
+            tex.set(egui::ColorImage::filled([MATH_ATLAS, MATH_ATLAS], egui::Color32::TRANSPARENT), egui::TextureOptions::LINEAR);
+        }
+    }
+}
+
+impl MathAtlas {
+    /// The picture stored under `key`, marking its page as drawn from in `frame`.
+    fn get(&mut self, frame: u64, key: &str) -> Option<(egui::TextureId, Rect)> {
+        let (page, uv) = *self.uv.get(key)?;
+        let p = self.pages.get_mut(page)?;
+        let id = p.tex.as_ref()?.id();
+        p.used = frame;
+        Some((id, uv))
+    }
+
+    /// Add `img` under `key`; its texture and UV rectangle, or `None` if it can't be placed in
+    /// this frame without wiping pictures already handed out in it.
+    fn add(&mut self, ctx: &egui::Context, frame: u64, key: &str, img: egui::ColorImage) -> Option<(egui::TextureId, Rect)> {
+        let [w, h] = img.size;
+        if w == 0 || h == 0 || w > MATH_ATLAS || h > MATH_ATLAS {
+            return None;
+        }
+        let mut spot = self.pages.iter_mut().enumerate().find_map(|(i, p)| p.place(w, h).map(|at| (i, at)));
+        if spot.is_none() && self.pages.len() < MATH_ATLAS_PAGES {
+            let mut p = AtlasPage::default();
+            spot = p.place(w, h).map(|at| (self.pages.len(), at));
+            self.pages.push(p);
+        }
+        if spot.is_none() {
+            // Every page is full: start over the one drawn from longest ago, unless all of them
+            // were drawn from in this frame.
+            let (i, p) = self.pages.iter_mut().enumerate().filter(|(_, p)| p.used != frame).min_by_key(|(_, p)| p.used)?;
+            p.reset();
+            self.uv.retain(|_, (page, _)| *page != i);
+            self.wipes = self.wipes.saturating_add(1);
+            spot = p.place(w, h).map(|at| (i, at));
+        }
+        let (i, at) = spot?;
+        let p = self.pages.get_mut(i)?;
+        let tex = p.tex.get_or_insert_with(|| {
+            ctx.load_texture(
+                format!("math_atlas_{i}"),
+                egui::ColorImage::filled([MATH_ATLAS, MATH_ATLAS], egui::Color32::TRANSPARENT),
+                egui::TextureOptions::LINEAR,
+            )
+        });
+        tex.set_partial(at, img, egui::TextureOptions::LINEAR);
+        p.used = frame;
+        let s = MATH_ATLAS as f32;
+        let uv = Rect::from_min_max(pos2(at[0] as f32 / s, at[1] as f32 / s), pos2((at[0] + w) as f32 / s, (at[1] + h) as f32 / s));
+        self.uv.insert(key.to_string(), (i, uv));
+        Some((tex.id(), uv))
+    }
 }
 
 impl Previews {
@@ -33,7 +157,9 @@ impl Previews {
     /// one (宋体 for SimSun in Chinese, #505), like Word's.
     pub fn families(&mut self) -> Vec<String> {
         let lang = crate::i18n::current().code();
-        if self.families.as_ref().is_none_or(|(l, _)| *l != lang) {
+        let generation = wordcraft_fonts::FontDb::global().generation();
+        if self.families.as_ref().is_none_or(|(l, _)| *l != lang) || self.font_gen != generation {
+            self.font_gen = generation;
             let db = wordcraft_fonts::FontDb::global();
             let mut f: Vec<String> = db.families_in(lang).into_iter().filter(|f| !f.starts_with('.')).collect();
             for w in [wordcraft_doc::styles::BODY_FONT, wordcraft_doc::styles::HEADING_FONT] {
@@ -88,6 +214,7 @@ impl Previews {
     /// `families` (an entry drawn before its font was added shows the fallback face).
     pub fn fonts_changed(&mut self, ctx: &egui::Context, families: impl Iterator<Item = String>) {
         self.families = None;
+        self.east_asian = None;
         ctx.data_mut(|d| {
             for f in families {
                 d.remove::<TextureHandle>(egui::Id::new(format!("font:{f}")));
@@ -101,6 +228,7 @@ impl Previews {
             let key = format!("font:{name}");
             let tex: Option<TextureHandle> = ui.ctx().data(|d| d.get_temp::<TextureHandle>(egui::Id::new(&key)));
             let (r, resp) = ui.allocate_exact_size(vec2(260.0, crate::widgets::COMBO_PREVIEW_ROW_H), Sense::click());
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), name));
             let t = Tokens::get(ui.ctx());
             if resp.hovered() {
                 ui.painter().rect_filled(r, 3.0, t.hover);
@@ -182,8 +310,9 @@ impl Previews {
 }
 
 /// An equation rasterised for a gallery tile or a button (`pt`: font size; `size`: the tile in
-/// points), with its empty slots shown. Cached by `key`; `None` while waiting for this frame's
-/// rendering budget.
+/// points), with its empty slots shown: the shared texture and the picture's UV rectangle in it
+/// ([`MathAtlas`]). An ink mask, drawn tinted with the theme's text colour. `None` while waiting
+/// for this frame's rendering budget.
 pub fn math_texture(
     app: &mut WordApp,
     ctx: &egui::Context,
@@ -192,10 +321,25 @@ pub fn math_texture(
     display: bool,
     pt: f32,
     size: egui::Vec2,
-) -> Option<TextureHandle> {
+) -> Option<(egui::TextureId, Rect)> {
     let ppp = ctx.pixels_per_point();
     let k = format!("math:{key}:{pt}:{}x{}:{ppp}", size.x, size.y);
-    app.previews.get_or(ctx, &k, || math_image(nodes, display, pt, size.x, size.y, ppp))
+    let p = &mut app.previews;
+    let frame = ctx.cumulative_frame_nr();
+    if let Some(hit) = p.math.get(frame, &k) {
+        return Some(hit);
+    }
+    if frame != p.frame {
+        p.frame = frame;
+        p.budget.set(0);
+    }
+    if p.budget.get() > 8 {
+        ctx.request_repaint();
+        return None;
+    }
+    p.budget.set(p.budget.get() + 1);
+    let img = math_image(nodes, display, pt, size.x, size.y, ppp)?;
+    p.math.add(ctx, frame, &k, img)
 }
 
 fn math_image(nodes: &wordcraft_doc::math::Arg, display: bool, pt: f32, w: f32, h: f32, ppp: f32) -> Option<egui::ColorImage> {
@@ -361,6 +505,10 @@ pub fn style_preview(app: &mut WordApp, ui: &mut Ui, id: &str, ty: &str, size: e
     }
 }
 
+/// Tiles the Home tab's Styles gallery shows, as designed and in a compact group.
+const STYLE_TILES: usize = 6;
+const STYLE_TILES_COMPACT: usize = 3;
+
 /// The Home tab's Styles gallery.
 pub fn style_gallery(app: &mut WordApp, ui: &mut Ui, state: &Value) {
     let t = Tokens::get(ui.ctx());
@@ -370,13 +518,16 @@ pub fn style_gallery(app: &mut WordApp, ui: &mut Ui, state: &Value) {
     let skey = app.previews.styles_key(&app.session.doc, rev);
     let ppp = ui.ctx().pixels_per_point();
     let start = ui.data(|d| d.get_temp::<usize>(egui::Id::new("gallery_start"))).unwrap_or(0).min(styles.len().saturating_sub(1));
-    let visible = 6usize;
+    // A compact ribbon group (#662, #1285) trims the gallery to fewer tiles before it folds.
+    let visible = if crate::ribbon_fit::compact(ui.ctx()) { STYLE_TILES_COMPACT } else { STYLE_TILES };
+    crate::ribbon_fit::add_saving(ui.ctx(), (STYLE_TILES - STYLE_TILES_COMPACT) as f32 * 76.0);
     let (area, _) = ui.allocate_exact_size(vec2(visible as f32 * 76.0 + 18.0, crate::widgets::CONTENT_H), Sense::hover());
     ui.painter().rect(area.shrink(1.0), 4.0, t.input, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
     for (k, (id, name)) in styles.iter().skip(start).take(visible).enumerate() {
         let r = Rect::from_min_size(pos2(area.min.x + 3.0 + k as f32 * 76.0, area.min.y + 3.0), vec2(74.0, area.height() - 6.0));
         let resp = ui.interact(r, ui.id().with(("style_tile", id)), Sense::click());
         let active = *id == current;
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, active, name));
         if active {
             ui.painter().rect(r, 3.0, t.checked, Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
         } else if resp.hovered() {
@@ -544,6 +695,83 @@ mod tests {
         assert!(loaded.len() <= 2, "previewing loaded {loaded:?}");
     }
 
+    /// A window whose Styles gallery lists `style` first: runs the gallery for a few frames and
+    /// returns the painted shapes of the last one and every texture picture uploaded on the way.
+    fn run_gallery(mut doc: Document, style: wordcraft_doc::styles::Style) -> (Vec<egui::epaint::ClippedShape>, Vec<egui::ColorImage>) {
+        // Only the style under test is in the gallery.
+        for other in &mut doc.styles.styles {
+            other.quick = false;
+        }
+        doc.styles.upsert(style);
+        let mut app = WordApp::new(wordcraft_engine::Session::new(doc), Default::default());
+        app.ui.language = "en".into();
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        let mut images = Vec::new();
+        for frame in 0..6 {
+            let input = egui::RawInput {
+                time: Some(f64::from(frame) * 0.1),
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 200.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                ui.add_space(20.0);
+                style_gallery(&mut app, ui, &json!({}));
+            });
+            for (_, deltas) in out.textures_delta.set.drain() {
+                for delta in deltas {
+                    if let (None, egui::ImageData::Color(img)) = (delta.pos, &delta.image) {
+                        images.push(egui::ColorImage::clone(img));
+                    }
+                }
+            }
+            out.textures_delta.clear();
+            shapes = out.shapes;
+        }
+        (shapes, images)
+    }
+
+    fn gallery_style(name: &str) -> wordcraft_doc::styles::Style {
+        wordcraft_doc::styles::Style { id: "Backfill".into(), name: name.into(), quick: true, priority: Some(0), ..Default::default() }
+    }
+
+    /// Regression test for #2: a style gallery label longer than its tile was painted at full width
+    /// and ran into the neighbouring tiles; it is now cut with an ellipsis to fit the tile.
+    #[test]
+    fn a_long_style_name_is_truncated_to_its_tile() {
+        let name = "An extraordinarily long custom style name that cannot fit a tile";
+        let (shapes, _) = run_gallery(Document::new(), gallery_style(name));
+        let label = shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == name => Some(t),
+                _ => None,
+            })
+            .expect("the long style's label is painted");
+        // A tile is 74 points wide.
+        assert!(label.galley.size().x <= 74.0, "the label is {} points wide, wider than its 74-point tile", label.galley.size().x);
+        assert!(label.galley.elided, "the label is cut short with an ellipsis");
+    }
+
+    /// Regression test for #2: a style whose hanging indent is larger than its left indent previewed
+    /// with its first line starting off the tile's left edge; the first line now starts at the edge.
+    #[test]
+    fn a_hanging_indent_style_previews_from_the_tile_edge() {
+        let mut style = gallery_style("Hanging");
+        style.para.indent_left = Some(0.0);
+        style.para.indent_first = Some(-36.0);
+        let (_, images) = run_gallery(Document::new(), style);
+        // The style is the only one in the gallery: its preview is the picture of a tile's size (the other upload is egui's font texture).
+        let preview = images.iter().find(|i| (200..300).contains(&i.size[0]) && (20..60).contains(&i.size[1])).expect("the preview is rendered");
+        let [w, h] = preview.size;
+        let inked: Vec<bool> = (0..w).map(|x| (0..h).any(|y| preview.pixels.get(y * w + x).is_some_and(|p| p.a() > 0 && p.r() < 160))).collect();
+        let first = inked.iter().position(|&i| i).expect("the preview has text");
+        let last = inked.iter().rposition(|&i| i).unwrap_or(first);
+        // "AaBbCcDd" begins at the left margin (1 point) and is whole: it is about 60 points wide.
+        assert!(first < 6, "the first line starts off the tile's left edge (ink from column {first})");
+        assert!(last - first > 40, "the first line is cut off by the tile's left edge (ink {first}..{last})");
+    }
+
     /// #663: gallery previews are dimmed in the dark theme, unless they show Switch Modes' dark
     /// page; the light theme keeps a white page.
     #[test]
@@ -600,6 +828,183 @@ mod tests {
         assert!(img.pixels.iter().any(|p| p.a() == 0), "paper is transparent");
         assert!(img.pixels.iter().any(|p| p.a() > 0), "ink is kept");
         assert!(img.pixels.iter().all(|p| *p == egui::Color32::from_white_alpha(p.a())), "ink is white, to be tinted");
+    }
+
+    /// Every picture the Equation tab and Insert › Equation draw: (key, nodes, display, pt, tile size).
+    fn equation_pictures() -> Vec<(String, wordcraft_doc::math::Arg, bool, f32, egui::Vec2)> {
+        use wordcraft_doc::math::{MNode, MRun, parse_linear};
+        use wordcraft_engine::math_gallery::{BUILT_INS, STRUCTURES, SYMBOL_SETS};
+        let mut out = Vec::new();
+        for g in STRUCTURES {
+            let pic = crate::equation_tab::button_picture(g.id);
+            out.push((format!("btn:{pic}"), parse_linear(pic), false, 12.0, vec2(40.0, 32.0)));
+            for (_, templates) in g.sections {
+                for t in templates.iter() {
+                    out.push((format!("tpl:{}", t.id), t.nodes(), true, 14.0, vec2(56.0, 52.0)));
+                    out.push((format!("tpl:{}", t.id), t.nodes(), true, 13.0, vec2(154.0, 56.0)));
+                }
+            }
+        }
+        for (id, _, lin) in BUILT_INS {
+            out.push((format!("builtin:{id}"), parse_linear(lin), true, 11.0, vec2(346.0, 60.0)));
+        }
+        for (_, chars) in SYMBOL_SETS {
+            for c in chars.chars() {
+                let nodes = vec![MNode::Run(MRun { text: c.to_string(), lit: true, ..Default::default() })];
+                out.push((format!("sym:{c}"), nodes, false, 11.0, vec2(22.0, 22.0)));
+            }
+        }
+        out
+    }
+
+    /// #1002: drawn the way the Equation tab draws them (the picture tinted with the theme's text
+    /// colour on an input-coloured tile), every gallery tile, button and symbol is the theme's
+    /// greys only: its background is the tile colour and its ink no darker or lighter than the
+    /// text, in light and dark mode, with no red or teal anywhere.
+    #[test]
+    fn equation_pictures_follow_the_theme() {
+        let mix = |fg: u8, bg: u8, a: u8| ((u32::from(fg) * u32::from(a) + u32::from(bg) * (255 - u32::from(a))) / 255) as u8;
+        for (key, nodes, display, pt, size) in equation_pictures() {
+            let img = math_image(&nodes, display, pt, size.x, size.y, 1.0).unwrap_or_else(|| panic!("{key} renders"));
+            assert!(img.pixels.iter().all(|p| *p == egui::Color32::from_white_alpha(p.a())), "{key}: an ink mask");
+            // Ink may reach the corner (a matrix bracket with Windows fonts): look for paper anywhere.
+            assert!(img.pixels.iter().any(|p| p.a() == 0), "{key}: transparent paper");
+            for t in [Tokens::light(), Tokens::dark()] {
+                let (bg, fg) = (t.input, t.text);
+                let (lo, hi) = (bg.r().min(fg.r()), bg.r().max(fg.r()));
+                for p in &img.pixels {
+                    let a = p.a();
+                    let c = [mix(fg.r(), bg.r(), a), mix(fg.g(), bg.g(), a), mix(fg.b(), bg.b(), a)];
+                    assert!(c[0] == c[1] && c[1] == c[2], "{key}: a grey, not {c:?}");
+                    assert!((lo..=hi).contains(&c[0]), "{key}: between the tile and the text colour, not {c:?}");
+                }
+            }
+        }
+    }
+
+    /// #1002: the pictures share one texture, written in place: browsing every gallery creates no
+    /// texture per tile and frees none (hundreds of small textures, freed in bulk, showed other
+    /// textures' memory on DirectX 12).
+    #[test]
+    fn equation_pictures_share_one_texture() {
+        let ctx = egui::Context::default();
+        let mut app = WordApp::new(wordcraft_engine::Session::new(Document::new()), crate::Services::default());
+        let pictures = equation_pictures();
+        // Symbols repeat across sets (∀, ≠…): each is drawn once.
+        let unique = pictures.iter().map(|(key, _, _, pt, size)| format!("{key}:{pt}:{size:?}")).collect::<std::collections::HashSet<_>>().len();
+        let mut drawn: HashMap<String, (egui::TextureId, Rect)> = HashMap::new();
+        let mut freed = 0;
+        for _ in 0..200 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let ctx = ui.ctx().clone();
+                for (key, nodes, display, pt, size) in &pictures {
+                    let k = format!("{key}:{pt}:{size:?}");
+                    if let std::collections::hash_map::Entry::Vacant(e) = drawn.entry(k)
+                        && let Some(t) = math_texture(&mut app, &ctx, key, nodes, *display, *pt, *size)
+                    {
+                        e.insert(t);
+                    }
+                }
+            });
+            freed += out.textures_delta.free.len();
+            out.textures_delta.clear();
+            if drawn.len() == unique {
+                break;
+            }
+        }
+        assert_eq!(drawn.len(), unique, "every picture is drawn");
+        let ids: std::collections::HashSet<_> = drawn.values().map(|(id, _)| *id).collect();
+        assert_eq!(ids.len(), 1, "one texture for every picture");
+        assert_eq!(freed, 0, "no texture freed while browsing");
+        // No two pictures overlap, and each lies inside the texture.
+        let rects: Vec<Rect> = drawn.values().map(|(_, uv)| *uv).collect();
+        for (i, a) in rects.iter().enumerate() {
+            assert!(a.min.x >= 0.0 && a.min.y >= 0.0 && a.max.x <= 1.0 && a.max.y <= 1.0, "{a:?} inside");
+            for b in rects.iter().skip(i + 1) {
+                assert!(!a.intersects(*b) || a.intersect(*b).area() <= 0.0, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    /// #1002: pictures are packed row by row, and pictures that can never fit are refused.
+    #[test]
+    fn math_atlas_packs_rows() {
+        let mut a = AtlasPage::default();
+        assert_eq!(a.place(100, 40), Some([0, 0]));
+        assert_eq!(a.place(100, 20), Some([100 + MATH_ATLAS_GAP, 0]));
+        assert_eq!(a.place(MATH_ATLAS, 10), Some([0, 40 + MATH_ATLAS_GAP]), "a new row under the tallest");
+        assert_eq!(a.place(MATH_ATLAS + 1, 10), None);
+        assert_eq!(a.place(10, 0), None);
+        assert_eq!(a.place(10, MATH_ATLAS), None, "full");
+        assert_eq!(a.place(10, 10), Some([0, 40 + MATH_ATLAS_GAP + 10 + MATH_ATLAS_GAP]), "still room after a refusal");
+    }
+
+    /// #1002: a page is never wiped in a frame that handed out one of its pictures (they are
+    /// already on screen); once all pages are full, the least recently drawn page starts over.
+    #[test]
+    fn math_atlas_never_wipes_a_page_drawn_from_this_frame() {
+        let ctx = egui::Context::default();
+        let img = || egui::ColorImage::filled([MATH_ATLAS, MATH_ATLAS], egui::Color32::TRANSPARENT);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut a = MathAtlas::default();
+            let first: Vec<_> = (0..MATH_ATLAS_PAGES).map(|i| a.add(ui.ctx(), 1, &format!("p{i}"), img())).collect();
+            assert!(first.iter().all(Option::is_some), "a page each");
+            let ids: std::collections::HashSet<_> = first.iter().flatten().map(|(id, _)| *id).collect();
+            assert_eq!(ids.len(), MATH_ATLAS_PAGES);
+            assert!(a.add(ui.ctx(), 1, "more", img()).is_none(), "every page was drawn from this frame");
+            assert_eq!(a.wipes, 0);
+            assert!(a.uv.len() == MATH_ATLAS_PAGES, "nothing forgotten");
+            // Next frame: page 0 is drawn from again, so the one drawn longest ago is page 1.
+            assert_eq!(a.get(2, "p0"), first.first().copied().flatten());
+            let (id, _) = a.add(ui.ctx(), 2, "more", img()).expect("a page starts over");
+            assert_eq!(a.wipes, 1);
+            assert_eq!(Some(id), first.get(1).copied().flatten().map(|(id, _)| id), "the least recently drawn page");
+            assert!(a.uv.contains_key("p0") && !a.uv.contains_key("p1"));
+            // Pages 0 and 1 are now in use this frame; 2 and 3 are free to start over, then none.
+            assert!(a.add(ui.ctx(), 2, "x", img()).is_some());
+            assert!(a.add(ui.ctx(), 2, "y", img()).is_some());
+            assert!(a.add(ui.ctx(), 2, "z", img()).is_none());
+            assert_eq!(a.wipes, 3);
+            assert!(a.get(2, "p0").is_some() && a.get(2, "more").is_some() && a.get(2, "x").is_some() && a.get(2, "y").is_some());
+        });
+        out.textures_delta.clear();
+    }
+
+    /// #1002: at a display scale of 3, the 22 built-in equations need more than one page; the
+    /// built-in menu opened again draws them all from the atlas, with nothing wiped or moved
+    /// (a single page used to start over every frame: flicker and constant re-rendering).
+    #[test]
+    fn builtin_menu_at_scale_3_fits_without_wiping() {
+        use wordcraft_doc::math::parse_linear;
+        use wordcraft_engine::math_gallery::BUILT_INS;
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(3.0);
+        let mut app = WordApp::new(wordcraft_engine::Session::new(Document::new()), crate::Services::default());
+        let builtins: Vec<_> = BUILT_INS.iter().map(|(id, _, lin)| (format!("builtin:{id}"), parse_linear(lin))).collect();
+        let draw = |app: &mut WordApp| {
+            let mut got = Vec::new();
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                assert_eq!(ui.ctx().pixels_per_point(), 3.0);
+                let ctx = ui.ctx().clone();
+                got = builtins.iter().map(|(key, nodes)| math_texture(app, &ctx, key, nodes, true, 11.0, vec2(346.0, 60.0))).collect();
+            });
+            out.textures_delta.clear();
+            got
+        };
+        // The first opening renders a few a frame.
+        let mut first = draw(&mut app);
+        for _ in 0..20 {
+            if first.iter().all(Option::is_some) {
+                break;
+            }
+            first = draw(&mut app);
+        }
+        assert!(first.iter().all(Option::is_some), "every built-in drawn");
+        let wipes = app.previews.math.wipes;
+        let again = draw(&mut app);
+        assert_eq!(again, first, "the same texture and place for each");
+        assert_eq!(app.previews.math.wipes, wipes, "nothing started over");
+        assert_eq!(wipes, 0);
     }
 
     #[test]

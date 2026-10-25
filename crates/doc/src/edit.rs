@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::para::InlineObject;
 use crate::props::{CharProps, ParaProps};
 use crate::{Block, Blocks, DocError, Document, Paragraph, Part, PartKind, Path, Pos, Result, para_block};
+use crate::{Table, table::MAX_TABLE_DEPTH};
 
 /// A copied piece of a document: blocks, where the first and last paragraphs may be partial.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
@@ -23,16 +24,92 @@ pub struct Fragment {
 
 impl Fragment {
     pub fn plain_text(&self) -> String {
+        self.to_document().plain_text(crate::StoryRef::Body)
+    }
+    /// The fragment as the body of a new document (default styles).
+    pub fn to_document(&self) -> Document {
         let mut d = Document::new();
         d.body = self.blocks.iter().cloned().map(Arc::new).collect();
-        d.plain_text(crate::StoryRef::Body)
+        d
+    }
+    /// Whether the fragment holds an equation (in tables too), which a copy also puts on the
+    /// system clipboard as MathML (#816).
+    pub fn has_equation(&self) -> bool {
+        let mut found = false;
+        for b in &self.blocks {
+            each_para(b, 0, &mut |p| found |= p.objects.iter().any(|o| matches!(o, InlineObject::Equation { .. })));
+        }
+        found
+    }
+    /// The equation (its linear format and whether it is a display equation) when the fragment
+    /// is that one equation and nothing else but white space and empty paragraphs: a copy of it
+    /// also goes on the system clipboard in the MathML formats that equation editors read (#1297).
+    pub fn sole_equation(&self) -> Option<(&str, bool)> {
+        let mut found = None;
+        for b in &self.blocks {
+            let Block::Para(p) = b else { return None };
+            for c in p.text.chars().filter(|c| !c.is_whitespace()) {
+                if c != crate::para::OBJ || found.is_some() {
+                    return None;
+                }
+                // The paragraph's only visible character, so its first object.
+                match p.objects.first() {
+                    Some(InlineObject::Equation { linear, display, .. }) => found = Some((linear.as_str(), *display)),
+                    _ => return None,
+                }
+            }
+        }
+        found
     }
     /// The text a copy puts on the clipboard: [`Self::plain_text`] with symbol-font characters
     /// (Wingdings…) as their Unicode equivalents.
     pub fn clipboard_text(&self) -> String {
-        let mut d = Document::new();
-        d.body = self.blocks.iter().cloned().map(Arc::new).collect();
-        d.shown_text(crate::StoryRef::Body)
+        self.to_document().shown_text(crate::StoryRef::Body)
+    }
+    /// Add `piece` at the end, followed by a paragraph mark unless it already ends with one: how
+    /// Word's Spike collects what it cuts. The piece's text box stories get ids after this
+    /// fragment's, so pieces copied from different documents (or after an id was freed and reused)
+    /// never share one.
+    pub fn append_piece(&mut self, mut piece: Fragment) {
+        let Some(last) = piece.blocks.last() else { return };
+        let ends_with_mark = piece.blocks.len() >= 2 && matches!(last, Block::Para(p) if p.is_empty());
+        if !ends_with_mark {
+            let mut mark = Paragraph::new();
+            if let Block::Para(p) = last {
+                mark.props = p.props.clone();
+            }
+            piece.blocks.push(Block::Para(mark));
+        }
+        let next = self.parts.keys().next_back().map_or(1, |k| k.saturating_add(1));
+        let ids: BTreeMap<u32, u32> = piece.parts.keys().zip(next..=u32::MAX).map(|(old, new)| (*old, new)).collect();
+        let renumber = |b: &mut Block| {
+            each_para_mut(b, 0, &mut |p| {
+                let mut changed = false;
+                for o in p.objects.iter_mut() {
+                    for slot in o.text_box_slots() {
+                        if let Some(new) = slot.and_then(|old| ids.get(&old)) {
+                            *slot = Some(*new);
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    p.touch();
+                }
+            })
+        };
+        piece.blocks.iter_mut().for_each(renumber);
+        for (old, mut part) in std::mem::take(&mut piece.parts) {
+            part.blocks.iter_mut().map(Arc::make_mut).for_each(renumber);
+            if let Some(new) = ids.get(&old) {
+                self.parts.insert(*new, part);
+            }
+        }
+        // The empty paragraph after the last mark is where the next piece starts.
+        if self.blocks.len() >= 2 && matches!(self.blocks.last(), Some(Block::Para(p)) if p.is_empty()) {
+            self.blocks.pop();
+        }
+        self.blocks.append(&mut piece.blocks);
     }
     pub fn from_text(s: &str) -> Fragment {
         let lines: Vec<&str> = s.split('\n').collect();
@@ -43,8 +120,68 @@ impl Fragment {
     }
 }
 
+/// Whether block `b`, in a block list the paragraph walk reaches at `depth`, has cells the walk
+/// skips ([`crate::PARA_WALK_DEPTH`]). Bounded by that depth.
+fn deeper_than_walk(b: &Block, depth: usize) -> bool {
+    match b {
+        Block::Para(_) => false,
+        Block::Table(t) => t
+            .rows
+            .iter()
+            .flat_map(|r| &r.cells)
+            .any(|c| depth + 1 > crate::PARA_WALK_DEPTH || c.blocks.iter().any(|x| deeper_than_walk(x, depth + 1))),
+    }
+}
+
 fn order(a: &Pos, b: &Pos) -> (Pos, Pos) {
     if a <= b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) }
+}
+
+/// The blocks in `t`'s cells, row by row.
+fn cell_blocks(t: &Table) -> impl DoubleEndedIterator<Item = &Block> {
+    t.rows.iter().flat_map(|r| r.cells.iter()).flat_map(|c| c.blocks.iter()).map(|b| &**b)
+}
+
+/// How many tables deep `t` goes, itself included: 1 when its cells hold no table (without
+/// recursion: a pasted fragment may be deep).
+fn table_height(t: &Table) -> usize {
+    let mut most = 1;
+    let mut stack: Vec<(&Block, usize)> = cell_blocks(t).map(|b| (b, 1)).collect();
+    while let Some((b, d)) = stack.pop() {
+        if let Block::Table(inner) = b {
+            let d = d.saturating_add(1);
+            most = most.max(d);
+            stack.extend(cell_blocks(inner).map(|cb| (cb, d)));
+        }
+    }
+    most
+}
+
+/// `b` as blocks nesting at most `room` tables deep: a table that would go deeper is replaced by
+/// its paragraphs (tables in its cells too, document order), as the DOCX reader does.
+fn fit_tables(b: Block, room: usize, out: &mut Vec<Block>) {
+    match b {
+        Block::Table(t) if room == 0 => {
+            let mut stack: Vec<&Block> = cell_blocks(&t).rev().collect();
+            while let Some(cb) = stack.pop() {
+                match cb {
+                    Block::Para(p) => out.push(Block::Para(p.clone())),
+                    Block::Table(inner) => stack.extend(cell_blocks(inner).rev()),
+                }
+            }
+        }
+        Block::Table(mut t) if table_height(&t) > room => {
+            for cell in t.rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
+                let mut kept = Vec::new();
+                for cb in std::mem::take(&mut cell.blocks) {
+                    fit_tables(Arc::unwrap_or_clone(cb), room.saturating_sub(1), &mut kept);
+                }
+                cell.blocks = kept.into_iter().map(Arc::new).collect();
+            }
+            out.push(Block::Table(t));
+        }
+        b => out.push(b),
+    }
 }
 
 /// Nesting limit when following text boxes inside text boxes.
@@ -52,37 +189,46 @@ const MAX_BOX_DEPTH: usize = 8;
 /// Most text box stories one paste may create (hostile documents can fan out).
 const MAX_PASTED_BOXES: usize = 4096;
 
-/// Call `f` on every paragraph of a block (tables descended, depth-limited).
-pub(crate) fn each_para<'a>(b: &'a Block, depth: usize, f: &mut dyn FnMut(&'a Paragraph)) {
-    match b {
-        Block::Para(p) => f(p),
-        Block::Table(t) if depth < 16 => {
-            for cell in t.rows.iter().flat_map(|r| r.cells.iter()) {
-                for cb in &cell.blocks {
-                    each_para(cb, depth + 1, f);
-                }
+/// Call `f` on every paragraph of a block, in document order, however deep its tables nest. The
+/// walk keeps its own stack instead of recursing, so it is complete: a text box it doesn't reach
+/// is shown nowhere, which pruning relies on (#1339). `_depth` is unused (callers keep passing it).
+pub(crate) fn each_para<'a>(b: &'a Block, _depth: usize, f: &mut dyn FnMut(&'a Paragraph)) {
+    // Most blocks are paragraphs, which need no stack.
+    if let Block::Para(p) = b {
+        return f(p);
+    }
+    let mut todo = vec![b];
+    while let Some(b) = todo.pop() {
+        match b {
+            Block::Para(p) => f(p),
+            Block::Table(t) => {
+                // Last first, so they come off the stack in document order.
+                let cells = t.rows.iter().rev().flat_map(|r| r.cells.iter().rev());
+                todo.extend(cells.flat_map(|c| c.blocks.iter().rev()).map(|cb| &**cb));
             }
         }
-        Block::Table(_) => {}
     }
 }
 
-pub(crate) fn each_para_mut(b: &mut Block, depth: usize, f: &mut dyn FnMut(&mut Paragraph)) {
-    match b {
-        Block::Para(p) => f(p),
-        Block::Table(t) if depth < 16 => {
-            for cell in t.rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
-                for cb in &mut cell.blocks {
-                    each_para_mut(Arc::make_mut(cb), depth + 1, f);
-                }
+/// [`each_para`], changing the paragraphs.
+pub(crate) fn each_para_mut(b: &mut Block, _depth: usize, f: &mut dyn FnMut(&mut Paragraph)) {
+    if let Block::Para(p) = b {
+        return f(p);
+    }
+    let mut todo = vec![b];
+    while let Some(b) = todo.pop() {
+        match b {
+            Block::Para(p) => f(p),
+            Block::Table(t) => {
+                let cells = t.rows.iter_mut().rev().flat_map(|r| r.cells.iter_mut().rev());
+                todo.extend(cells.flat_map(|c| c.blocks.iter_mut().rev()).map(Arc::make_mut));
             }
         }
-        Block::Table(_) => {}
     }
 }
 
 /// Whether a paragraph anywhere in `b` (also inside tables) uses paragraph or character style
-/// `id` (depth-limited like `each_para`). Table styles are the engine's `table.deleteStyle`'s job.
+/// `id` (tables to 16 levels deep). Table styles are the engine's `table.deleteStyle`'s job.
 fn uses_style(b: &Block, id: &str, depth: usize) -> bool {
     let is = |s: &Option<String>| s.as_deref() == Some(id);
     match b {
@@ -263,8 +409,14 @@ impl Document {
         Ok(Pos { story: pos.story, path: pos.path.with_last(i + 1), off: 0 })
     }
 
-    /// Insert a block before the block at `path` (same container).
+    /// Insert a block before the block at `path` (same container). A table that would nest
+    /// deeper than [`MAX_TABLE_DEPTH`] is refused.
     pub fn insert_block(&mut self, story: crate::StoryRef, path: &Path, block: Block) -> Result<()> {
+        if let Block::Table(t) = &block
+            && path.depth().saturating_add(table_height(t)) > MAX_TABLE_DEPTH
+        {
+            return Err(DocError::Invalid(format!("tables can't nest more than {MAX_TABLE_DEPTH} deep")));
+        }
         let i = path.last();
         let bl = self.container_mut(story, path)?;
         if i > bl.len() {
@@ -294,10 +446,16 @@ impl Document {
         if a.story != b.story {
             return Vec::new();
         }
-        self.para_paths(a.story).into_iter().filter(|p| *p >= a.path && *p <= b.path).collect()
+        // Only the blocks the range reaches are walked (not every paragraph of the story).
+        let mut out = Vec::new();
+        if let Some(bl) = self.story(a.story) {
+            crate::walk_between(bl, &mut Vec::new(), &mut out, 0, (&a.path.0, &b.path.0));
+        }
+        out
     }
 
-    /// Delete `a..b`. Returns the position where the deletion collapsed to.
+    /// Delete `a..b`. Returns the position where the deletion collapsed to. On error the document
+    /// is unchanged: both ends are checked before anything is deleted.
     pub fn delete_range(&mut self, a: &Pos, b: &Pos) -> Result<Pos> {
         let (a, b) = order(a, b);
         if a == b {
@@ -305,6 +463,14 @@ impl Document {
         }
         if a.story != b.story {
             return Err(DocError::Invalid("range spans stories".into()));
+        }
+        // Check both ends before the first edit, so an error never leaves the document half-deleted.
+        for p in [&a, &b] {
+            match self.para(p.story, &p.path) {
+                Some(para) if para.clamp(p.off) == p.off => {}
+                Some(_) => return Err(DocError::BadOffset(p.off)),
+                None => return Err(DocError::BadPath(p.path.to_string())),
+            }
         }
         // Content control markers whose partner is outside the range stay (the control is
         // emptied, not broken).
@@ -343,18 +509,42 @@ impl Document {
                 pb.clone()
             };
             let bl = self.container_mut(a.story, &a.path)?;
+            // Section breaks on the marks in between go with their paragraphs.
+            let between: Vec<_> = bl
+                .get(ia + 1..ib)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|b| match &**b {
+                    Block::Para(p) => p.section.clone(),
+                    Block::Table(_) => None,
+                })
+                .collect();
             if ib < bl.len() && ia < ib {
                 bl.drain(ia + 1..=ib);
             }
             tail.props = ParaProps::default();
+            // The deleted marks include `a`'s, so a section break there goes too: the joined
+            // paragraph ends where `b`'s mark did, and its text takes the following section's
+            // setup, as in Word (#2127).
+            let sect = tail.section.take();
             let pa = self.para_mut(a.story, &a.path)?;
             let keep_props = pa.props.clone();
             pa.append(tail);
             pa.props = keep_props;
+            let before = std::mem::replace(&mut pa.section, sect);
+            if a.story == crate::StoryRef::Body && a.path.0.len() == 1 {
+                // Nearest first, as "link to previous" resolved them before the delete.
+                let following = self.section_mut(a.path.last());
+                for s in between.iter().rev().chain(before.iter()) {
+                    following.absorb(s);
+                }
+            }
             return Ok(a);
         }
         // Different containers (range enters or leaves a table): clear text in every paragraph
-        // inside; remove whole tables that are entirely covered when at the same level as `a`.
+        // inside, then remove the tables it covers whole (below).
+        // Whether `b` is at its paragraph's end, before that paragraph is trimmed.
+        let b_at_end = self.para(b.story, &b.path).is_some_and(|p| p.len() == b.off);
         let paths = self.paths_between(&a, &b);
         for p in paths.iter().rev() {
             let (from, to) = {
@@ -365,20 +555,68 @@ impl Document {
             };
             self.para_mut(a.story, p)?.delete_except(from, to, &kept_in(p))?;
         }
-        // Drop top-level tables strictly between a and b at a's level.
-        if a.path.depth() == 0 && b.path.depth() > 0 {
-            let first_b = b.path.0.first().copied().unwrap_or(0) as usize;
-            let ia = a.path.last();
-            let bl = self.container_mut(a.story, &a.path)?;
-            let mut i = first_b;
-            while i > ia + 1 {
-                i -= 1;
+        // Tables the range covers whole, in the innermost container holding both ends, go (#1198,
+        // #1844): those strictly between the ends, the one `a` is in when it starts at that
+        // table's very start, and the one `b` is in when it ends at that table's very end. A range
+        // that is one table and nothing else only empties it (Word's Delete keeps the table).
+        let common = a.path.0.iter().zip(&b.path.0).take_while(|(x, y)| x == y).count();
+        let level = common - common % 3;
+        let (Some(&ia), Some(&ib)) = (a.path.0.get(level), b.path.0.get(level)) else { return Ok(a) };
+        let (ia, ib) = (ia as usize, ib as usize);
+        if ia >= ib {
+            return Ok(a);
+        }
+        let prefix = a.path.0.get(..level).unwrap_or_default().to_vec();
+        let block_path = |i: usize| {
+            let mut v = prefix.clone();
+            v.push(i as u32);
+            Path(v)
+        };
+        // Paragraphs inside the block at index `i` of the container, in document order.
+        let paths = self.para_paths(a.story);
+        let inside = |i: usize| -> Vec<&Path> {
+            let pre = block_path(i);
+            paths.iter().filter(|q| q.0.len() > pre.0.len() && q.0.starts_with(&pre.0)).collect()
+        };
+        // A table with cells deeper than the paragraph walk goes has paragraphs `inside` never
+        // lists, so where it starts or ends isn't known: it is never taken as covered.
+        let walked = |i: usize| self.container(a.story, &block_path(i)).and_then(|bl| bl.get(i)).is_some_and(|b| !deeper_than_walk(b, level / 3));
+        let a_covers = a.path.0.len() > level + 1 && a.off == 0 && walked(ia) && inside(ia).first() == Some(&&a.path);
+        let b_covers = b.path.0.len() > level + 1 && walked(ib) && inside(ib).last() == Some(&&b.path) && b_at_end;
+        let first = if a_covers { ia } else { ia + 1 };
+        let last = if b_covers { ib } else { ib - 1 };
+        let mut removed = 0;
+        {
+            let bl = self.container_mut(a.story, &block_path(ia))?;
+            for i in (first..=last.min(bl.len().saturating_sub(1))).rev() {
                 if matches!(bl.get(i).map(|b| &**b), Some(Block::Table(_))) {
                     bl.remove(i);
+                    removed += 1;
                 }
             }
+            if removed == 0 {
+                return Ok(a);
+            }
+            // A story or cell always ends with a paragraph.
+            if bl.is_empty() || matches!(bl.last().map(|b| &**b), Some(Block::Table(_))) {
+                bl.push(para_block(Paragraph::new()));
+            }
         }
-        Ok(a)
+        // The paragraphs left between the ends join, as in a range within one container.
+        let at = if a_covers { Pos { story: a.story, path: block_path(ia), off: 0 } } else { a.clone() };
+        let end = if b_covers {
+            Pos { story: a.story, path: block_path((ib + 1).saturating_sub(removed)), off: 0 }
+        } else {
+            Pos { story: a.story, path: block_path(ib.saturating_sub(removed)), off: 0 }
+        };
+        let paras = |p: &Pos| p.path.0.len() == level + 1 && self.para(p.story, &p.path).is_some();
+        if paras(&at) && paras(&end) && at.path <= end.path {
+            return self.delete_range(&at, &end);
+        }
+        if self.para(at.story, &at.path).is_some() {
+            return Ok(at);
+        }
+        Ok(self.clamp(&at))
     }
 
     /// Apply `f` to the character formatting of `a..b`. A collapsed range changes nothing (the
@@ -543,7 +781,7 @@ impl Document {
         let body = crate::TextBody { next: None, ..src.body };
         *budget -= 1;
         self.adopt_text_boxes(&mut blocks, parts, depth + 1, budget);
-        let id = self.add_part(PartKind::TextBox, blocks.into_iter().map(Arc::new).collect());
+        let id = self.try_add_part(PartKind::TextBox, blocks.into_iter().map(Arc::new).collect()).ok()?;
         if let Some(p) = self.parts.get_mut(&id) {
             p.body = body;
         }
@@ -552,7 +790,12 @@ impl Document {
 
     /// Insert a fragment at `pos`; returns the position after the pasted content.
     pub fn insert_fragment(&mut self, pos: &Pos, frag: &Fragment) -> Result<Pos> {
-        let mut blocks = frag.blocks.clone();
+        // Tables that would nest deeper than the limit here become their paragraphs (#1596).
+        let room = MAX_TABLE_DEPTH.saturating_sub(pos.path.depth());
+        let mut blocks = Vec::with_capacity(frag.blocks.len());
+        for b in frag.blocks.iter().cloned() {
+            fit_tables(b, room, &mut blocks);
+        }
         if blocks.is_empty() {
             return Ok(pos.clone());
         }
@@ -644,6 +887,27 @@ mod tests {
         Document::from_text(&lines.join("\n"))
     }
 
+    /// Paths between two positions are those of all the story's paragraphs between them.
+    #[test]
+    fn paths_between_matches_every_path_filtered() {
+        let mut d = doc(&["a", "b", "c", "d", "e"]);
+        let mut inner = Table::new(2, 2, 100.0);
+        inner.rows[1].cells[0].blocks.push(crate::para_block(crate::Paragraph::new()));
+        let mut t = Table::new(3, 2, 200.0);
+        t.rows[1].cells[1].blocks.insert(0, Arc::new(Block::Table(inner)));
+        d.insert_block(StoryRef::Body, &Path::top(2), Block::Table(t)).unwrap();
+        d.insert_block(StoryRef::Body, &Path::top(4), Block::Table(Table::new(1, 3, 200.0))).unwrap();
+        let all = d.para_paths(StoryRef::Body);
+        for a in &all {
+            for b in &all {
+                let (pa, pb) = (Pos { story: StoryRef::Body, path: a.clone(), off: 0 }, Pos { story: StoryRef::Body, path: b.clone(), off: 0 });
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                let want: Vec<Path> = all.iter().filter(|p| *p >= lo && *p <= hi).cloned().collect();
+                assert_eq!(d.paths_between(&pa, &pb), want, "{a:?} {b:?}");
+            }
+        }
+    }
+
     #[test]
     fn split_and_join() {
         let mut d = doc(&["Hello world"]);
@@ -656,11 +920,58 @@ mod tests {
     }
 
     #[test]
+    fn delete_range_with_bad_end_leaves_document_unchanged() {
+        let mut d = doc(&["one", "two", "three"]);
+        let before = d.plain_text(StoryRef::Body);
+        // Missing paragraph as the second end.
+        assert!(d.delete_range(&Pos::body(0, 1), &Pos::body(9, 0)).is_err());
+        assert_eq!(d.plain_text(StoryRef::Body), before);
+        // Offset past the end of the second paragraph.
+        assert!(d.delete_range(&Pos::body(0, 1), &Pos::body(1, 99)).is_err());
+        assert_eq!(d.plain_text(StoryRef::Body), before);
+        // Offset inside a multi-byte character.
+        let mut d = doc(&["abc", "\u{e9}x"]);
+        assert!(d.delete_range(&Pos::body(0, 1), &Pos::body(1, 1)).is_err());
+        assert_eq!(d.plain_text(StoryRef::Body), "abc\n\u{e9}x");
+        // Range entering a table with a bad offset at its start: the cell text stays.
+        let mut d = doc(&["before", "after"]);
+        d.insert_block(StoryRef::Body, &Path::top(1), Block::Table(Table::new(2, 1, 200.0))).unwrap();
+        d.insert_text(&Pos { story: StoryRef::Body, path: Path(vec![1, 0, 0, 0]), off: 0 }, "x", &CharProps::default()).unwrap();
+        let before = d.plain_text(StoryRef::Body);
+        let cell = Pos { story: StoryRef::Body, path: Path(vec![1, 1, 0, 0]), off: 0 };
+        assert!(d.delete_range(&Pos::body(0, 99), &cell).is_err());
+        assert_eq!(d.plain_text(StoryRef::Body), before);
+    }
+
+    #[test]
     fn delete_multi() {
         let mut d = doc(&["one", "two", "three"]);
         d.delete_range(&Pos::body(2, 2), &Pos::body(0, 1)).unwrap();
         assert_eq!(d.plain_text(StoryRef::Body), "oree");
         assert_eq!(d.body.len(), 1);
+    }
+
+    /// #2127: a range over two section breaks joins three sections into the last; the headers
+    /// and footers it showed by linking to earlier ones stay, each from the nearest section that
+    /// named it, as they resolved before the delete.
+    #[test]
+    fn delete_over_two_section_breaks_keeps_the_linked_headers() {
+        let mut d = doc(&["A", "B", "C"]);
+        let set = |default| crate::section::HeaderSet { default: Some(default), ..Default::default() };
+        let s1 = crate::section::SectionProps { headers: set(1), footers: set(5), ..Default::default() };
+        let s2 = crate::section::SectionProps { headers: set(2), ..Default::default() };
+        let s3 = crate::section::SectionProps { margin_left: 99.0, ..Default::default() };
+        for (i, s) in [(0, s1), (1, s2), (2, s3.clone())] {
+            if let Some(Block::Para(p)) = d.body.get_mut(i).map(Arc::make_mut) {
+                p.section = Some(Box::new(s));
+            }
+        }
+        assert_eq!(d.sections().len(), 4);
+        d.delete_range(&Pos::body(0, 1), &Pos::body(2, 0)).unwrap();
+        assert_eq!(d.plain_text(StoryRef::Body), "AC");
+        let sections = d.sections();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(*sections[0].1, crate::section::SectionProps { headers: set(2), footers: set(5), ..s3 });
     }
 
     #[test]
@@ -687,6 +998,73 @@ mod tests {
         let e = d.insert_fragment(&Pos::body(0, 0), &one).unwrap();
         assert_eq!(e, Pos::body(0, 2));
         assert!(d.plain_text(StoryRef::Body).starts_with("XYalpha"));
+    }
+
+    /// The first paragraph of the deepest cell, following the first table at each level.
+    fn deepest(d: &Document) -> Path {
+        let (mut path, mut blocks) = (Vec::new(), &d.body);
+        while let Some((i, t)) = blocks.iter().enumerate().find_map(|(i, b)| if let Block::Table(t) = &**b { Some((i, t)) } else { None }) {
+            path.extend([i as u32, 0, 0]);
+            blocks = &t.rows[0].cells[0].blocks;
+        }
+        path.push(0);
+        Path(path)
+    }
+
+    fn body_height(d: &Document) -> usize {
+        d.body.iter().filter_map(|b| if let Block::Table(t) = &**b { Some(table_height(t)) } else { None }).max().unwrap_or(0)
+    }
+
+    /// How many times `c` is in `blocks`, the deepest cells too.
+    fn count(blocks: &[Arc<Block>], c: char) -> usize {
+        blocks
+            .iter()
+            .map(|b| match &**b {
+                Block::Para(p) => p.text.matches(c).count(),
+                Block::Table(t) => t.rows.iter().flat_map(|r| &r.cells).map(|cell| count(&cell.blocks, c)).sum(),
+            })
+            .sum()
+    }
+
+    #[test]
+    fn tables_nest_at_most_max_table_depth() {
+        let mut d = doc(&["x", ""]);
+        for _ in 0..MAX_TABLE_DEPTH {
+            let at = deepest(&d);
+            d.insert_block(StoryRef::Body, &at, Block::Table(Table::new(1, 1, 100.0))).unwrap();
+        }
+        assert_eq!(body_height(&d), MAX_TABLE_DEPTH);
+        // One more in the deepest cell is refused and changes nothing; a paragraph is fine.
+        let (at, before) = (deepest(&d), d.clone());
+        assert_eq!(at.depth(), MAX_TABLE_DEPTH);
+        assert!(d.insert_block(StoryRef::Body, &at, Block::Table(Table::new(1, 1, 100.0))).is_err());
+        assert_eq!(d, before);
+        d.insert_block(StoryRef::Body, &at, Block::Para(Paragraph::new())).unwrap();
+        // One level up, a table fits but a table holding a table doesn't.
+        let up = Path(at.0[..at.0.len() - 3].to_vec());
+        let mut two = Table::new(1, 1, 100.0);
+        two.rows[0].cells[0].blocks.insert(0, Arc::new(Block::Table(Table::new(1, 1, 100.0))));
+        assert!(d.insert_block(StoryRef::Body, &up, Block::Table(two)).is_err());
+        d.insert_block(StoryRef::Body, &up, Block::Table(Table::new(1, 1, 100.0))).unwrap();
+        assert_eq!(body_height(&d), MAX_TABLE_DEPTH);
+    }
+
+    #[test]
+    fn pasting_a_table_into_its_own_cell_stops_at_max_table_depth() {
+        // #1596: copy everything and paste it into the deepest cell, again and again: each round
+        // doubled the nesting, until saving, copying or closing the document overflowed the stack.
+        let mut d = doc(&["x", ""]);
+        d.insert_block(StoryRef::Body, &Path::top(1), Block::Table(Table::new(1, 1, 100.0))).unwrap();
+        d.insert_text(&Pos { story: StoryRef::Body, path: Path(vec![1, 0, 0, 0]), off: 0 }, "a", &CharProps::default()).unwrap();
+        for _ in 0..8 {
+            let all = d.copy_range(&Pos::body(0, 0), &Pos::body(d.body.len() - 1, 0));
+            let at = deepest(&d);
+            let off = d.para(StoryRef::Body, &at).map_or(0, Paragraph::len);
+            d.insert_fragment(&Pos { story: StoryRef::Body, path: at, off }, &all).unwrap();
+        }
+        assert_eq!(body_height(&d), MAX_TABLE_DEPTH);
+        // Nothing is lost: every copy's text is there, below the limit as paragraphs.
+        assert_eq!((count(&d.body, 'x'), count(&d.body, 'a')), (256, 256));
     }
 
     fn text_box(d: &mut Document, pos: &Pos, text: &str) -> u32 {
@@ -840,6 +1218,42 @@ mod tests {
         assert_eq!(Path(vec![1, 0, 1, 0]).cell(), Some((Path::top(1), 0, 1)));
     }
 
+    fn para(text: &str) -> Block {
+        Block::Para(Paragraph::with_text(text, CharProps::default()))
+    }
+
+    #[test]
+    fn appended_pieces_are_each_followed_by_one_paragraph_mark() {
+        let mut spike = Fragment::default();
+        spike.append_piece(Fragment { blocks: vec![para("a")], ..Default::default() });
+        spike.append_piece(Fragment { blocks: vec![para("b")], ..Default::default() });
+        assert_eq!(spike.plain_text(), "a\nb\n");
+        // A piece that already ends with its paragraph mark gets no second one.
+        let mut spike = Fragment::default();
+        spike.append_piece(Fragment { blocks: vec![para("a"), para("")], ..Default::default() });
+        assert_eq!(spike.plain_text(), "a\n");
+        spike.append_piece(Fragment { blocks: vec![para("b"), para("c")], ..Default::default() });
+        assert_eq!(spike.plain_text(), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn appended_pieces_keep_their_own_text_boxes() {
+        // Two documents give their first text box the same id.
+        let mut one = doc(&["x"]);
+        let id1 = text_box(&mut one, &Pos::body(0, 1), "One");
+        let mut two = doc(&["y"]);
+        let id2 = text_box(&mut two, &Pos::body(0, 1), "Two");
+        assert_eq!(id1, id2);
+        let mut spike = Fragment::default();
+        spike.append_piece(one.copy_range(&Pos::body(0, 0), &Pos::body(0, 1 + 3)));
+        spike.append_piece(two.copy_range(&Pos::body(0, 0), &Pos::body(0, 1 + 3)));
+        let mut dst = doc(&[""]);
+        dst.insert_fragment(&Pos::body(0, 0), &spike).unwrap();
+        let texts: Vec<String> =
+            [0, 1].iter().flat_map(|i| boxes_in(&dst, &Path::top(*i))).map(|b| dst.plain_text(StoryRef::Part(b.unwrap()))).collect();
+        assert_eq!(texts, ["One", "Two"]);
+    }
+
     #[test]
     fn bad_positions_error() {
         let mut d = doc(&["é"]);
@@ -849,5 +1263,158 @@ mod tests {
         let c = d.clamp(&Pos::body(9, 9));
         assert_eq!(c, Pos::body(0, 2));
         assert!(d.delete_range(&Pos { story: StoryRef::Part(3), path: Path::top(0), off: 0 }, &Pos::body(0, 0)).is_err());
+    }
+
+    // delete_range over whole tables (#1844), in the body, a header and a footnote.
+
+    /// A document whose story (the body, or a header or footnote part) holds `lines`.
+    fn story_doc(kind: Option<PartKind>, lines: &[&str]) -> (Document, StoryRef) {
+        match kind {
+            None => (doc(lines), StoryRef::Body),
+            Some(k) => {
+                let mut d = doc(&["body"]);
+                let blocks = lines.iter().map(|l| para_block(Paragraph::with_text(l, CharProps::default()))).collect();
+                let id = d.add_part(k, blocks);
+                (d, StoryRef::Part(id))
+            }
+        }
+    }
+
+    const STORIES: [Option<PartKind>; 3] = [None, Some(PartKind::Header), Some(PartKind::Footnote)];
+
+    fn at(story: StoryRef, path: &[u32], off: usize) -> Pos {
+        Pos { story, path: Path(path.to_vec()), off }
+    }
+
+    /// Insert an `rows`×`cols` table at `path` whose cells hold `texts`, row by row.
+    fn put_table(d: &mut Document, story: StoryRef, path: &[u32], rows: usize, cols: usize, texts: &[&str]) {
+        d.insert_block(story, &Path(path.to_vec()), Block::Table(Table::new(rows, cols, 200.0))).unwrap();
+        for (k, t) in texts.iter().enumerate() {
+            let mut p = path.to_vec();
+            p.extend([(k / cols) as u32, (k % cols) as u32, 0]);
+            d.insert_text(&at(story, &p, 0), t, &CharProps::default()).unwrap();
+        }
+    }
+
+    /// The story's top-level blocks: a paragraph's text, or `[table]`.
+    fn shape(d: &Document, story: StoryRef) -> Vec<String> {
+        d.story(story).unwrap().iter().map(|b| b.as_para().map_or("[table]".to_string(), |p| p.text.clone())).collect()
+    }
+
+    fn cell_text(d: &Document, story: StoryRef, table: &[u32], r: u32, c: u32) -> String {
+        let mut p = table.to_vec();
+        p.extend([r, c, 0]);
+        d.para(story, &Path(p)).map(|p| p.text.clone()).unwrap_or_else(|| "<none>".into())
+    }
+
+    #[test]
+    fn a_range_ending_at_the_end_of_a_cell_that_isnt_the_last_keeps_the_table() {
+        for kind in STORIES {
+            for (r, c) in [(0, 1), (1, 0)] {
+                let (mut d, st) = story_doc(kind, &["before", "after"]);
+                put_table(&mut d, st, &[1], 2, 2, &["a", "b", "c", "d"]);
+                d.delete_range(&at(st, &[0], 0), &at(st, &[1, r, c, 0], 1)).unwrap();
+                assert_eq!(shape(&d, st), ["", "[table]", "after"], "{kind:?} ({r},{c})");
+                assert_eq!(cell_text(&d, st, &[1], 1, 1), "d", "{kind:?} ({r},{c})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_range_from_the_start_of_one_table_into_the_middle_of_the_next_removes_only_the_first() {
+        for kind in STORIES {
+            let (mut d, st) = story_doc(kind, &["x", "mid", "y"]);
+            put_table(&mut d, st, &[2], 2, 2, &["e", "f", "g", "h"]);
+            put_table(&mut d, st, &[1], 2, 2, &["a", "b", "c", "d"]);
+            assert_eq!(shape(&d, st), ["x", "[table]", "mid", "[table]", "y"]);
+            let to = d.delete_range(&at(st, &[1, 0, 0, 0], 0), &at(st, &[3, 0, 1, 0], 1)).unwrap();
+            assert_eq!(shape(&d, st), ["x", "", "[table]", "y"], "{kind:?}");
+            assert_eq!([cell_text(&d, st, &[2], 0, 0), cell_text(&d, st, &[2], 0, 1), cell_text(&d, st, &[2], 1, 0)], ["", "", "g"], "{kind:?}");
+            assert!(d.para(st, &to.path).is_some(), "{kind:?}: {to:?}");
+        }
+    }
+
+    #[test]
+    fn a_range_from_a_cell_paragraph_to_the_end_of_a_table_nested_in_that_cell_removes_only_the_nested_table() {
+        for kind in STORIES {
+            let (mut d, st) = story_doc(kind, &["before", "after"]);
+            put_table(&mut d, st, &[1], 1, 1, &["p"]);
+            put_table(&mut d, st, &[1, 0, 0, 1], 1, 1, &["n"]);
+            d.insert_block(st, &Path(vec![1, 0, 0, 2]), Block::Para(Paragraph::with_text("q", CharProps::default()))).unwrap();
+            let to = d.delete_range(&at(st, &[1, 0, 0, 0], 1), &at(st, &[1, 0, 0, 1, 0, 0, 0], 1)).unwrap();
+            assert_eq!(shape(&d, st), ["before", "[table]", "after"], "{kind:?}");
+            let cell = d.container(st, &Path(vec![1, 0, 0, 0])).unwrap();
+            let cell: Vec<String> = cell.iter().map(|b| b.as_para().map_or("[table]".to_string(), |p| p.text.clone())).collect();
+            assert_eq!(cell, ["pq"], "{kind:?}");
+            assert_eq!(to, at(st, &[1, 0, 0, 0], 1), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn two_whole_tables_at_the_end_of_a_story_leave_one_empty_paragraph() {
+        for kind in STORIES {
+            for trailing in [true, false] {
+                let (mut d, st) = story_doc(kind, &[""]);
+                put_table(&mut d, st, &[0], 1, 2, &["a", "b"]);
+                put_table(&mut d, st, &[1], 2, 1, &["c", "d"]);
+                if !trailing {
+                    // A story that ends in a table (a hostile file).
+                    d.story_mut(st).unwrap().pop();
+                }
+                let to = d.delete_range(&at(st, &[0, 0, 0, 0], 0), &at(st, &[1, 1, 0, 0], 1)).unwrap();
+                assert_eq!(shape(&d, st), [""], "{kind:?} trailing {trailing}");
+                assert_eq!(to, at(st, &[0], 0), "{kind:?} trailing {trailing}");
+            }
+        }
+    }
+
+    /// Content controls pair their markers within one block list (a story, or a cell), so a
+    /// marker in a table never has its partner outside it: a control inside a table removed whole
+    /// goes with it, and one the range only enters keeps both markers (the control is emptied).
+    #[test]
+    fn removing_a_whole_table_keeps_a_control_the_range_only_partly_covers() {
+        use crate::control::ContentControl;
+        let start = || InlineObject::ControlStart { control: Box::new(ContentControl::default()) };
+        for kind in STORIES {
+            let (mut d, st) = story_doc(kind, &["before", "after"]);
+            put_table(&mut d, st, &[1], 1, 1, &["c"]);
+            // One control around "efo" in "before", one around the cell's text.
+            d.insert_object(&at(st, &[0], 4), InlineObject::ControlEnd, &CharProps::default()).unwrap();
+            let in_before = d.insert_object(&at(st, &[0], 1), start(), &CharProps::default()).unwrap();
+            d.insert_object(&at(st, &[1, 0, 0, 0], 1), InlineObject::ControlEnd, &CharProps::default()).unwrap();
+            d.insert_object(&at(st, &[1, 0, 0, 0], 0), start(), &CharProps::default()).unwrap();
+            assert_eq!(d.control_ranges(st).len(), 2, "setup");
+            let end = d.para(st, &Path(vec![1, 0, 0, 0])).unwrap().len();
+            // From inside the first control to the end of the table.
+            d.delete_range(&Pos { off: in_before.off + 1, ..in_before }, &at(st, &[1, 0, 0, 0], end)).unwrap();
+            assert_eq!(shape(&d, st), ["b\u{FFFC}e\u{FFFC}after"], "{kind:?}: the table goes, the paragraphs join");
+            let ranges = d.control_ranges(st);
+            assert_eq!(ranges.len(), 1, "{kind:?}: {ranges:?}");
+            assert!(ranges.iter().all(|r| r.start.path == Path::top(0) && r.end.path == Path::top(0)), "{kind:?}");
+            let objects = d.para(st, &Path::top(0)).map_or(0, |p| p.objects.len());
+            assert_eq!(objects, 2, "{kind:?}: no orphan markers left");
+        }
+    }
+
+    #[test]
+    fn a_table_nested_deeper_than_the_paragraph_walk_is_never_removed_whole() {
+        // 20 tables, each in the first cell of the one around it, ahead of that cell's paragraph:
+        // the innermost paragraphs come first in the document but the paragraph walk stops short.
+        let mut t = Table::new(1, 1, 200.0);
+        if let Some(cell) = t.rows.get_mut(0).and_then(|r| r.cells.get_mut(0)) {
+            cell.blocks = vec![para_block(Paragraph::with_text("deep", CharProps::default()))];
+        }
+        for _ in 0..20 {
+            let mut outer = Table::new(1, 1, 200.0);
+            if let Some(cell) = outer.rows.get_mut(0).and_then(|r| r.cells.get_mut(0)) {
+                cell.blocks.insert(0, Arc::new(Block::Table(t)));
+            }
+            t = outer;
+        }
+        let mut d = doc(&["before", "after"]);
+        d.insert_block(StoryRef::Body, &Path::top(1), Block::Table(t)).unwrap();
+        let first = d.para_paths(StoryRef::Body).into_iter().find(|p| p.0.first() == Some(&1)).unwrap();
+        d.delete_range(&Pos { story: StoryRef::Body, path: first, off: 0 }, &Pos::body(2, 0)).unwrap();
+        assert!(d.body.get(1).is_some_and(|b| b.as_table().is_some()), "a table with paragraphs the walk never saw was removed");
     }
 }

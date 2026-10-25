@@ -26,6 +26,19 @@ pub(crate) struct TableDrag {
     /// The resize reach at the press (page points).
     reach: f32,
     target: Target,
+    /// Shift was down at the press on a row area: the rows extend from the anchor row.
+    extend: bool,
+    /// The row that Shift+click extends from, read at the press: the rows it selects would
+    /// otherwise move it on the next frame.
+    anchor: Option<usize>,
+}
+
+/// `table.selectAt`'s params, with the press's anchor row when it has one.
+fn select_params(mut at: serde_json::Value, anchor: Option<usize>) -> serde_json::Value {
+    if let (Some(a), Some(m)) = (anchor, at.as_object_mut()) {
+        m.insert("anchorRow".into(), json!(a));
+    }
+    at
 }
 
 /// Whether the table mouse is in reach: when resizing is, and not while a border is dragged.
@@ -54,7 +67,10 @@ pub fn pointer(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect]
             d.to = ((p.x - r.min.x) / sc, (p.y - r.min.y) / sc);
         }
         let down = ui.input(|i| i.pointer.primary_down());
-        let at = json!({"page": d.page, "x": d.from.0, "y": d.from.1, "reach": d.reach, "toX": d.to.0, "toY": d.to.1});
+        let at = select_params(
+            json!({"page": d.page, "x": d.from.0, "y": d.from.1, "reach": d.reach, "toX": d.to.0, "toY": d.to.1, "extend": d.extend}),
+            d.anchor,
+        );
         if d.target.spot == Spot::Handle {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 return true;
@@ -66,7 +82,7 @@ pub fn pointer(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect]
             // Released: a drag moves the table (one undo step), a click selects it.
             let moved = (d.to.0 - d.from.0).abs() >= 0.5 || (d.to.1 - d.from.1).abs() >= 0.5;
             let id = if moved && table_mouse::movable(&d.target.geom) { "table.moveDrag" } else { "table.selectAt" };
-            if let Err(e) = app.run(id, at) {
+            if let Err(e) = app.run_keep_view(id, at) {
                 app.status(e);
             }
             return true;
@@ -76,7 +92,7 @@ pub fn pointer(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect]
         if down {
             if d.to != d.sent {
                 d.sent = d.to;
-                let _ = app.run("table.selectAt", at);
+                let _ = app.run_keep_view("table.selectAt", at);
             }
             app.canvas.table_drag = Some(d);
         } else if matches!(d.target.spot, Spot::Cell(..))
@@ -87,29 +103,62 @@ pub fn pointer(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect]
         }
         return true;
     }
-    if !available(app) || !(ui.input(|i| i.pointer.primary_pressed()) && resp.contains_pointer()) {
+    if !(available(app) && ui.input(|i| i.pointer.primary_pressed()) && resp.contains_pointer()) {
         return false;
     }
     let Some(p) = latest else { return false };
     let Some((page, x, y, reach, target)) = target_at(app, layout, rects, scale, p) else { return false };
-    let at = json!({"page": page, "x": x, "y": y, "reach": reach});
+    let mods = ui.input(|i| i.modifiers);
+    // Word: a triple-click or Ctrl/Cmd+click beside a row selects the whole document, as in the
+    // body's selection bar.
+    if matches!(target.spot, Spot::Row(_)) && !mods.shift {
+        let now = ui.input(|i| i.time);
+        let (delay, dist) = ui.ctx().options(|o| (o.input_options.max_double_click_delay, o.input_options.max_click_dist));
+        let clicks = crate::canvas::press_count(app.canvas.last_press, now, p, delay, dist);
+        app.canvas.last_press = Some((now, p, clicks));
+        if clicks >= 3 || mods.command {
+            if let Err(e) = app.run("select.all", json!({"whole": true})) {
+                app.status(e);
+            }
+            crate::canvas::hold_document_selection(app, clicks);
+            return true;
+        }
+    }
+    let extend = matches!(target.spot, Spot::Row(_)) && mods.shift;
+    // Shift+click with the selection started outside the table is the ordinary Shift+click into
+    // a table (the caret logic extends it by whole rows); only the table's own selection extends here.
+    if extend && !in_table(app, &target.geom.table) {
+        return false;
+    }
+    let anchor = match target.spot {
+        Spot::Row(r) if extend => Some(table_mouse::anchor_row(&app.session, &target.geom.table, r)),
+        _ => None,
+    };
+    let at = select_params(json!({"page": page, "x": x, "y": y, "reach": reach, "extend": extend}), anchor);
     match target.spot {
         Spot::InsertRow(_) | Spot::InsertColumn(_) => {
-            if let Err(e) = app.run("table.insertAt", at) {
+            if let Err(e) = app.run_keep_view("table.insertAt", at) {
                 app.status(e);
             }
         }
         spot => {
             // A selection area selects at once; the move handle waits for the release.
             if spot != Spot::Handle
-                && let Err(e) = app.run("table.selectAt", at)
+                && let Err(e) = app.run_keep_view("table.selectAt", at)
             {
                 app.status(e);
             }
-            app.canvas.table_drag = Some(TableDrag { page, from: (x, y), to: (x, y), sent: (x, y), reach, target });
+            app.canvas.table_drag = Some(TableDrag { page, from: (x, y), to: (x, y), sent: (x, y), reach, target, extend, anchor });
         }
     }
     true
+}
+
+/// Whether the selection's anchor (or its selected cells) is in the table at `tp`.
+fn in_table(app: &WordApp, tp: &wordcraft_doc::Path) -> bool {
+    let body = |story| story == wordcraft_doc::StoryRef::Body;
+    app.session.cell_range().is_some_and(|c| body(c.story) && &c.table == tp)
+        || (body(app.session.sel.anchor.story) && app.session.sel.anchor.path.cell().is_some_and(|(t, ..)| &t == tp))
 }
 
 /// The pointer: the move arrows on the handle, the plain arrow on an insert button; over a
@@ -136,6 +185,7 @@ pub fn cursor(app: &WordApp, ui: &Ui, resp: &egui::Response, layout: &DocLayout,
 /// dragged, a dashed outline of where the table goes.
 pub fn paint(app: &WordApp, painter: &egui::Painter, t: &Tokens, layout: &DocLayout, rects: &[Rect], scale: f32) {
     let hover = painter.ctx().input(|i| i.pointer.hover_pos());
+    let dark = app.session.view.dark_mode;
     if let Some(d) = &app.canvas.table_drag {
         match d.target.spot {
             Spot::Handle => {
@@ -150,7 +200,7 @@ pub fn paint(app: &WordApp, painter: &egui::Painter, t: &Tokens, layout: &DocLay
             }
             spot => {
                 if let Some(p) = hover {
-                    arrow(painter, p, spot);
+                    arrow(painter, p, spot, dark);
                 }
             }
         }
@@ -158,6 +208,15 @@ pub fn paint(app: &WordApp, painter: &egui::Painter, t: &Tokens, layout: &DocLay
     }
     if !available(app) {
         return;
+    }
+    // The caret's table shows its move handle wherever the pointer is, as in Word.
+    for (page, h, _) in crate::table_resize::caret_handles(app, painter, layout, rects) {
+        if let Some(h) = h
+            && let (Some(a), Some(b)) =
+                (to_screen(rects, layout, scale, page, h.x, h.y), to_screen(rects, layout, scale, page, h.right(), h.bottom()))
+        {
+            move_handle(painter, Rect::from_two_pos(a, b), t);
+        }
     }
     let Some(p) = hover else { return };
     let Some((page, x, y)) = crate::canvas::page_at(rects, layout, scale, p) else { return };
@@ -177,7 +236,7 @@ pub fn paint(app: &WordApp, painter: &egui::Painter, t: &Tokens, layout: &DocLay
                 insert_button(painter, c, a, b, sc, t);
             }
         }
-        None if target.spot != Spot::Handle => arrow(painter, p, target.spot),
+        None if target.spot != Spot::Handle => arrow(painter, p, target.spot, dark),
         None => {}
     }
 }
@@ -212,13 +271,10 @@ fn insert_button(painter: &egui::Painter, c: Pos2, from: Pos2, to: Pos2, sc: f32
 
 /// The selection arrow at the pointer, its tip on it (the system pointer is hidden there): down
 /// over a column; up and right, filled, in a cell; up and right, hollow, beside a row.
-fn arrow(painter: &egui::Painter, tip: Pos2, spot: Spot) {
+fn arrow(painter: &egui::Painter, tip: Pos2, spot: Spot, dark: bool) {
     use std::f32::consts::{FRAC_PI_4, PI};
-    let (turn, fill, edge) = match spot {
-        Spot::Column(_) => (PI, Color32::BLACK, Color32::WHITE),
-        Spot::Cell(..) => (FRAC_PI_4, Color32::BLACK, Color32::WHITE),
-        _ => (FRAC_PI_4, Color32::WHITE, Color32::BLACK),
-    };
+    let turn = if matches!(spot, Spot::Column(_)) { PI } else { FRAC_PI_4 };
+    let (fill, edge) = arrow_colors(spot, dark);
     // An arrow pointing up from its tip at (0, 0), turned clockwise by `turn` (screen points).
     let (sin, cos) = turn.sin_cos();
     let at = |(x, y): (f32, f32)| tip + vec2(x * cos - y * sin, x * sin + y * cos);
@@ -230,10 +286,33 @@ fn arrow(painter: &egui::Painter, tip: Pos2, spot: Spot) {
     painter.add(Shape::closed_line(outline.to_vec(), Stroke::new(1.0, edge)));
 }
 
+/// The arrow's fill and edge: black on white over a column or cell (white on the dark paper's
+/// grey in dark mode, where black would vanish), white on black beside a row.
+fn arrow_colors(spot: Spot, dark: bool) -> (Color32, Color32) {
+    match spot {
+        Spot::Column(_) | Spot::Cell(..) if dark => (Color32::WHITE, Color32::from_gray(wordcraft_render::DARK_PAPER)),
+        Spot::Column(_) | Spot::Cell(..) => (Color32::BLACK, Color32::WHITE),
+        _ => (Color32::WHITE, Color32::BLACK),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::table_resize::tests::{H, button, cell, screen, steps, table_window, table_window_stepping};
+
+    /// On the dark paper the column and cell arrows are drawn light, so they stay visible; on
+    /// white paper they stay black, and the hollow row arrow is the same on both.
+    #[test]
+    fn the_selection_arrow_is_light_on_dark_paper() {
+        let dark_paper = Color32::from_gray(wordcraft_render::DARK_PAPER);
+        assert_eq!(arrow_colors(Spot::Column(0), false), (Color32::BLACK, Color32::WHITE));
+        assert_eq!(arrow_colors(Spot::Cell(0, 0), false), (Color32::BLACK, Color32::WHITE));
+        assert_eq!(arrow_colors(Spot::Column(0), true), (Color32::WHITE, dark_paper));
+        assert_eq!(arrow_colors(Spot::Cell(0, 0), true), (Color32::WHITE, dark_paper));
+        assert_eq!(arrow_colors(Spot::Row(0), false), (Color32::WHITE, Color32::BLACK));
+        assert_eq!(arrow_colors(Spot::Row(0), true), (Color32::WHITE, Color32::BLACK));
+    }
 
     fn click(h: &mut H, at: Pos2) {
         h.event(egui::Event::PointerMoved(at));
@@ -285,6 +364,150 @@ mod tests {
         steps(&mut h, 2);
         assert!(h.state().canvas.table_drag.is_none());
         assert_eq!(h.state().session.cell_range().map(|r| (r.rows, r.cols)), Some(((0, 1), (0, 2))));
+    }
+
+    /// The selection bar beside a table (the page margin, well past the row areas) selects the
+    /// row; a drag down it selects the rows it passes; Shift+click extends by rows.
+    #[test]
+    fn the_margin_beside_a_table_selects_rows() {
+        let mut h = table_window();
+        let (a, b) = (cell(&mut h, 0, 0), cell(&mut h, 1, 0));
+        let (ya, yb) = (a.y + a.h / 2.0, b.y + b.h / 2.0);
+        let far = 20.0;
+        assert!(a.x - far > 30.0, "well past the row areas");
+        let at_a = screen(&mut h, far, ya);
+        h.event(egui::Event::PointerMoved(at_a));
+        steps(&mut h, 2);
+        assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::None, "the drawn selection arrow");
+        click(&mut h, at_a);
+        assert_eq!(h.state().session.cell_range().map(|r| (r.rows, r.cols)), Some(((0, 0), (0, 2))), "one click, the row");
+        // Drag from row 0 to row 1.
+        let end = screen(&mut h, far, yb);
+        h.event(egui::Event::PointerMoved(at_a));
+        h.step();
+        button(&h, at_a, true);
+        h.step();
+        h.event(egui::Event::PointerMoved(end));
+        h.step();
+        assert_eq!(h.state().session.cell_range().map(|r| r.rows), Some((0, 1)), "the selection follows the pointer");
+        button(&h, end, false);
+        steps(&mut h, 2);
+        // Click row 0 again, then Shift+click row 1.
+        click(&mut h, at_a);
+        assert_eq!(h.state().session.cell_range().map(|r| r.rows), Some((0, 0)));
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+        h.step();
+        h.event(egui::Event::PointerMoved(end));
+        h.step();
+        button(&h, end, true);
+        h.step();
+        button(&h, end, false);
+        steps(&mut h, 2);
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+        h.step();
+        assert_eq!(h.state().session.cell_range().map(|r| (r.rows, r.cols)), Some(((0, 1), (0, 2))), "extended by rows");
+    }
+
+    /// Shift+click beside an upper row with the last row selected takes the rows between, and
+    /// the pointer moving a little before the release keeps them: the anchor row is the one at
+    /// the press, not re-read from the rows the press selected.
+    #[test]
+    fn a_shift_click_up_the_margin_keeps_its_anchor_while_held() {
+        let mut h = table_window();
+        let (a, b) = (cell(&mut h, 0, 0), cell(&mut h, 1, 0));
+        let far = 20.0;
+        let at_b = screen(&mut h, far, b.y + b.h / 2.0);
+        click(&mut h, at_b);
+        assert_eq!(h.state().session.cell_range().map(|r| r.rows), Some((1, 1)));
+        let at = screen(&mut h, far, a.y + a.h / 2.0);
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+        h.step();
+        h.event(egui::Event::PointerMoved(at));
+        h.step();
+        button(&h, at, true);
+        h.step();
+        assert_eq!(h.state().session.cell_range().map(|r| r.rows), Some((0, 1)), "extended up");
+        for k in 1..=3 {
+            h.event(egui::Event::PointerMoved(at + vec2(k as f32, 1.0)));
+            h.step();
+        }
+        button(&h, at + vec2(3.0, 1.0), false);
+        steps(&mut h, 2);
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+        h.step();
+        assert_eq!(h.state().session.cell_range().map(|r| (r.rows, r.cols)), Some(((0, 1), (0, 2))), "the jitter kept the rows");
+    }
+
+    /// Word: a triple-click, or Ctrl/Cmd+click, in the margin beside a table row selects the whole
+    /// document; a single click (and a drag) keeps selecting rows.
+    #[test]
+    fn triple_click_or_ctrl_click_beside_a_row_selects_the_document() {
+        let mut h = table_window_stepping(1.0 / 60.0);
+        let b = cell(&mut h, 1, 0);
+        let at = screen(&mut h, 20.0, b.y + b.h / 2.0);
+        let whole = |h: &mut H| {
+            let s = &h.state().session;
+            // From the first cell's start to the end of the paragraph after the table.
+            let (a, e) = s.sel.ordered();
+            a.path == wordcraft_doc::Path(vec![0, 0, 0, 0]) && a.off == 0 && e == wordcraft_doc::Pos::body(1, 0)
+        };
+        // One click: the row.
+        click(&mut h, at);
+        assert_eq!(h.state().session.cell_range().map(|r| r.rows), Some((1, 1)), "a click selects the row");
+        // Three quick clicks: everything.
+        steps(&mut h, 40);
+        for _ in 0..3 {
+            h.event(egui::Event::PointerMoved(at));
+            h.step();
+            button(&h, at, true);
+            h.step();
+            button(&h, at, false);
+            h.step();
+        }
+        steps(&mut h, 2);
+        assert!(whole(&mut h), "triple-click: {:?}", h.state().session.sel);
+        // Ctrl+click: everything too.
+        steps(&mut h, 40);
+        click(&mut h, at);
+        assert_eq!(h.state().session.cell_range().map(|r| r.rows), Some((1, 1)));
+        steps(&mut h, 40);
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+        h.step();
+        click(&mut h, at);
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+        h.step();
+        assert!(whole(&mut h), "ctrl+click: {:?}", h.state().session.sel);
+    }
+
+    /// Shift+click in the bar beside a row, with the selection started above the table, extends
+    /// that selection (the ordinary Shift+click into a table), instead of selecting only the row.
+    #[test]
+    fn shift_click_beside_a_row_extends_a_selection_from_above() {
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+        a.run("text.insert", json!({"text": "Above"})).unwrap();
+        a.run("insert.table", json!({"rows": 3, "cols": 2})).unwrap();
+        a.run("caret.set", json!({"pos": serde_json::to_value(wordcraft_doc::Pos::body(0, 0)).unwrap()})).unwrap();
+        a.run("view.commentsPane", json!({"value": false})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        steps(&mut h, 6);
+        let b = cell(&mut h, 1, 0);
+        let at = screen(&mut h, 20.0, b.y + b.h / 2.0);
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+        h.step();
+        click(&mut h, at);
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+        h.step();
+        let sel = h.state().session.sel.clone();
+        assert_eq!(sel.anchor, wordcraft_doc::Pos::body(0, 0), "the selection still starts above the table");
+        assert!(!sel.is_collapsed());
+        assert!(sel.focus.path.cell().is_some_and(|(_, r, _)| r == 1), "and runs into the clicked row: {:?}", sel.focus);
     }
 
     /// An ordinary drag from one cell's text into another's selects the rectangle of whole cells
@@ -377,5 +600,27 @@ mod tests {
         let moved = cell(&mut h, 0, 0);
         assert!((moved.x - (a.x + 40.0)).abs() < 1.0 && (moved.y - (a.y + 30.0)).abs() < 1.0, "{a:?} → {moved:?}");
         assert_eq!(h.state().session.undo_depth(), depth + 1);
+    }
+
+    /// #1738: dropping the move handle leaves the view where it is.
+    #[test]
+    fn dropping_the_move_handle_keeps_the_view_where_it_is() {
+        let mut h = table_window();
+        let a = cell(&mut h, 0, 0);
+        let (hx, hy) = (a.x - 6.0, a.y - 6.0);
+        let start = screen(&mut h, hx, hy);
+        h.event(egui::Event::PointerMoved(start));
+        steps(&mut h, 2);
+        button(&h, start, true);
+        h.step();
+        let end = screen(&mut h, hx + 40.0, hy + 30.0);
+        h.event(egui::Event::PointerMoved(end));
+        steps(&mut h, 2);
+        h.state_mut().canvas.scroll_to_caret = false;
+        let depth = h.state().session.undo_depth();
+        button(&h, end, false);
+        h.step();
+        assert_eq!(h.state().session.undo_depth(), depth + 1, "the table moved");
+        assert!(!h.state().canvas.scroll_to_caret, "the move scrolled to the caret");
     }
 }

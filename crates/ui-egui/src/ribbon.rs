@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use crate::colors::{Remember, Target};
 use crate::options::MeasureExt;
 use crate::theme::{Tokens, medium, regular, semibold};
-use crate::widgets::{CONTENT_H, LABEL_H, big, big_toggle, combo, font_combo, group, menu_button, small, split};
+use crate::widgets::{CONTENT_H, LABEL_H, big, big_toggle, group, menu_button, small, split};
 use crate::{WordApp, icons};
 
 pub const TABS: [&str; 13] = wordcraft_engine::ribbon::TABS;
@@ -75,6 +75,20 @@ fn reading_toolbar(app: &mut WordApp, ui: &mut Ui, t: Tokens) {
                     }
                 });
                 ui.separator();
+                use wordcraft_engine::cmd::view::ReadPageColor;
+                let colors =
+                    [(ReadPageColor::None, "None", "none"), (ReadPageColor::Sepia, "Sepia", "sepia"), (ReadPageColor::Inverse, "Inverse", "inverse")];
+                let current = app.session.view.read_page_color;
+                let name = colors.iter().find(|c| c.0 == current).map_or("None", |c| c.1);
+                ui.menu_button(format!("{}: {}", tl!("Page color"), tl!(name)), |ui| {
+                    for (color, name, value) in colors {
+                        if ui.selectable_label(current == color, tl!(name)).clicked() {
+                            let _ = app.run("view.readPageColor", json!({"value": value}));
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
                 // Headings to jump to, in the Navigation pane beside the columns (Outline view
                 // is an editing layout, so it isn't offered here).
                 if ui.button(tl!("Navigation Pane")).clicked() {
@@ -132,7 +146,113 @@ pub fn contextual_tabs(s: &wordcraft_engine::Session) -> Vec<&'static str> {
 
 /// Tab to show when the stored tab is no longer applicable (pure, tested).
 pub fn resolve_tab<'a>(current: &'a str, available: &[&str]) -> &'a str {
-    if available.contains(&current) { current } else { "Home" }
+    if available.contains(&current) { current } else { crate::DEFAULT_TAB }
+}
+
+/// Width of the » button that holds the tabs the strip has no room for.
+const MORE_TABS_W: f32 = 24.0;
+
+/// Which tabs fit on a strip `avail` points wide (#897), from each tab's width and whether it must
+/// stay. The others give way from the end, leaving `more` points for the » menu that holds them
+/// (pure, tested).
+pub fn fit_tabs(tabs: &[(f32, bool)], avail: f32, more: f32) -> Vec<bool> {
+    let mut fits = vec![true; tabs.len()];
+    let mut total: f32 = tabs.iter().map(|(w, _)| w).sum();
+    if total <= avail {
+        return fits;
+    }
+    for (fit, (w, keep)) in fits.iter_mut().zip(tabs).rev() {
+        if total + more <= avail {
+            break;
+        }
+        if !keep {
+            *fit = false;
+            total -= w;
+        }
+    }
+    fits
+}
+
+/// One tab as the strip planner sees it (#2026).
+#[derive(Debug, Clone, Copy)]
+pub struct TabSpec {
+    /// Width of the label at full size.
+    pub text_w: f32,
+    /// File: always on the strip.
+    pub file: bool,
+    /// The tab being shown.
+    pub active: bool,
+    /// A contextual tab (Table Design, Picture Format…).
+    pub contextual: bool,
+}
+
+/// How the tab strip is laid out (#2026).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StripPlan {
+    /// Padding each side of a tab label.
+    pub pad: f32,
+    /// How much of Comments / Editing / Share is spelled out: 0 all, 1 Share only, 2 none.
+    pub buttons: usize,
+    /// Whether each tab is on the strip (the others are in the » menu).
+    pub fits: Vec<bool>,
+    /// Width each tab takes on the strip (a label may be cut with …).
+    pub widths: Vec<f32>,
+}
+
+/// Smallest a tab label is cut down to before the tab goes into the » menu.
+const MIN_TAB_W: f32 = 44.0;
+
+/// Lays the tabs and the buttons on their right out on `avail` points, giving way in this order:
+/// the padding between tabs, the Comments / Editing labels, the Share label, the plain tabs (from
+/// the end, into »), the labels of the active and contextual tabs (cut with …), and last those tabs
+/// themselves. The buttons' room is always kept and File never leaves the strip. `buttons` is the
+/// width of the three buttons at each level (pure, tested).
+pub fn plan_strip(tabs: &[TabSpec], buttons: [f32; 3], avail: f32, more: f32) -> StripPlan {
+    const STEPS: [(f32, usize); 4] = [(18.0, 0), (10.0, 0), (10.0, 1), (10.0, 2)];
+    let widths_at = |pad: f32| -> Vec<f32> { tabs.iter().map(|t| t.text_w.max(0.0) + pad + 2.0).collect() };
+    for (pad, level) in STEPS {
+        let widths = widths_at(pad);
+        if widths.iter().sum::<f32>() <= avail - buttons[level] {
+            return StripPlan { pad, buttons: level, fits: vec![true; tabs.len()], widths };
+        }
+    }
+    let (pad, level) = (10.0, 2);
+    let mut widths = widths_at(pad);
+    let room = avail - buttons[level];
+    let specs: Vec<(f32, bool)> = widths.iter().zip(tabs).map(|(w, t)| (*w, t.file || t.active || t.contextual)).collect();
+    let mut fits = fit_tabs(&specs, room, more);
+    // The tabs that must stay share what the plain ones left; each is cut down to its share.
+    let kept = |fits: &[bool], i: usize| fits.get(i).copied().unwrap_or(false) && tabs.get(i).is_some_and(|t| !t.file);
+    loop {
+        let n = (0..tabs.len()).filter(|&i| kept(&fits, i)).count();
+        let others: f32 =
+            (0..tabs.len()).filter(|&i| fits.get(i) == Some(&true) && !kept(&fits, i)).map(|i| widths.get(i).copied().unwrap_or(0.0)).sum();
+        let own: f32 = (0..tabs.len()).filter(|&i| kept(&fits, i)).map(|i| widths.get(i).copied().unwrap_or(0.0)).sum();
+        let extra = if fits.iter().all(|f| *f) { 0.0 } else { more };
+        let share_room = room - extra - others;
+        if n == 0 || own <= share_room {
+            break;
+        }
+        if share_room >= n as f32 * MIN_TAB_W {
+            let share = share_room / n as f32;
+            for (i, w) in widths.iter_mut().enumerate() {
+                if kept(&fits, i) {
+                    *w = w.min(share);
+                }
+            }
+            break;
+        }
+        // Not even cut down: the last of them (the active tab last of all) goes into ».
+        let last = (0..tabs.len())
+            .rev()
+            .find(|&i| kept(&fits, i) && tabs.get(i).is_some_and(|t| !t.active))
+            .or_else(|| (0..tabs.len()).rev().find(|&i| kept(&fits, i)));
+        match last.and_then(|i| fits.get_mut(i)) {
+            Some(f) => *f = false,
+            None => break,
+        }
+    }
+    StripPlan { pad, buttons: level, fits, widths }
 }
 
 /// Whether the caret is inside a table (so the contextual tabs and their badges are shown).
@@ -196,69 +316,180 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
-                for (tab, custom) in &tabs {
-                    let (tab, custom) = (tab.as_str(), *custom);
-                    let contextual = !custom && wordcraft_engine::ribbon::CONTEXTUAL_TABS.contains(&tab);
-                    // A custom tab's name is the user's own text: shown as typed.
-                    let shown = if custom { tab } else { tl!(tab) };
-                    let w = ui.ctx().fonts_mut(|f| f.layout_no_wrap(shown.to_string(), medium(12.5), t.text).size().x) + 18.0;
-                    let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
-                    if app.ui.keytips == crate::keytips::Phase::Tabs && app.ui.keytip_prefix.is_empty() {
-                        crate::keytips::record_tab(r, tab, &mut app.keytip_rects);
-                    }
-                    let active = app.ui.tab == tab && !app.ui.backstage;
-                    if resp.hovered() && !active {
-                        ui.painter().rect_filled(r.shrink2(vec2(0.0, 4.0)), 4.0, t.hover);
-                    }
-                    let color = if contextual || active { t.accent_text } else { t.text };
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, shown, if active { semibold(12.5) } else { medium(12.5) }, color);
-                    if active {
-                        let u = Rect::from_center_size(pos2(r.center().x, r.max.y - 2.0), vec2(w - 16.0, 3.0));
-                        ui.painter().rect_filled(u, 2.0, t.accent);
-                    }
-                    if resp.clicked() {
-                        let _ = app.run("ui.tab", json!({"tab": tab}));
-                    }
-                    if resp.double_clicked() && tab != "File" {
-                        let _ = app.run("ui.collapseRibbon", json!({}));
-                    }
-                    resp.context_menu(|ui| crate::widgets::customize_menu_items(ui, app));
-                }
+                // Share, Editing mode and Comments keep their room; the tabs get what is left of it
+                // (#897, #2026), and the buttons give up their labels before a tab is drawn over them.
+                let share = tl!("Share");
+                let editing_label = if app.session.doc.settings.track_changes { tl!("Reviewing") } else { tl!("Editing") };
+                let comments = tl!("Comments");
+                let share_w = ui.ctx().fonts_mut(|f| f.layout_no_wrap(share.to_string(), medium(12.0), t.text).size().x);
+                let spaced = |w: f32| w + 2.0;
+                let button_widths = |level: usize| -> f32 {
+                    let labels = level == 0;
+                    let share_full = (share_w + 36.0).max(74.0);
+                    let share_button = if level < 2 { share_full } else { 30.0 };
+                    let editing = crate::widgets::icon_text_button_width(ui, editing_label, regular(12.0), true, labels);
+                    let comment = crate::widgets::icon_text_button_width(ui, comments, regular(12.0), false, labels);
+                    // The gaps (6 + 4 + 8) and the strip's margin.
+                    spaced(share_button) + spaced(editing) + spaced(comment) + 18.0 + 12.0
+                };
+                let button_levels = [button_widths(0), button_widths(1), button_widths(2)];
+                let labels: Vec<&str> = tabs.iter().map(|(tab, custom)| if *custom { tab.as_str() } else { tl!(tab) }).collect();
+                let specs: Vec<TabSpec> = tabs
+                    .iter()
+                    .zip(&labels)
+                    .map(|((tab, custom), shown)| TabSpec {
+                        text_w: ui.ctx().fonts_mut(|f| f.layout_no_wrap(shown.to_string(), medium(12.5), t.text).size().x),
+                        file: tab == "File",
+                        active: *tab == app.ui.tab,
+                        contextual: !custom && wordcraft_engine::ribbon::CONTEXTUAL_TABS.contains(&tab.as_str()),
+                    })
+                    .collect();
+                let plan = plan_strip(&specs, button_levels, ui.available_width(), MORE_TABS_W + 2.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Share, Editing mode, Comments.
-                    let share = tl!("Share");
-                    let share_w = ui.ctx().fonts_mut(|f| f.layout_no_wrap(share.to_string(), medium(12.0), t.text).size().x);
-                    let (r, resp) = ui.allocate_exact_size(vec2((share_w + 36.0).max(74.0), 24.0), Sense::click());
-                    ui.painter().rect_filled(r, 4.0, if resp.hovered() { t.accent_text } else { t.accent });
-                    icons::paint(
-                        ui.painter(),
-                        Rect::from_center_size(pos2(r.min.x + 14.0, r.center().y), vec2(14.0, 14.0)),
-                        "share",
-                        t.on_accent,
-                        t.on_accent,
-                    );
-                    ui.painter().text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, share, medium(12.0), t.on_accent);
-                    if resp.on_hover_text(tl!("Export a copy to share (PDF, Word document)")).clicked() {
-                        let _ = app.run("ui.backstage", json!({"value": true, "page": "export"}));
-                    }
-                    ui.add_space(6.0);
-                    let track = app.session.doc.settings.track_changes;
-                    let mode =
-                        crate::widgets::icon_text_menu_button(ui, "pencil", if track { tl!("Reviewing") } else { tl!("Editing") }, regular(12.0));
-                    egui::Popup::menu(&mode).show(|ui| {
-                        if ui.selectable_label(!track, tl!(tl!("Editing — edit the document directly"))).clicked() {
-                            let _ = app.run("review.trackChanges", json!({"value": false}));
-                            ui.close();
+                    // No document open (#1129): nothing to share, edit or comment on — but only
+                    // these buttons. Disabling the whole line took the tab strip with it: the
+                    // tabs took clicks that did nothing, so the empty window had no way back to
+                    // the Start screen (#3045).
+                    ui.add_enabled_ui(app.has_document(), |ui| {
+                        let (share_size, share_text) =
+                            if plan.buttons < 2 { (((share_w + 36.0).max(74.0), 24.0), true) } else { ((30.0, 24.0), false) };
+                        let (r, resp) = ui.allocate_exact_size(vec2(share_size.0, share_size.1), Sense::click());
+                        ui.painter().rect_filled(r, 4.0, if resp.hovered() { t.accent_text } else { t.accent });
+                        let icon_x = if share_text { r.min.x + 14.0 } else { r.center().x };
+                        icons::paint(
+                            ui.painter(),
+                            Rect::from_center_size(pos2(icon_x, r.center().y), vec2(14.0, 14.0)),
+                            "share",
+                            t.on_accent,
+                            t.on_accent,
+                        );
+                        if share_text {
+                            ui.painter().text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, share, medium(12.0), t.on_accent);
                         }
-                        if ui.selectable_label(track, tl!(tl!("Reviewing — edits become suggestions"))).clicked() {
-                            let _ = app.run("review.trackChanges", json!({"value": true}));
-                            ui.close();
+                        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, share));
+                        if resp.on_hover_text(tl!("Export a copy to share (PDF, Word document)")).clicked() {
+                            let _ = app.run("ui.backstage", json!({"value": true, "page": "export"}));
+                        }
+                        ui.add_space(6.0);
+                        let track = app.session.doc.settings.track_changes;
+                        let mode = if plan.buttons == 0 {
+                            crate::widgets::icon_text_menu_button(ui, "pencil", editing_label, regular(12.0))
+                        } else {
+                            crate::widgets::icon_only_button(ui, "pencil", editing_label, regular(12.0), true)
+                        };
+                        egui::Popup::menu(&mode).show(|ui| {
+                            if ui.selectable_label(!track, tl!(tl!("Editing — edit the document directly"))).clicked() {
+                                let _ = app.run("review.trackChanges", json!({"value": false}));
+                                ui.close();
+                            }
+                            if ui.selectable_label(track, tl!(tl!("Reviewing — edits become suggestions"))).clicked() {
+                                let _ = app.run("review.trackChanges", json!({"value": true}));
+                                ui.close();
+                            }
+                        });
+                        ui.add_space(4.0);
+                        let comments_button = if plan.buttons == 0 {
+                            crate::widgets::icon_text_button(ui, "comment", comments, regular(12.0))
+                        } else {
+                            crate::widgets::icon_only_button(ui, "comment", comments, regular(12.0), false)
+                        };
+                        if comments_button.clicked() {
+                            let _ = app.run("view.commentsPane", json!({}));
                         }
                     });
-                    ui.add_space(4.0);
-                    if crate::widgets::icon_text_button(ui, "comment", tl!("Comments"), regular(12.0)).clicked() {
-                        let _ = app.run("view.commentsPane", json!({}));
-                    }
+                    ui.add_space(8.0);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        // The tabs that don't fit go into a » menu at the end of the strip (#897, #2026).
+                        for (i, ((tab, custom), _)) in tabs.iter().zip(&plan.fits).enumerate().filter(|(_, (_, fits))| **fits) {
+                            let (tab, custom) = (tab.as_str(), *custom);
+                            let contextual = !custom && wordcraft_engine::ribbon::CONTEXTUAL_TABS.contains(&tab);
+                            // A custom tab's name is the user's own text: shown as typed.
+                            let shown = if custom { tab } else { tl!(tab) };
+                            let w = plan.widths.get(i).copied().unwrap_or(0.0) - 2.0;
+                            let cut = specs.get(i).is_some_and(|sp| sp.text_w + plan.pad > w + 0.5);
+                            let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
+                            if app.ui.keytips == crate::keytips::Phase::Tabs {
+                                crate::keytips::record_tab(r, tab, &app.ui.keytip_prefix, &mut app.keytip_rects);
+                            } else if app.ui.keytips == crate::keytips::Phase::Legacy {
+                                // Every tab: they only place the legacy keys' hint (#1697).
+                                crate::keytips::record_tab(r, tab, "", &mut app.keytip_rects);
+                            }
+                            let active = app.ui.tab == tab && !app.ui.backstage;
+                            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, active, shown));
+                            if resp.hovered() && !active {
+                                ui.painter().rect_filled(r.shrink2(vec2(0.0, 4.0)), 4.0, t.hover);
+                            }
+                            let color = if contextual || active { t.accent_text } else { t.text };
+                            if cut {
+                                let mut job = egui::text::LayoutJob::single_section(
+                                    shown.to_string(),
+                                    egui::text::TextFormat::simple(if active { semibold(12.5) } else { medium(12.5) }, color),
+                                );
+                                job.wrap = egui::text::TextWrapping {
+                                    max_width: (w - plan.pad).max(1.0),
+                                    max_rows: 1,
+                                    break_anywhere: true,
+                                    overflow_character: Some('…'),
+                                };
+                                let galley = ui.painter().layout_job(job);
+                                ui.painter().galley(r.center() - galley.size() / 2.0, galley, color);
+                            } else {
+                                ui.painter().text(
+                                    r.center(),
+                                    Align2::CENTER_CENTER,
+                                    shown,
+                                    if active { semibold(12.5) } else { medium(12.5) },
+                                    color,
+                                );
+                            }
+                            let resp = if cut { resp.on_hover_text(shown) } else { resp };
+                            if active {
+                                let u = Rect::from_center_size(pos2(r.center().x, r.max.y - 2.0), vec2(w - 16.0, 3.0));
+                                ui.painter().rect_filled(u, 2.0, t.accent);
+                            }
+                            if resp.clicked() {
+                                let _ = app.run("ui.tab", json!({"tab": tab}));
+                            }
+                            if resp.double_clicked() && tab != "File" {
+                                let _ = app.run("ui.collapseRibbon", json!({}));
+                            }
+                            resp.context_menu(|ui| crate::widgets::customize_menu_items(ui, app));
+                        }
+                        let left_out: Vec<(&str, &str)> = tabs
+                            .iter()
+                            .zip(&labels)
+                            .zip(&plan.fits)
+                            .filter(|(_, fits)| !**fits)
+                            .map(|(((tab, _), shown), _)| (tab.as_str(), *shown))
+                            .collect();
+                        if !left_out.is_empty() {
+                            let (r, resp) = ui.allocate_exact_size(vec2(MORE_TABS_W, 30.0), Sense::click());
+                            if resp.hovered() {
+                                ui.painter().rect_filled(r.shrink2(vec2(0.0, 4.0)), 4.0, t.hover);
+                            }
+                            // The active tab is in the menu: the button says so.
+                            let holds_active = left_out.iter().any(|(tab, _)| *tab == app.ui.tab);
+                            ui.painter().text(
+                                r.center(),
+                                Align2::CENTER_CENTER,
+                                "»",
+                                medium(12.5),
+                                if holds_active { t.accent_text } else { t.text },
+                            );
+                            // "»" means nothing read aloud: the button says what it holds.
+                            let more = tl!("More tabs");
+                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, more));
+                            let resp = resp.on_hover_text(more);
+                            egui::Popup::menu(&resp).show(|ui| {
+                                for (tab, shown) in left_out {
+                                    if ui.selectable_label(app.ui.tab == tab, shown).clicked() {
+                                        let _ = app.run("ui.tab", json!({"tab": tab}));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                    });
                 });
             });
         });
@@ -273,9 +504,14 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         .show(ui, |ui| {
             // Right-click on the ribbon (outside a button): Customize Ribbon. Registered first, so
             // the buttons drawn over it keep their own clicks.
+            // No document open (#1129): every command is greyed out but Help's.
+            if !app.has_document() && app.ui.tab != "Help" {
+                ui.disable();
+            }
             let bg = ui.interact(ui.max_rect(), ui.id().with("ribbon_background"), Sense::click());
             bg.context_menu(|ui| crate::widgets::customize_menu_items(ui, app));
             let entry = user_tabs.iter().find(|e| e.name == app.ui.tab);
+            crate::ribbon_fit::begin(ui.ctx(), &app.ui.tab, ui.available_width() - 4.0);
             let scroll = egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
@@ -313,6 +549,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     }
                 });
             });
+            crate::ribbon_fit::end(ui.ctx());
             // The bar is hidden, so a row wider than the window would be clipped with no sign. Edge chevrons show
             // where more is and scroll it on click. Every command also stays reachable through Search Commands.
             let r = scroll.inner_rect;
@@ -387,6 +624,23 @@ fn edge_cue(ui: &mut Ui, rect: Rect, glyph: &str, hint: &str, t: &Tokens) -> boo
     resp.clicked()
 }
 
+/// Whether Esc just ended typing in a field (`r`, remembered under `id`). egui 0.36 keeps a
+/// `DragValue`'s typed text after Esc and applies it a frame later, when the field still counts as
+/// having just lost focus but Esc is no longer pressed: a change reported within two frames of the
+/// Esc is that late value, to be dropped so that Esc cancels as in Word.
+fn esc_cancelled(ui: &Ui, r: &egui::Response, id: egui::Id) -> bool {
+    let now = ui.ctx().cumulative_pass_nr();
+    let (focus_key, esc_key) = (id.with("focused"), id.with("esc"));
+    // Read outside `data_mut`: both lock the context.
+    let focused = r.has_focus();
+    let had_focus = ui.data(|d| d.get_temp::<bool>(focus_key)).unwrap_or(false);
+    ui.data_mut(|d| d.insert_temp(focus_key, focused));
+    if had_focus && !focused && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|d| d.insert_temp(esc_key, now));
+    }
+    ui.data(|d| d.get_temp::<u64>(esc_key)).is_some_and(|at| now.saturating_sub(at) <= 2)
+}
+
 fn stack(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = vec2(1.0, 0.0);
@@ -394,8 +648,132 @@ fn stack(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     });
 }
 
+/// Layout › Size: the named paper sizes, then More Paper Sizes… for a custom size in Page
+/// Setup (#1433).
+pub(crate) fn size_menu(ui: &mut Ui, app: &mut WordApp) {
+    // The current paper size is checked.
+    let x = wordcraft_engine::cmd::page::sect(&app.session);
+    let current = wordcraft_geom::paper_name(x.page_w, x.page_h);
+    for (n, w, h) in wordcraft_geom::PAPER_SIZES {
+        // Paper names are the industry's (Letter, A4, B5 (JIS)) and stay as they are; the
+        // envelopes say what they are. Sizes in the measurement unit, written the region's
+        // way (`21 cm × 29,7 cm`, #838).
+        let name = if n.starts_with("Envelope ") { tl!(n) } else { n };
+        let (width, height) = (crate::options::length(*w), crate::options::length(*h));
+        let label = crate::i18n::fmt(tl!("{paper}   {width} × {height}"), &[("paper", name), ("width", &width), ("height", &height)]);
+        mi_check(ui, app, &label, current == Some(*n), "layout.size", json!({"name": n}));
+    }
+    ui.separator();
+    mi(ui, app, crate::dialogs::PAPER_LABELS.more, "ui.dialog", json!({"name": "pageSetup"}));
+}
+
+/// The underline styles Home › Underline offers as line samples: (`format.underline` style, name).
+const UNDERLINE_STYLES: [(&str, &str); 8] = [
+    ("single", "Single"),
+    ("double", "Double"),
+    ("thick", "Thick"),
+    ("dotted", "Dotted"),
+    ("dash", "Dashed"),
+    ("dotDash", "Dot-dash"),
+    ("dotDotDash", "Dot-dot-dash"),
+    ("wave", "Wave"),
+];
+
+/// Home › Font › Underline's drop-down (#2738): a sample of each line, Words only, None, More
+/// Underlines… (the Font dialog) and Underline Color.
+fn underline_menu(ui: &mut Ui, app: &mut WordApp) {
+    for (style, name) in UNDERLINE_STYLES {
+        underline_item(ui, app, style, name);
+    }
+    mi(ui, app, "Words only", "format.wordUnderline", json!({}));
+    // Not `mi`: Ctrl+U beside None would read as its shortcut, but Ctrl+U toggles a single underline.
+    let enabled = crate::widgets::enabled(app, "format.underline");
+    if ui.add_enabled(enabled, egui::Button::new(tl!("None")).min_size(vec2(200.0, 0.0))).clicked() {
+        crate::widgets::run_from_ribbon(app, "format.underline", json!({"value": false}));
+        ui.close();
+    }
+    ui.separator();
+    mi(ui, app, "More Underlines…", "format.fontDialog", json!({}));
+    ui.menu_button(tl!("Underline Color"), |ui| {
+        mi(ui, app, "Automatic", "format.underlineColor", json!({"color": "auto"}));
+        let theme = app.session.doc.settings.theme_colors.clone();
+        crate::colors::menu(ui, app, &theme, Target::cmd("format.underlineColor"));
+    });
+}
+
+/// A menu entry drawn as a sample of its underline; its name is the tooltip and what assistive
+/// technology reads.
+fn underline_item(ui: &mut Ui, app: &mut WordApp, style: &str, name: &str) {
+    let enabled = crate::widgets::enabled(app, "format.underline");
+    let resp = ui.add_enabled(enabled, egui::Button::new("").min_size(vec2(200.0, 22.0)));
+    let label = tl!(name);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    let t = Tokens::get(ui.ctx());
+    let color = if enabled { t.text } else { t.text_disabled };
+    paint_underline(ui.painter(), resp.rect.shrink2(vec2(10.0, 0.0)), style, color);
+    if resp.on_hover_text(label).clicked() {
+        crate::widgets::run_from_ribbon(app, "format.underline", json!({"style": style}));
+        ui.close();
+    }
+}
+
+/// A line in `style` across `r` at its middle: our own drawing of each underline kind.
+fn paint_underline(p: &egui::Painter, r: Rect, style: &str, color: egui::Color32) {
+    let y = r.center().y.round() + 0.5;
+    let (x0, x1) = (r.left(), r.right());
+    let line = |y: f32, w: f32| {
+        p.line_segment([pos2(x0, y), pos2(x1, y)], Stroke::new(w, color));
+    };
+    // Repeats a pattern of (length, gap) pairs along the line; a length of 0 is a dot.
+    let pattern = |pat: &[(f32, f32)]| {
+        let mut x = x0;
+        'run: loop {
+            for &(len, gap) in pat {
+                if x >= x1 {
+                    break 'run;
+                }
+                if len == 0.0 {
+                    p.circle_filled(pos2(x + 0.75, y), 0.75, color);
+                    x += 1.5 + gap;
+                } else {
+                    p.line_segment([pos2(x, y), pos2((x + len).min(x1), y)], Stroke::new(1.0, color));
+                    x += len + gap;
+                }
+            }
+        }
+    };
+    match style {
+        "double" => {
+            line(y - 1.5, 1.0);
+            line(y + 1.5, 1.0);
+        }
+        "thick" => line(y, 2.5),
+        "dotted" => pattern(&[(0.0, 2.0)]),
+        "dash" => pattern(&[(6.0, 4.0)]),
+        "dotDash" => pattern(&[(6.0, 3.0), (0.0, 3.0)]),
+        "dotDotDash" => pattern(&[(6.0, 3.0), (0.0, 2.5), (0.0, 3.0)]),
+        "wave" => {
+            let pts: Vec<_> =
+                (0..=((x1 - x0) as usize)).map(|i| pos2(x0 + i as f32, y + 1.6 * (i as f32 * std::f32::consts::TAU / 6.0).sin())).collect();
+            p.add(egui::Shape::line(pts, Stroke::new(1.0, color)));
+        }
+        _ => line(y, 1.0),
+    }
+}
+
 pub(crate) fn mi(ui: &mut Ui, app: &mut WordApp, label: &str, id: &str, params: Value) {
     mi_text(ui, app, tl!(label), id, params);
+}
+
+/// [`mi`] with a drawn icon before the label.
+fn mi_icon(ui: &mut Ui, app: &mut WordApp, icon: &str, label: &str, id: &str, params: Value) {
+    let sc = crate::widgets::shortcut_text(app, id);
+    let enabled = crate::widgets::enabled(app, id);
+    let resp = ui.add_enabled_ui(enabled, |ui| crate::widgets::icon_menu_item(ui, icon, tl!(label), &sc, 200.0)).inner;
+    if resp.clicked() {
+        crate::widgets::run_from_ribbon(app, id, params);
+        ui.close();
+    }
 }
 
 /// A menu item whose text is already in the interface language.
@@ -410,46 +788,233 @@ fn mi_text(ui: &mut Ui, app: &mut WordApp, text: &str, id: &str, params: Value) 
 }
 
 /// The proofing languages the Language menu offers: tag and English name (translated when drawn).
-pub(crate) const PROOFING_LANGUAGES: [(&str, &str); 4] =
-    [("en-US", "English (United States)"), ("en-GB", "English (United Kingdom)"), ("pl-PL", "Polish"), ("pt-BR", "Portuguese (Brazil)")];
+pub(crate) const PROOFING_LANGUAGES: [(&str, &str); 16] = [
+    ("en-US", "English (United States)"),
+    ("en-GB", "English (United Kingdom)"),
+    ("en-AU", "English (Australia)"),
+    ("en-CA", "English (Canada)"),
+    ("pl-PL", "Polish"),
+    ("pt-BR", "Portuguese (Brazil)"),
+    ("it-IT", "Italian"),
+    ("hr-HR", "Croatian"),
+    ("tr-TR", "Turkish"),
+    ("ru-RU", "Russian"),
+    ("cs-CZ", "Czech"),
+    ("id-ID", "Indonesian"),
+    ("es-ES", "Spanish (Spain)"),
+    ("es-MX", "Spanish (Mexico)"),
+    ("es-419", "Spanish (Latin America)"),
+    ("es-UY", "Spanish (Uruguay)"),
+];
 
 /// The English name of a proofing language tag, as the status bar shows it (no tag: WordCraft's
-/// default, US English; a tag without a name here: the tag).
+/// default, US English): a listed language by its name; another region of one by the language
+/// and the region ("French (Canada)"); a bare language subtag by its usual variant; else the tag.
 pub(crate) fn language_name(tag: Option<&str>) -> String {
     let tag = tag.unwrap_or("en-US");
-    if let Some((_, name)) = PROOFING_LANGUAGES.iter().find(|(t, _)| t.eq_ignore_ascii_case(tag)) {
-        return (*name).to_string();
+    let named =
+        |t: &str| PROOFING_LANGUAGES.iter().chain(crate::dialogs_layout::LANGUAGES.iter()).find(|(l, _)| l.eq_ignore_ascii_case(t)).map(|(_, n)| *n);
+    // Any language the Language dialog offers (French, German…) by its name, not its tag (#860).
+    if let Some(name) = named(tag) {
+        return name.to_string();
     }
-    match wordcraft_engine::proof::ProofLang::from_tag(Some(tag)) {
-        wordcraft_engine::proof::ProofLang::Pl => "Polish".into(),
-        wordcraft_engine::proof::ProofLang::Pt => "Portuguese (Brazil)".into(),
-        wordcraft_engine::proof::ProofLang::En if tag.eq_ignore_ascii_case("en") => "English (United States)".into(),
-        _ => tag.to_string(),
+    let mut parts = tag.split(['-', '_']);
+    let primary = parts.next().unwrap_or("");
+    // The region: the first two-letter or three-digit subtag after the language (and script).
+    let region =
+        parts.find(|p| (p.len() == 2 && p.chars().all(|c| c.is_ascii_alphabetic())) || (p.len() == 3 && p.chars().all(|c| c.is_ascii_digit())));
+    match region {
+        // A region the list doesn't have: the language's name without its own region or variant.
+        Some(r) => {
+            let language = crate::dialogs_layout::LANGUAGES
+                .iter()
+                .find(|(l, _)| l.split('-').next().is_some_and(|p| p.eq_ignore_ascii_case(primary)))
+                .map(|(_, n)| n.split(" (").next().unwrap_or(n));
+            match language {
+                Some(language) => format!("{language} ({})", region_name(r)),
+                None => tag.to_string(),
+            }
+        }
+        // A bare language subtag ("pt", "pl"): the variant WordCraft proofs.
+        None => match wordcraft_engine::proof::ProofLang::from_tag(Some(tag)) {
+            wordcraft_engine::proof::ProofLang::Pl => "Polish".into(),
+            wordcraft_engine::proof::ProofLang::Hr => "Croatian".into(),
+            wordcraft_engine::proof::ProofLang::Pt => "Portuguese (Brazil)".into(),
+            wordcraft_engine::proof::ProofLang::It => "Italian".into(),
+            wordcraft_engine::proof::ProofLang::Tr => "Turkish".into(),
+            wordcraft_engine::proof::ProofLang::Ru => "Russian".into(),
+            wordcraft_engine::proof::ProofLang::Cs => "Czech".into(),
+            wordcraft_engine::proof::ProofLang::Id => "Indonesian".into(),
+            wordcraft_engine::proof::ProofLang::Es => "Spanish (Spain)".into(),
+            wordcraft_engine::proof::ProofLang::De => "German (Germany)".into(),
+            wordcraft_engine::proof::ProofLang::En if tag.eq_ignore_ascii_case("en") => "English (United States)".into(),
+            _ => tag.to_string(),
+        },
     }
+}
+
+/// The English name of a region subtag the language list has no entry for (else the subtag).
+fn region_name(code: &str) -> String {
+    const REGIONS: [(&str, &str); 62] = [
+        ("AE", "U.A.E."),
+        ("AO", "Angola"),
+        ("AR", "Argentina"),
+        ("AT", "Austria"),
+        ("AU", "Australia"),
+        ("BA", "Bosnia and Herzegovina"),
+        ("BE", "Belgium"),
+        ("BO", "Bolivia"),
+        ("BR", "Brazil"),
+        ("BY", "Belarus"),
+        ("CA", "Canada"),
+        ("CH", "Switzerland"),
+        ("CL", "Chile"),
+        ("CN", "China"),
+        ("CO", "Colombia"),
+        ("CR", "Costa Rica"),
+        ("CV", "Cabo Verde"),
+        ("CY", "Cyprus"),
+        ("DE", "Germany"),
+        ("DO", "Dominican Republic"),
+        ("EC", "Ecuador"),
+        ("EG", "Egypt"),
+        ("ES", "Spain"),
+        ("FR", "France"),
+        ("GB", "United Kingdom"),
+        ("GT", "Guatemala"),
+        ("HK", "Hong Kong SAR"),
+        ("IE", "Ireland"),
+        ("IN", "India"),
+        ("IQ", "Iraq"),
+        ("IT", "Italy"),
+        ("JM", "Jamaica"),
+        ("JO", "Jordan"),
+        ("KW", "Kuwait"),
+        ("KZ", "Kazakhstan"),
+        ("LB", "Lebanon"),
+        ("LI", "Liechtenstein"),
+        ("LU", "Luxembourg"),
+        ("MA", "Morocco"),
+        ("MC", "Monaco"),
+        ("ME", "Montenegro"),
+        ("MO", "Macao SAR"),
+        ("MX", "Mexico"),
+        ("MY", "Malaysia"),
+        ("MZ", "Mozambique"),
+        ("NL", "Netherlands"),
+        ("NZ", "New Zealand"),
+        ("PE", "Peru"),
+        ("PH", "Philippines"),
+        ("PR", "Puerto Rico"),
+        ("PT", "Portugal"),
+        ("PY", "Paraguay"),
+        ("QA", "Qatar"),
+        ("RU", "Russia"),
+        ("SG", "Singapore"),
+        ("SY", "Syria"),
+        ("TW", "Taiwan"),
+        ("UA", "Ukraine"),
+        ("US", "United States"),
+        ("UY", "Uruguay"),
+        ("VE", "Venezuela"),
+        ("ZA", "South Africa"),
+    ];
+    REGIONS.iter().find(|(c, _)| c.eq_ignore_ascii_case(code)).map_or_else(|| code.to_ascii_uppercase(), |(_, n)| (*n).to_string())
 }
 
 /// The language at the caret (resolved through the styles), translated, for the status bar.
 pub(crate) fn caret_language(app: &WordApp) -> String {
+    tl!(&language_name(caret_lang_tag(app).as_deref())).to_string()
+}
+
+/// The formatting at the caret, resolved through the styles and the document default.
+fn caret_char(app: &WordApp) -> wordcraft_doc::resolve::ResolvedChar {
     let s = &app.session;
     let style = s.doc.para_at(&s.sel.focus).and_then(|p| p.props.style.clone());
-    let rc = s.doc.styles.resolve_char(style.as_deref(), &s.typing_props());
-    tl!(&language_name(rc.lang.as_deref())).to_string()
+    s.doc.styles.resolve_char(style.as_deref(), &s.typing_props())
+}
+
+/// The language tag at the caret, resolved through the styles and the document default.
+fn caret_lang_tag(app: &WordApp) -> Option<String> {
+    caret_char(app).lang
+}
+
+/// Is the text at the caret itself marked Do not check spelling or grammar? (`format.state`
+/// looks at the whole word around a caret, so a partly marked word would read as checked.)
+pub(crate) fn caret_no_proof(app: &WordApp) -> bool {
+    caret_char(app).no_proof
+}
+
+/// Does WordCraft check spelling and grammar in the caret's language at all (Bulgarian: no)?
+pub(crate) fn caret_language_proofed(app: &WordApp) -> bool {
+    wordcraft_engine::proof::has_dictionary(caret_lang_tag(app).as_deref())
+}
+
+/// The Hunspell dictionary the caret's language needs but doesn't have (`pl_PL`), if any (#1167).
+pub(crate) fn caret_missing_dictionary(app: &WordApp) -> Option<&'static str> {
+    wordcraft_engine::proof::missing_dictionary(caret_lang_tag(app).as_deref())
+}
+
+/// The dictionary file and reason when the caret's language has a dictionary installed that
+/// couldn't be read, so "no dictionary" would send the user to reinstall it for nothing (#2830).
+pub(crate) fn caret_unreadable_dictionary(app: &WordApp) -> Option<(std::path::PathBuf, String)> {
+    wordcraft_engine::proof::unreadable_dictionary(caret_lang_tag(app).as_deref()).map(|(_, file, reason)| (file, reason))
 }
 
 /// Review › Language (and the status bar's language): set the selection's proofing language, or
-/// leave it unchecked. The current choice has a check mark.
+/// leave it unchecked. The current choice has a check mark; a language outside the short list
+/// (French, German…) shows checked above it. Set Proofing Language… opens the Language dialog
+/// with every language and Set As Default, and Language Preferences… opens Options › Language
+/// (#860: the short list alone left no way to pick French).
 pub(crate) fn language_menu(ui: &mut Ui, app: &mut WordApp) {
     let st = app.session.run("format.state", &json!({})).unwrap_or_default();
-    let current = st.get("lang").and_then(Value::as_str).unwrap_or("").to_string();
+    // The selection's own language; else (nothing set on the text) the one it gets from its
+    // style or the document default, as the status bar shows.
+    let current = match st.get("lang") {
+        Some(Value::String(t)) => t.clone(),
+        Some(Value::Null) if app.session.sel.is_collapsed() => caret_lang_tag(app).unwrap_or_else(|| "en-US".into()),
+        _ => String::new(),
+    };
     let no_proof = st.get("noProof").and_then(Value::as_bool).unwrap_or(false);
-    for (tag, name) in PROOFING_LANGUAGES {
-        let on = current.eq_ignore_ascii_case(tag)
+    let listed = |tag: &str| {
+        current.eq_ignore_ascii_case(tag)
             || (tag == "pl-PL" && current.eq_ignore_ascii_case("pl"))
-            || (tag == "pt-BR" && current.eq_ignore_ascii_case("pt"));
+            || (tag == "pt-BR" && current.eq_ignore_ascii_case("pt"))
+            || (tag == "it-IT" && current.eq_ignore_ascii_case("it"))
+            || (tag == "hr-HR" && current.eq_ignore_ascii_case("hr"))
+            || (tag == "tr-TR" && current.eq_ignore_ascii_case("tr"))
+            || (tag == "cs-CZ" && wordcraft_engine::proof::ProofLang::from_tag(Some(&current)) == wordcraft_engine::proof::ProofLang::Cs)
+            || (tag == "id-ID" && wordcraft_engine::proof::ProofLang::from_tag(Some(&current)) == wordcraft_engine::proof::ProofLang::Id)
+            || (tag == "es-ES" && current.eq_ignore_ascii_case("es"))
+            || (tag == "en-US" && current.eq_ignore_ascii_case("en"))
+    };
+    let checks = language_checks(&current, listed);
+    if let Some(name) = checks.extra {
+        mi_check(ui, app, &name, true, "review.language", json!({"lang": current}));
+    }
+    for ((tag, name), on) in PROOFING_LANGUAGES.iter().zip(checks.listed) {
         mi_check(ui, app, name, on, "review.language", json!({"lang": tag}));
     }
     ui.separator();
     mi_check(ui, app, "Do Not Check Spelling or Grammar", no_proof, "review.language", json!({"noProof": !no_proof}));
+    ui.separator();
+    mi_check(ui, app, "Set Proofing Language…", false, "review.language", json!({}));
+    mi_check(ui, app, "Language Preferences…", false, "file.options", json!({"pane": "language"}));
+}
+
+/// The Language menu's check marks for the `current` tag: which short-list entries are checked
+/// (`listed` matches a tag), and the name of the current language when it is none of them,
+/// shown checked above. A language named like a short-list entry checks that entry, so no name
+/// shows twice.
+struct LanguageChecks {
+    extra: Option<String>,
+    listed: [bool; PROOFING_LANGUAGES.len()],
+}
+
+fn language_checks(current: &str, listed: impl Fn(&str) -> bool) -> LanguageChecks {
+    let name = (!current.is_empty()).then(|| language_name(Some(current)));
+    let on = PROOFING_LANGUAGES.map(|(t, n)| listed(t) || name.as_deref() == Some(n));
+    LanguageChecks { extra: name.filter(|_| !on.contains(&true)), listed: on }
 }
 
 /// A menu item with a check mark when `checked` (the current choice of several).
@@ -496,6 +1061,29 @@ pub(crate) fn wrap_text_items(ui: &mut Ui, app: &mut WordApp) {
     mi_check(ui, app, "Fix Position on Page", with_text == Some(false), "arrange.moveWithText", json!({"value": false}));
 }
 
+/// The Format Painter button. A click arms it for one use (blue border only); a double-click keeps
+/// it on across several uses (full checked look), like Word. Esc or another click turns it off.
+fn format_painter_button(ui: &mut Ui, app: &mut WordApp) {
+    let sticky = matches!(app.session.painter, Some((_, _, true)));
+    let armed = app.session.painter.is_some();
+    let resp = small(ui, app, "painter", Some("Format"), "Format Painter", "edit.formatPainter", json!({}), sticky);
+    if resp.double_clicked() {
+        painter_double_click(app);
+    } else if armed && !sticky {
+        let t = Tokens::get(ui.ctx());
+        ui.painter().rect_stroke(resp.rect, egui::CornerRadius::same(4), Stroke::new(1.0, t.accent.linear_multiply(0.5)), egui::StrokeKind::Inside);
+    }
+}
+
+/// A double-click fires `clicked()` twice, so by now the painter has been armed and disarmed again.
+/// Arm it once more, this time sticky.
+fn painter_double_click(app: &mut WordApp) {
+    if app.session.painter.is_some() {
+        let _ = app.run("edit.formatPainter", json!({}));
+    }
+    let _ = app.run("edit.formatPainter", json!({"sticky": true}));
+}
+
 fn home(app: &mut WordApp, ui: &mut Ui) {
     let st = app.session.run("format.state", &json!({})).unwrap_or_default();
     let flag = |k: &str| st.get(k).and_then(Value::as_bool).unwrap_or(false);
@@ -508,12 +1096,8 @@ fn home(app: &mut WordApp, ui: &mut Ui) {
         });
         stack(ui, |ui| {
             small(ui, app, "cut", Some("Cut"), "Cut", "edit.cut", json!({}), false);
-            let r = small(ui, app, "copy", Some("Copy"), "Copy", "edit.copy", json!({}), false);
-            if r.clicked() {
-                ui.ctx().copy_text(app.session.clipboard_text.clone());
-            }
-            let active = app.session.painter.is_some();
-            small(ui, app, "painter", Some("Format"), "Format Painter", "edit.formatPainter", json!({}), active);
+            small(ui, app, "copy", Some("Copy"), "Copy", "edit.copy", json!({}), false);
+            format_painter_button(ui, app);
         });
     });
     group(ui, "Font", Some("format.fontDialog"), app, |ui, app| {
@@ -522,10 +1106,13 @@ fn home(app: &mut WordApp, ui: &mut Ui) {
                 let font = st.get("font").and_then(Value::as_str).unwrap_or("").to_string();
                 let font = app.previews.font_shown(&font);
                 let fams = app.previews.families();
+                let recent: Vec<String> = app.ui.recent_fonts.iter().map(|f| app.previews.font_shown(f)).collect();
                 let prev = app.previews.font_preview_fn();
-                if let Some(f) = font_combo(ui, "font", 150.0, &font, &fams, Some(&*prev)) {
+                if let Some(f) = crate::widgets::font_combo_with_recent_hint(ui, "font", 150.0, &font, &fams, &recent, Some(&*prev), tl!("Font")) {
                     let _ = if f == crate::widgets::ADD_FONT {
                         app.run("font.add", json!({}))
+                    } else if f == crate::widgets::LOAD_SYSTEM_FONTS {
+                        app.run("font.loadSystem", json!({}))
                     } else {
                         let f = app.previews.font_stored(&f);
                         app.run("format.font", json!({"name": f}))
@@ -538,7 +1125,7 @@ fn home(app: &mut WordApp, ui: &mut Ui) {
                     .unwrap_or_default();
                 let sizes: Vec<String> =
                     wordcraft_engine::cmd::format::SIZES.iter().map(|s| if s.fract() == 0.0 { format!("{s:.0}") } else { s.to_string() }).collect();
-                if let Some(v) = combo(ui, "size", 52.0, &size, &sizes, None)
+                if let Some(v) = crate::widgets::combo_hint(ui, "size", 52.0, &size, &sizes, None, tl!("Font Size"))
                     && let Ok(x) = v.trim().parse::<f64>()
                 {
                     let _ = app.run("format.size", json!({"size": x}));
@@ -560,20 +1147,7 @@ fn home(app: &mut WordApp, ui: &mut Ui) {
             crate::widgets::row(ui, |ui| {
                 small(ui, app, "bold", None, "Bold", "format.bold", json!({}), flag("bold"));
                 small(ui, app, "italic", None, "Italic", "format.italic", json!({}), flag("italic"));
-                split(ui, app, "underline", "Underline", "format.underline", json!({}), flag("underline"), None, |ui, app| {
-                    for (l, s) in [
-                        ("Single", "single"),
-                        ("Double", "double"),
-                        ("Thick", "thick"),
-                        ("Dotted", "dotted"),
-                        ("Dashed", "dash"),
-                        ("Dot-dash", "dotDash"),
-                        ("Wave", "wave"),
-                        ("Words only", "words"),
-                    ] {
-                        mi(ui, app, l, "format.underline", json!({"style": s}));
-                    }
-                });
+                split(ui, app, "underline", "Underline", "format.underline", json!({}), flag("underline"), None, underline_menu);
                 small(ui, app, "strike", None, "Strikethrough", "format.strikethrough", json!({}), flag("strike"));
                 small(ui, app, "subscript", None, "Subscript", "format.subscript", json!({}), flag("subscript"));
                 small(ui, app, "superscript", None, "Superscript", "format.superscript", json!({}), flag("superscript"));
@@ -596,25 +1170,18 @@ fn home(app: &mut WordApp, ui: &mut Ui) {
                     mi(ui, app, "Double Strikethrough", "format.doubleStrikethrough", json!({}));
                 });
                 let hl = app.canvas.last_highlight.clone();
-                split(ui, app, "highlight", "Text Highlight Color", "format.highlight", json!({"color": hl}), false, None, |ui, app| {
-                    let grid = wordcraft_doc::props::Highlight::ALL;
-                    egui::Grid::new("hl").spacing(vec2(3.0, 3.0)).show(ui, |ui| {
-                        for (i, h) in grid.iter().enumerate().skip(1) {
-                            let c = h.rgb().unwrap_or(wordcraft_doc::Rgb::WHITE);
-                            let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
-                            ui.painter().rect_filled(r, 2.0, egui::Color32::from_rgb(c.0, c.1, c.2));
-                            if resp.on_hover_text(h.name()).clicked() {
-                                app.canvas.last_highlight = h.ooxml().to_string();
-                                let _ = app.run("format.highlight", json!({"color": h.ooxml()}));
-                                ui.close();
-                            }
-                            if i % 5 == 0 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-                    mi(ui, app, "No Color", "format.highlight", json!({"color": "none"}));
-                });
+                let (icon, sw, color) = crate::mini_toolbar::highlight_button_appearance(&hl);
+                split(
+                    ui,
+                    app,
+                    icon,
+                    "Text Highlight Color",
+                    "format.highlight",
+                    json!({"color": color}),
+                    false,
+                    sw,
+                    crate::mini_toolbar::highlight_menu,
+                );
                 let fc = app.canvas.last_font_color.clone();
                 let sw = wordcraft_doc::Rgb::parse(&fc).map(crate::theme::c32);
                 split(ui, app, "fontcolor", "Font Color", "format.color", json!({"color": fc}), false, sw, |ui, app| {
@@ -672,6 +1239,23 @@ fn home(app: &mut WordApp, ui: &mut Ui) {
                 split(ui, app, "multilevel", "Multilevel List", "para.multilevel", json!({}), lists.multilevel, None, |ui, app| {
                     mi(ui, app, "1. 1.1. 1.1.1.", "para.multilevel", json!({"kind": "legal"}));
                     mi(ui, app, "I. A. 1. a.", "para.multilevel", json!({"kind": "outline"}));
+                    ui.separator();
+                    // Lists linked to the heading styles: the headings carry the numbers. Each item
+                    // reads as its first three levels, number then (translated) style name.
+                    for (numbers, k) in [
+                        (["1", "1.1", "1.1.1"], "headings"),
+                        (["Article I.", "Section 1.01", "(a)"], "article"),
+                        (["I.", "A.", "1."], "outlineHeadings"),
+                        (["Chapter 1", "", ""], "chapter"),
+                    ] {
+                        let text = numbers
+                            .iter()
+                            .zip(["Heading 1", "Heading 2", "Heading 3"])
+                            .map(|(n, h)| if n.is_empty() { tl!(h).to_string() } else { format!("{} {}", tl!(n), tl!(h)) })
+                            .collect::<Vec<_>>()
+                            .join(" / ");
+                        mi_text(ui, app, &text, "list.multilevelPreset", json!({"preset": k}));
+                    }
                     ui.separator();
                     mi(ui, app, "Define New Multilevel List…", "list.define", json!({}));
                     ui.separator();
@@ -798,10 +1382,10 @@ fn insert(app: &mut WordApp, ui: &mut Ui) {
                 ("Star", "star"),
                 ("Heart", "heart"),
             ] {
-                mi(ui, app, l, "insert.shape", json!({"kind": k}));
+                mi_icon(ui, app, &format!("shape.{k}"), l, "insert.shape", json!({"kind": k}));
             }
             ui.separator();
-            mi(ui, app, "New Drawing Canvas", "insert.canvas", json!({}));
+            mi_icon(ui, app, "canvas", "New Drawing Canvas", "insert.canvas", json!({}));
             // Connectors: glue their ends to shapes by dragging them (shape.connect).
             for (l, k, arrow) in [
                 ("Straight Connector", "straightConnector", "none"),
@@ -811,7 +1395,8 @@ fn insert(app: &mut WordApp, ui: &mut Ui) {
                 ("Curved Connector", "curvedConnector", "none"),
                 ("Curved Arrow Connector", "curvedConnector", "end"),
             ] {
-                mi(ui, app, l, "insert.shape", json!({"kind": k, "arrow": arrow}));
+                let icon = if arrow == "end" { k.replace("Connector", "ArrowConnector") } else { k.to_string() };
+                mi_icon(ui, app, &format!("shape.{icon}"), l, "insert.shape", json!({"kind": k, "arrow": arrow}));
             }
         });
         stack(ui, |ui| {
@@ -852,14 +1437,18 @@ fn insert(app: &mut WordApp, ui: &mut Ui) {
             mi(ui, app, "Bottom of Page", "insert.pageNumber", json!({"position": "bottom", "align": "center"}));
             mi(ui, app, "Page X of Y", "insert.pageNumber", json!({"position": "bottom", "format": "x of y"}));
             mi(ui, app, "Current Position", "insert.pageNumber", json!({"position": "current"}));
-            mi(ui, app, "Format Page Numbers…", "layout.pageNumberFormat", json!({}));
+            mi(ui, app, "Format Page Numbers…", "ui.dialog", json!({"name": "pageNumbers"}));
         });
     });
     group(ui, "Text", None, app, |ui, app| {
         big(ui, app, "textBox", "Text\nBox", "insert.textBox", json!({}), false);
         stack(ui, |ui| {
             menu_button(ui, app, "quickParts", Some("Quick Parts"), "Quick Parts", false, "insert.quickParts", |ui, app| {
-                let parts: Vec<String> = app.session.building_blocks.keys().cloned().collect();
+                // This session's building blocks, then the document's own Quick Parts.
+                let mut parts: Vec<String> = app.session.building_blocks.keys().cloned().collect();
+                let mut seen: std::collections::HashSet<String> = parts.iter().cloned().collect();
+                let glossary = app.session.doc.glossary.iter().filter(|e| e.gallery == wordcraft_doc::QUICK_PARTS_GALLERY);
+                parts.extend(glossary.filter(|e| seen.insert(e.name.clone())).map(|e| e.name.clone()));
                 for name in parts {
                     if ui.button(&name).clicked() {
                         let _ = app.run("insert.quickParts", json!({"insert": name}));
@@ -871,7 +1460,7 @@ fn insert(app: &mut WordApp, ui: &mut Ui) {
             menu_button(ui, app, "wordArt", Some("WordArt"), "WordArt", false, "", |ui, app| {
                 crate::wordart_menus::style_gallery(ui, app, "insert.wordArt")
             });
-            small(ui, app, "dropCap", Some("Drop Cap"), "Drop Cap", "insert.dropCap", json!({}), false);
+            menu_button(ui, app, "dropCap", Some("Drop Cap"), "Drop Cap", false, "insert.dropCap", drop_cap_items);
         });
         stack(ui, |ui| {
             small(ui, app, "signature", None, "Signature Line", "insert.signatureLine", json!({}), false);
@@ -913,6 +1502,17 @@ fn insert(app: &mut WordApp, ui: &mut Ui) {
             mi(ui, app, "More Symbols…", "ui.dialog", json!({"name": "symbol"}));
         });
     });
+}
+
+/// Insert › Drop Cap's menu (#2601): None, Dropped and In margin (the current one checked),
+/// then the Drop Cap dialog.
+fn drop_cap_items(ui: &mut Ui, app: &mut WordApp) {
+    let current = wordcraft_engine::cmd::insert::drop_cap_state(&app.session).position;
+    for (label, v) in [("None", "none"), ("Dropped", "dropped"), ("In margin", "margin")] {
+        mi_check(ui, app, label, current == v, "insert.dropCap", json!({"position": v}));
+    }
+    ui.separator();
+    mi(ui, app, "Drop Cap Options…", "ui.dialog", json!({"name": "dropCap"}));
 }
 
 fn draw(app: &mut WordApp, ui: &mut Ui) {
@@ -1084,6 +1684,12 @@ fn design(app: &mut WordApp, ui: &mut Ui) {
                     ("Relaxed", "relaxed"),
                     ("Double", "double"),
                 ] {
+                    // "Open" here is roomy spacing, not the file verb: only a `spacing` row
+                    // translates it, else it stays English.
+                    if l == "Open" {
+                        mi_text(ui, app, crate::i18n::get("spacing", l).unwrap_or(l), "design.paragraphSpacing", json!({"value": v}));
+                        continue;
+                    }
                     mi(ui, app, l, "design.paragraphSpacing", json!({"value": v}));
                 }
             });
@@ -1109,6 +1715,51 @@ fn design(app: &mut WordApp, ui: &mut Ui) {
     });
 }
 
+// Layout › Margins, Orientation, Size and Columns: the caret section's setting has a check
+// mark, as Text Direction's does (#1206).
+fn margins_items(ui: &mut Ui, app: &mut WordApp) {
+    let current = wordcraft_engine::cmd::page::margins_preset_at(&app.session);
+    // The two uniform presets name their margin in the measurement unit (`2,54 cm`, #838).
+    for (l, k, uniform) in [
+        ("Normal  {size} all", "normal", Some(72.0)),
+        ("Narrow  {size} all", "narrow", Some(36.0)),
+        ("Moderate", "moderate", None),
+        ("Wide", "wide", None),
+        ("Mirrored", "mirrored", None),
+        ("Office 2003 Default", "office2003", None),
+    ] {
+        let label = match uniform {
+            Some(pt) => crate::i18n::fmt(tl!(l), &[("size", &crate::options::length(pt))]),
+            None => l.to_string(),
+        };
+        // Mirrored margins come from the document as well as from the preset (#1181).
+        let on = current == Some(k) || (k == "mirrored" && app.session.doc.settings.mirror_margins);
+        mi_check(ui, app, &label, on, "layout.margins", json!({"preset": k}));
+    }
+    mi(ui, app, "Custom Margins…", "ui.dialog", json!({"name": "pageSetup"}));
+}
+
+fn orientation_items(ui: &mut Ui, app: &mut WordApp) {
+    let land = wordcraft_engine::cmd::page::sect(&app.session).landscape;
+    mi_check(ui, app, "Portrait", !land, "layout.orientation", json!({"value": "portrait"}));
+    mi_check(ui, app, "Landscape", land, "layout.orientation", json!({"value": "landscape"}));
+}
+
+fn columns_items(ui: &mut Ui, app: &mut WordApp) {
+    let current = wordcraft_engine::cmd::page::columns_preset_at(&app.session);
+    for (l, k, params) in [
+        ("One", "one", json!({"count": 1})),
+        ("Two", "two", json!({"count": 2})),
+        ("Three", "three", json!({"count": 3})),
+        ("Left", "left", json!({"preset": "left"})),
+        ("Right", "right", json!({"preset": "right"})),
+    ] {
+        mi_check(ui, app, l, current == Some(k), "layout.columns", params);
+    }
+    ui.separator();
+    mi(ui, app, "More Columns…", "ui.dialog", json!({"name": "columns"}));
+}
+
 fn layout(app: &mut WordApp, ui: &mut Ui) {
     group(ui, "Page Setup", Some("layout.pageSetup"), app, |ui, app| {
         // Text Direction works on what the caret is in: table cells, a text box, else the section.
@@ -1121,38 +1772,10 @@ fn layout(app: &mut WordApp, ui: &mut Ui) {
                 mi_check(ui, app, label, dir == d, "layout.textDirection", json!({"value": d.ooxml()}));
             }
         });
-        menu_button(ui, app, "margins", Some("Margins"), "Margins", true, "layout.margins", |ui, app| {
-            for (l, k) in [
-                ("Normal  1\" all", "normal"),
-                ("Narrow  0.5\" all", "narrow"),
-                ("Moderate", "moderate"),
-                ("Wide", "wide"),
-                ("Mirrored", "mirrored"),
-                ("Office 2003 Default", "office2003"),
-            ] {
-                mi(ui, app, l, "layout.margins", json!({"preset": k}));
-            }
-            mi(ui, app, "Custom Margins…", "ui.dialog", json!({"name": "pageSetup"}));
-        });
-        menu_button(ui, app, "orientation", Some("Orientation"), "Orientation", true, "layout.orientation", |ui, app| {
-            mi(ui, app, "Portrait", "layout.orientation", json!({"value": "portrait"}));
-            mi(ui, app, "Landscape", "layout.orientation", json!({"value": "landscape"}));
-        });
-        menu_button(ui, app, "size", Some("Size"), "Size", true, "layout.size", |ui, app| {
-            for (n, w, h) in wordcraft_geom::PAPER_SIZES {
-                // In the measurement unit, written the region's way (`21 cm × 29,7 cm`, #838).
-                mi(ui, app, &format!("{n}   {} × {}", crate::options::length(*w), crate::options::length(*h)), "layout.size", json!({"name": n}));
-            }
-        });
-        menu_button(ui, app, "columns", Some("Columns"), "Columns", true, "layout.columns", |ui, app| {
-            mi(ui, app, "One", "layout.columns", json!({"count": 1}));
-            mi(ui, app, "Two", "layout.columns", json!({"count": 2}));
-            mi(ui, app, "Three", "layout.columns", json!({"count": 3}));
-            mi(ui, app, "Left", "layout.columns", json!({"preset": "left"}));
-            mi(ui, app, "Right", "layout.columns", json!({"preset": "right"}));
-            ui.separator();
-            mi(ui, app, "More Columns…", "ui.dialog", json!({"name": "columns"}));
-        });
+        menu_button(ui, app, "margins", Some("Margins"), "Margins", true, "layout.margins", margins_items);
+        menu_button(ui, app, "orientation", Some("Orientation"), "Orientation", true, "layout.orientation", orientation_items);
+        menu_button(ui, app, "size", Some("Size"), "Size", true, "layout.size", size_menu);
+        menu_button(ui, app, "columns", Some("Columns"), "Columns", true, "layout.columns", columns_items);
         stack(ui, |ui| {
             menu_button(ui, app, "breaks", Some("Breaks"), "Breaks", false, "layout.break", |ui, app| {
                 ui.label(egui::RichText::new(tl!("Page Breaks")).strong());
@@ -1241,7 +1864,7 @@ fn layout(app: &mut WordApp, ui: &mut Ui) {
             small(ui, app, "selectionPane", Some("Selection Pane"), "Selection Pane", "arrange.selectionPane", json!({}), false);
         });
         stack(ui, |ui| {
-            small(ui, app, "align", None, "Align", "arrange.align", json!({}), false);
+            align_menu(ui, app, None);
             group_menu(ui, app, None);
             rotate_menu(ui, app, None);
         });
@@ -1310,6 +1933,16 @@ fn group_menu(ui: &mut Ui, app: &mut WordApp, label: Option<&str>) {
     menu_button(ui, app, "group", label, "Group", false, "arrange.group", |ui, app| {
         mi(ui, app, "Group", "arrange.group", json!({}));
         mi(ui, app, "Ungroup", "arrange.ungroup", json!({}));
+    });
+}
+
+/// Arrange › Align: horizontal position relative to the margin (#3242 — a plain button ran
+/// `arrange.align` with no `value`, which always centers; a menu reaches Left and Right too).
+fn align_menu(ui: &mut Ui, app: &mut WordApp, label: Option<&str>) {
+    menu_button(ui, app, "align", label, "Align", false, "arrange.align", |ui, app| {
+        mi(ui, app, "Align Left", "arrange.align", json!({"value": "left"}));
+        mi(ui, app, "Align Center", "arrange.align", json!({"value": "center"}));
+        mi(ui, app, "Align Right", "arrange.align", json!({"value": "right"}));
     });
 }
 
@@ -1458,16 +2091,42 @@ fn mailings(app: &mut WordApp, ui: &mut Ui) {
         big(ui, app, "preview", "Preview\nResults", "mailings.preview", json!({}), false);
         stack(ui, |ui| {
             crate::widgets::row(ui, |ui| {
+                small(ui, app, "first", None, "First Record", "mailings.first", json!({}), false);
                 small(ui, app, "previous", None, "Previous Record", "mailings.previous", json!({}), false);
+                record_box(ui, app);
                 small(ui, app, "next", None, "Next Record", "mailings.next", json!({}), false);
+                small(ui, app, "last", None, "Last Record", "mailings.last", json!({}), false);
             });
             small(ui, app, "find", Some("Find Recipient"), "Find Recipient", "mailings.findRecipient", json!({}), false);
             small(ui, app, "checkErrors", Some("Check for Errors"), "Check for Errors", "mailings.checkErrors", json!({}), false);
         });
     });
     group(ui, "Finish", None, app, |ui, app| {
-        big(ui, app, "finish", "Finish &\nMerge", "mailings.finish", json!({}), false);
+        menu_button(ui, app, "finish", Some("Finish &\nMerge"), "Finish & Merge", true, "mailings.finish", |ui, app| {
+            mi(ui, app, "Edit Individual Documents…", "mailings.finish", json!({}));
+            mi(ui, app, "Print Documents…", "mailings.printDocuments", json!({}));
+        });
     });
+}
+
+/// Preview Results' record number: shows the previewed record; a number typed and Enter go there.
+fn record_box(ui: &mut Ui, app: &mut WordApp) {
+    let on = !app.session.merge.rows.is_empty();
+    let shown = if on { (app.session.merge.record + 1).to_string() } else { String::new() };
+    // The draft lives in temp memory while typing (frame-local text would lose keystrokes).
+    let key = egui::Id::new("merge_record_box");
+    let mut text = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| shown.clone());
+    let r = ui.add_enabled(on, egui::TextEdit::singleline(&mut text).desired_width(36.0).horizontal_align(egui::Align::Center));
+    let r = r.on_hover_text(tl!("Go to Record"));
+    if r.changed() {
+        ui.data_mut(|d| d.insert_temp(key, text.clone()));
+    }
+    if r.lost_focus() {
+        ui.data_mut(|d| d.remove::<String>(key));
+        if ui.input(|i| i.key_pressed(egui::Key::Enter)) && text.trim() != shown {
+            let _ = app.run("mailings.goToRecord", json!({"record": text.trim()}));
+        }
+    }
 }
 
 /// Zotero (`docs/zotero.md`): the Zotero desktop app does the work in its own window.
@@ -1538,12 +2197,16 @@ fn review(app: &mut WordApp, ui: &mut Ui) {
     });
     group(ui, "Changes", None, app, |ui, app| {
         menu_button(ui, app, "accept", Some("Accept"), "Accept", true, "review.accept", |ui, app| {
+            mi(ui, app, "Accept and Move to Next", "review.accept", json!({"next": true}));
             mi(ui, app, "Accept This Change", "review.accept", json!({}));
             mi(ui, app, "Accept All Changes", "review.acceptAll", json!({}));
+            mi(ui, app, "Accept All Changes and Stop Tracking", "review.acceptAll", json!({"stopTracking": true}));
         });
         menu_button(ui, app, "reject", Some("Reject"), "Reject", true, "review.reject", |ui, app| {
+            mi(ui, app, "Reject and Move to Next", "review.reject", json!({"next": true}));
             mi(ui, app, "Reject Change", "review.reject", json!({}));
             mi(ui, app, "Reject All Changes", "review.rejectAll", json!({}));
+            mi(ui, app, "Reject All Changes and Stop Tracking", "review.rejectAll", json!({"stopTracking": true}));
         });
         stack(ui, |ui| {
             small(ui, app, "prevChange", Some("Previous"), "Previous Change", "review.previousChange", json!({}), false);
@@ -1662,7 +2325,7 @@ fn view(app: &mut WordApp, ui: &mut Ui) {
         menu_button(ui, app, "interfaceTheme", Some("Interface\nTheme"), "Interface Theme", true, "", |ui, app| {
             for a in crate::theme::Appearance::ALL {
                 if ui.add(egui::Button::selectable(app.ui.theme == a, tl!(a.label())).min_size(vec2(200.0, 0.0))).clicked() {
-                    let _ = app.run("ui.theme", json!({"value": a.code()}));
+                    let _ = app.run("view.interfaceTheme", json!({"value": a.code()}));
                     ui.close();
                 }
             }
@@ -1672,6 +2335,13 @@ fn view(app: &mut WordApp, ui: &mut Ui) {
         big(ui, app, "newWindow", "New\nWindow", "view.newWindow", json!({}), false);
         big(ui, app, "arrangeAll", "Arrange\nAll", "view.arrangeAll", json!({}), false);
         big(ui, app, "split", "Split", "view.split", json!({}), false);
+        // The Full Screen button carries its name for assistive technology (and for the
+        // regression test that clicks it): big buttons are otherwise drawn unlabeled. Its
+        // enabled state is the command's own, as every other ribbon control reports: the
+        // browser has no full screen to ask for, and says so (#662).
+        let on = crate::widgets::enabled(app, "view.fullScreen");
+        let resp = big_toggle(ui, app, "fullScreen", "Full\nScreen", "view.fullScreen", v.full_screen);
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, on, v.full_screen, "Full Screen"));
     });
     group(ui, "Macros", None, app, |ui, app| {
         big(ui, app, "macros", "Macros", "tools.macros", json!({}), false);
@@ -1694,7 +2364,7 @@ fn outlining(app: &mut WordApp, ui: &mut Ui) {
                 small(ui, app, "outlineTop", None, "Promote to Heading 1", "outline.promoteToHeading1", json!({}), false);
                 small(ui, app, "outlinePromote", None, "Promote", "outline.promote", json!({}), false);
                 let levels: Vec<String> = (1..=BODY).map(name).collect();
-                if let Some(v) = combo(ui, "outlineLevel", 100.0, &name(level), &levels, None)
+                if let Some(v) = crate::widgets::combo_hint(ui, "outlineLevel", 100.0, &name(level), &levels, None, tl!("Outline Level"))
                     && let Some(i) = levels.iter().position(|x| *x == v)
                 {
                     let l = if i + 1 >= usize::from(BODY) { json!("body") } else { json!(i + 1) };
@@ -1714,7 +2384,7 @@ fn outlining(app: &mut WordApp, ui: &mut Ui) {
                 let mut shown: Vec<String> = vec![tl!("All Levels").to_string()];
                 shown.extend((1..BODY).map(name));
                 let current = shown.get(usize::from(o.show_level)).cloned().unwrap_or_default();
-                if let Some(v) = combo(ui, "outlineShowLevel", 90.0, &current, &shown, None)
+                if let Some(v) = crate::widgets::combo_hint(ui, "outlineShowLevel", 90.0, &current, &shown, None, tl!("Show Level"))
                     && let Some(i) = shown.iter().position(|x| *x == v)
                 {
                     let l = if i == 0 { json!("all") } else { json!(i) };
@@ -1807,6 +2477,7 @@ fn smart_art_design(app: &mut WordApp, ui: &mut Ui) {
     group(ui, "Reset", None, app, |ui, app| {
         big(ui, app, "resetGraphic", "Reset\nGraphic", "smartArt.reset", json!({}), false);
     });
+    graphic_size(ui, app);
 }
 
 /// Chart Design: the selected chart's elements (title, legend, data labels), its data and type,
@@ -1841,6 +2512,11 @@ fn chart_design(app: &mut WordApp, ui: &mut Ui) {
     group(ui, "Type", None, app, |ui, app| {
         big(ui, app, "changeChartType", "Change\nChart Type", "chart.type", json!({}), false);
     });
+    graphic_size(ui, app);
+}
+
+/// Chart Design and SmartArt Design › Size: the selected graphic's height and width.
+fn graphic_size(ui: &mut Ui, app: &mut WordApp) {
     group(ui, "Size", None, app, |ui, app| {
         let (w0, h0) =
             wordcraft_engine::cmd::objects::selected(&app.session).and_then(|(_, o)| o.frame().map(|(w, h, _)| (w, h))).unwrap_or((0.0, 0.0));
@@ -1849,8 +2525,10 @@ fn chart_design(app: &mut WordApp, ui: &mut Ui) {
                 crate::widgets::row(ui, |ui| {
                     ui.label(egui::RichText::new(tl!(label)).small());
                     let mut v = v0;
-                    let r = ui.add(egui::DragValue::new(&mut v).speed(1.0).range(36.0..=2000.0).suffix(" pt"));
-                    if r.changed() {
+                    // The range bounds what is typed or dragged; a size outside it is shown as it
+                    // is (clamped, egui would report a change and resize the graphic unasked).
+                    let r = ui.add(egui::DragValue::new(&mut v).speed(1.0).range(36.0..=2000.0).clamp_existing_to_range(false).suffix(" pt"));
+                    if r.changed() && v != v0 {
                         if r.dragged() && !r.drag_started() {
                             app.session.join_next_undo();
                         }
@@ -1862,11 +2540,52 @@ fn chart_design(app: &mut WordApp, ui: &mut Ui) {
     });
 }
 
+/// Shape Fill › Gradient: No Gradient, Light and Dark Variations of the shape's colour, More
+/// Gradients… (the Format Shape pane).
+pub(crate) fn gradient_menu(ui: &mut Ui, app: &mut WordApp, fill: Option<&wordcraft_doc::fill::Fill>) {
+    use wordcraft_engine::cmd::shape_fill;
+    let pos = wordcraft_engine::cmd::objects::selected(&app.session).map(|(p, _)| p);
+    let main = match (fill, &pos) {
+        (Some(f), Some(p)) => crate::format_shape::variation_base(ui.ctx(), p, f),
+        (Some(f), None) => f.main_color(),
+        _ => app.session.doc.settings.theme_colors.get(4).copied().unwrap_or(wordcraft_doc::Rgb(68, 114, 196)),
+    };
+    // No Gradient: the shape's colour, solid.
+    ui.label(egui::RichText::new(tl!("No Gradient")).small().weak());
+    if crate::format_shape::swatch(ui, &wordcraft_doc::fill::Fill::solid(main), "No Gradient") {
+        let _ = app.run("shape.fill", json!({"color": main.hex()}));
+        ui.close();
+    }
+    for (title, tiles) in ["Light Variations", "Dark Variations"].into_iter().zip(shape_fill::variations(main)) {
+        ui.label(egui::RichText::new(tl!(title)).small().weak());
+        egui::Grid::new(title).spacing(vec2(4.0, 4.0)).show(ui, |ui| {
+            for (i, (f, name)) in tiles.iter().enumerate() {
+                if crate::format_shape::swatch(ui, f, name) {
+                    let _ = app.run("shape.fill", shape_fill::params(Some(f)));
+                    if let (Some(p), Some(Some(now))) = (pos.clone(), crate::format_shape::current(app)) {
+                        crate::format_shape::remember_variation(ui.ctx(), p, now, main);
+                    }
+                    ui.close();
+                }
+                if i % 5 == 4 {
+                    ui.end_row();
+                }
+            }
+        });
+    }
+    ui.separator();
+    if ui.button(tl!("More Gradients…")).clicked() {
+        let _ = app.run("view.formatShapePane", json!({"value": true}));
+        ui.close();
+    }
+}
+
 /// Shape Format: fill, outline and effects of the selected shape, and its arrangement.
 fn shape_format(app: &mut WordApp, ui: &mut Ui) {
-    let (stroke, glow_size) = match wordcraft_engine::cmd::objects::selected(&app.session) {
-        Some((_, wordcraft_doc::para::InlineObject::Shape { stroke, effects, .. })) => (stroke, effects.glow.map(|g| g.size)),
-        _ => (None, None),
+    let (stroke, glow_size, fill) = match wordcraft_engine::cmd::objects::selected(&app.session) {
+        Some((_, wordcraft_doc::para::InlineObject::Shape { stroke, effects, fill, .. })) => (stroke, effects.glow.map(|g| g.size), fill),
+        Some((_, o)) => (None, None, o.canvas_style().and_then(|c| c.fill.clone())),
+        _ => (None, None, None),
     };
     let theme = app.session.doc.settings.theme_colors.clone();
     group(ui, "Shape Styles", None, app, |ui, app| {
@@ -1874,6 +2593,8 @@ fn shape_format(app: &mut WordApp, ui: &mut Ui) {
             menu_button(ui, app, "shading", Some("Shape Fill"), "Shape Fill", false, "shape.fill", |ui, app| {
                 mi(ui, app, "No Color", "shape.fill", json!({"color": null}));
                 crate::colors::menu(ui, app, &theme, Target::cmd("shape.fill"));
+                ui.separator();
+                ui.menu_button(tl!("Gradient"), |ui| gradient_menu(ui, app, fill.as_ref()));
             });
             menu_button(ui, app, "pen", Some("Shape Outline"), "Shape Outline", false, "shape.outline", |ui, app| {
                 mi(ui, app, "No Color", "shape.outline", json!({"color": null}));
@@ -1926,7 +2647,7 @@ fn shape_format(app: &mut WordApp, ui: &mut Ui) {
         wrap_menu(ui, app);
         stack(ui, |ui| {
             rotate_menu(ui, app, Some("Rotate"));
-            small(ui, app, "align", Some("Align"), "Align", "arrange.align", json!({}), false);
+            align_menu(ui, app, Some("Align"));
         });
     });
     group(ui, "Size", None, app, |ui, app| {
@@ -1937,8 +2658,10 @@ fn shape_format(app: &mut WordApp, ui: &mut Ui) {
                 for (label, key, v0) in [("W:", "width", w0), ("H:", "height", h0)] {
                     ui.label(egui::RichText::new(tl!(label)).small());
                     let mut v = v0;
-                    let r = ui.add(egui::DragValue::new(&mut v).speed(1.0).range(4.0..=2000.0).suffix(" pt"));
-                    if r.changed() {
+                    // `picture.size`'s own range; a size outside it (a thin line) is shown as it
+                    // is (clamped, egui would report a change and resize the shape unasked).
+                    let r = ui.add(egui::DragValue::new(&mut v).speed(1.0).range(1.0..=4000.0).clamp_existing_to_range(false).suffix(" pt"));
+                    if r.changed() && v != v0 {
                         if r.dragged() && !r.drag_started() {
                             app.session.join_next_undo();
                         }
@@ -2051,6 +2774,25 @@ fn picture_format(app: &mut WordApp, ui: &mut Ui) {
             for v in [0.0, 15.0, 30.0, 50.0, 65.0, 80.0, 95.0] {
                 mi(ui, app, &format!("{v:.0}%"), "picture.transparency", json!({"percent": v}));
             }
+            ui.separator();
+            // An exact value, dragged with a live preview: absolute from the original
+            // pixels, one undo step for the whole drag (same pattern as Size › W/H).
+            // The current value isn't stored anywhere, so the slider reopens where it
+            // was last left for this picture.
+            let (media, off) = match wordcraft_engine::cmd::objects::selected(&app.session) {
+                Some((pos, wordcraft_doc::para::InlineObject::Image { media, .. })) => (media, pos.off),
+                _ => (String::new(), 0),
+            };
+            let key = egui::Id::new(("picture_transparency", media, off));
+            let mut v = ui.data(|d| d.get_temp::<f64>(key)).unwrap_or(0.0);
+            let r = ui.add(egui::DragValue::new(&mut v).speed(1.0).range(0.0..=100.0).suffix("%"));
+            if r.changed() {
+                ui.data_mut(|d| d.insert_temp(key, v));
+                if r.dragged() && !r.drag_started() {
+                    app.session.join_next_undo();
+                }
+                let _ = app.run("picture.transparency", json!({"percent": v}));
+            }
         });
         stack(ui, |ui| {
             small(ui, app, "picture", Some("Change"), "Change Picture", "ui.changePicture", json!({}), false);
@@ -2081,50 +2823,68 @@ fn picture_format(app: &mut WordApp, ui: &mut Ui) {
         wrap_menu(ui, app);
         stack(ui, |ui| {
             rotate_menu(ui, app, Some("Rotate"));
-            small(ui, app, "align", Some("Align"), "Align", "arrange.align", json!({}), false);
+            align_menu(ui, app, Some("Align"));
             group_menu(ui, app, Some("Group"));
         });
     });
-    group(ui, "Size", None, app, |ui, app| {
+    // The launcher opens the Size dialog: scale, Lock aspect ratio, the original size (#2573).
+    group(ui, "Size", Some("picture.size"), app, |ui, app| {
         let (media, off, w0, h0, crop0, alt0) = match wordcraft_engine::cmd::objects::selected(&app.session) {
             Some((pos, wordcraft_doc::para::InlineObject::Image { media, w, h, alt, crop, .. })) => (media, pos.off, w, h, crop, alt),
             _ => (String::new(), 0, 0.0, 0.0, [0.0; 4], String::new()),
         };
         // `picture.size` locks the aspect ratio unless told otherwise, so one dimension suffices.
+        // The fields show the interface unit and take a size typed in any unit, pixels too
+        // (`300 px`, #1901), applied once typed (Enter, Tab or a click elsewhere; Esc cancels),
+        // never per keystroke; a drag applies as it goes, one undo step.
+        let unit = crate::options::unit();
+        let k = unit.pt_per_unit();
         stack(ui, |ui| {
             crate::widgets::row(ui, |ui| {
-                ui.label(egui::RichText::new(tl!("W:")).small());
-                let mut w = w0;
-                let r = ui.add(egui::DragValue::new(&mut w).speed(1.0).range(4.0..=2000.0).suffix(format!(" {}", tl!("pt"))));
-                if r.changed() {
-                    if r.dragged() && !r.drag_started() {
-                        app.session.join_next_undo();
+                for (label, key, pt) in [("W:", "width", w0), ("H:", "height", h0)] {
+                    let name = ui.label(egui::RichText::new(tl!(label)).small());
+                    let was = pt / k;
+                    let mut v = was;
+                    // Not `clamp_existing_to_range`: egui would clamp a size outside the range (a 1 px
+                    // picture is 0.75 pt) and report it as a change, resizing the picture unasked.
+                    let field = egui::DragValue::new(&mut v)
+                        .speed(1.0 / k)
+                        .range(1.0 / k..=4000.0 / k)
+                        .clamp_existing_to_range(false)
+                        .measure(unit)
+                        .max_decimals(2);
+                    let r = ui.add(field.update_while_editing(false)).labelled_by(name.id).on_hover_text(tl!(
+                        "Type a size in any unit, such as 5 cm or 300 px. The other side follows, so the picture keeps its proportions."
+                    ));
+                    // While typing, the field reports each keystroke as a change; only a new
+                    // value (Enter, Tab, a click elsewhere, a drag) resizes, and Esc cancels.
+                    let cancelled = esc_cancelled(ui, &r, egui::Id::new(("picture_size_field", key)));
+                    if r.changed() && v != was && !cancelled {
+                        if r.dragged() && !r.drag_started() {
+                            app.session.join_next_undo();
+                        }
+                        let _ = app.run("picture.size", json!({key: v * k}));
                     }
-                    let _ = app.run("picture.size", json!({"width": w}));
-                }
-                ui.label(egui::RichText::new(tl!("H:")).small());
-                let mut h = h0;
-                let r = ui.add(egui::DragValue::new(&mut h).speed(1.0).range(4.0..=2000.0).suffix(format!(" {}", tl!("pt"))));
-                if r.changed() {
-                    if r.dragged() && !r.drag_started() {
-                        app.session.join_next_undo();
-                    }
-                    let _ = app.run("picture.size", json!({"height": h}));
                 }
                 rotation_field(ui, app);
             });
             ui.add_space(2.0);
             crate::widgets::row(ui, |ui| {
+                let cropping = crate::crop::active(app).is_some();
+                small(ui, app, "crop", Some("Crop"), "Crop", "ui.crop", json!({}), cropping);
                 for (i, side) in ["L", "T", "R", "B"].iter().enumerate() {
                     ui.label(egui::RichText::new(tl!(side)).small());
                     let mut v = crop0[i] * 100.0;
-                    let r = ui.add(egui::DragValue::new(&mut v).speed(0.5).range(0.0..=45.0).suffix("%"));
+                    let r = ui.add(egui::DragValue::new(&mut v).speed(0.5).range(0.0..=95.0).suffix("%"));
                     if r.changed() {
                         if r.dragged() && !r.drag_started() {
                             app.session.join_next_undo();
                         }
                         let mut c = crop0;
-                        c[i] = (v / 100.0).clamp(0.0, 0.45);
+                        c[i] = (v / 100.0).clamp(0.0, 0.95);
+                        // The two sides of an axis keep 5% of the source between them.
+                        let other = c[if i < 2 { i + 2 } else { i - 2 }];
+                        c[i] = c[i].min((0.95 - other).max(0.0));
                         let _ = app.run("picture.crop", json!({"left": c[0], "top": c[1], "right": c[2], "bottom": c[3]}));
                     }
                 }
@@ -2399,6 +3159,18 @@ mod tests {
     use super::*;
     use wordcraft_engine::Session;
 
+    /// Two clicks arm and disarm the painter; the double-click handling then leaves it sticky (#2785).
+    #[test]
+    fn double_click_on_format_painter_makes_it_sticky() {
+        let mut app = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Text")), crate::Services::default());
+        app.run("edit.formatPainter", json!({})).unwrap();
+        assert!(matches!(app.session.painter, Some((_, _, false))), "one click arms it for one use");
+        app.run("edit.formatPainter", json!({})).unwrap();
+        assert!(app.session.painter.is_none(), "the second click of a double-click turns it off");
+        painter_double_click(&mut app);
+        assert!(matches!(app.session.painter, Some((_, _, true))), "the double-click leaves it sticky");
+    }
+
     fn png_data() -> String {
         let img = image::RgbaImage::from_fn(20, 10, |x, y| {
             if x > 2 && x < 17 && y > 2 && y < 7 { image::Rgba([200, 30, 30, 255]) } else { image::Rgba([255, 255, 255, 255]) }
@@ -2428,6 +3200,60 @@ mod tests {
         assert!(next_x >= gallery.right() + 8.0 - 0.01, "{next_x} {gallery:?}");
     }
 
+    /// #2738: Home › Underline's drop-down: every line sample is a named entry (assistive
+    /// technology, tooltips) that applies its own style; Words only, None and Underline Color ›
+    /// Automatic do what they say.
+    #[test]
+    fn underline_menu_entries_apply_their_style() {
+        use egui_kittest::kittest::Queryable;
+        use wordcraft_doc::props::Underline;
+        let mut a = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Lanterns")), crate::Services::default());
+        a.run("select.all", json!({})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(400.0, 700.0)).build_ui_state(|ui, app: &mut WordApp| underline_menu(ui, app), a);
+        h.run_steps(2);
+        let run =
+            |h: &egui_kittest::Harness<'_, WordApp>| h.state().session.doc.para_at(&wordcraft_doc::Pos::body(0, 0)).unwrap().runs[0].props.clone();
+        for (_, name) in UNDERLINE_STYLES {
+            assert!(h.query_by_label(name).is_some(), "{name} is a named entry");
+        }
+        // Entries made with `mi` carry their shortcut text in their label (Words only: Ctrl+Shift+W).
+        for (name, want) in
+            [("Double", Underline::Double), ("Dot-dot-dash", Underline::DotDotDash), ("Wave", Underline::Wave), ("Words only", Underline::Words)]
+        {
+            h.get_by_label_contains(name).click();
+            h.run_steps(2);
+            assert_eq!(run(&h).underline, Some(want), "{name}");
+        }
+        h.get_by_label("None").click();
+        h.run_steps(2);
+        assert_eq!(run(&h).underline, Some(Underline::None));
+        h.get_by_label("Double").click();
+        h.run_steps(2);
+        // The submenu opens on a click once the pointer is on it.
+        let open_colors = |h: &mut egui_kittest::Harness<'_, WordApp>| {
+            h.get_by_label("Underline Color").hover();
+            h.run();
+            h.get_by_label("Underline Color").click();
+            h.run();
+        };
+        open_colors(&mut h);
+        // Standard Colors' first swatch (C00000) sits just under its heading; swatches have no label.
+        let heading = h.get_by_label("Standard Colors").rect();
+        let at = egui::pos2(heading.left() + 7.0, heading.bottom() + 10.0);
+        h.event(egui::Event::PointerMoved(at));
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        h.step();
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+        h.run_steps(3);
+        assert_eq!(run(&h).underline_color, wordcraft_doc::Rgb::parse("C00000"));
+        assert_eq!(run(&h).underline, Some(Underline::Double), "a colour keeps the style");
+        open_colors(&mut h);
+        h.get_by_label_contains("Automatic").click();
+        h.run_steps(2);
+        assert_eq!(run(&h).underline_color, None);
+        assert_eq!(run(&h).underline, Some(Underline::Double));
+    }
+
     /// #658: menu buttons grey out (and don't open) while the command their menu is about is
     /// disabled: the Table Layout menus outside a table; menus with no command stay on.
     #[test]
@@ -2445,12 +3271,132 @@ mod tests {
         }
     }
 
+    /// #1206: Margins, Orientation, Size and Columns mark the caret section's setting, as Word
+    /// does. Every value differs from a new document's, so a default can't satisfy it.
+    #[test]
+    fn page_setup_menus_mark_the_current_setting() {
+        use egui_kittest::kittest::{By, NodeT, Queryable};
+        let mut app = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Text")), crate::Services::default());
+        app.run("layout.margins", json!({"preset": "narrow"})).unwrap();
+        app.run("layout.orientation", json!({"value": "landscape"})).unwrap();
+        app.run("layout.size", json!({"name": "A4"})).unwrap();
+        app.run("layout.columns", json!({"preset": "right"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(400.0, 1200.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                margins_items(ui, app);
+                orientation_items(ui, app);
+                size_menu(ui, app);
+                columns_items(ui, app);
+            },
+            app,
+        );
+        h.run_steps(2);
+        let checked: Vec<String> = h
+            .query_all(By::new().predicate(|n| n.toggled() == Some(egui::accesskit::Toggled::True)))
+            .filter_map(|n| n.accesskit_node().label())
+            .collect();
+        let first_words: Vec<&str> = checked.iter().filter_map(|l| l.trim_start_matches('✓').split_whitespace().next()).collect();
+        assert_eq!(first_words, ["Narrow", "Landscape", "A4", "Right"], "{checked:?}");
+    }
+
+    /// #860 review: a tag the language list doesn't have shows by language and region, not as
+    /// the tag; Portuguese (Angola) isn't Brazil's, and no name shows twice in the menu.
+    #[test]
+    fn other_regions_show_by_name_once() {
+        assert_eq!(language_name(Some("fr-CA")), "French (Canada)");
+        assert_eq!(language_name(Some("en-AU")), "English (Australia)");
+        assert_eq!(language_name(Some("de_AT")), "German (Austria)");
+        assert_eq!(language_name(Some("pt-AO")), "Portuguese (Angola)");
+        assert_eq!(language_name(Some("sr-Latn-BA")), "Serbian (Bosnia and Herzegovina)");
+        assert_eq!(language_name(Some("en-ZZ")), "English (ZZ)");
+        assert_eq!(language_name(Some("xx-YY")), "xx-YY");
+        let exact = |cur: &'static str| move |t: &str| t.eq_ignore_ascii_case(cur);
+        for tag in ["fr-CA", "pt-AO", "en-SG"] {
+            let c = language_checks(tag, exact(tag));
+            let name = c.extra.expect("shown above the list");
+            assert!(!PROOFING_LANGUAGES.iter().any(|(_, n)| *n == name), "{name} is listed once");
+            assert!(!c.listed.contains(&true), "{tag}: nothing in the list checked");
+        }
+        // A tag named like a list entry checks that entry instead of showing it again.
+        let c = language_checks("PT-br-x-test", |_| false);
+        assert_eq!(c.extra, None);
+        assert_eq!(c.listed, PROOFING_LANGUAGES.map(|(t, _)| t == "pt-BR"));
+    }
+
+    /// The Englishes WordCraft proofs differently are in the menu, checked by their tags, and
+    /// every English region has a name (#1281, #1045).
+    #[test]
+    fn english_dialects_are_in_the_language_menu() {
+        for (tag, name) in [
+            ("en-US", "English (United States)"),
+            ("en-GB", "English (United Kingdom)"),
+            ("en-AU", "English (Australia)"),
+            ("en-CA", "English (Canada)"),
+        ] {
+            assert!(PROOFING_LANGUAGES.contains(&(tag, name)), "{tag}");
+            assert_eq!(language_name(Some(tag)), name);
+            let c = language_checks(&tag.to_ascii_lowercase(), |t| t.eq_ignore_ascii_case(tag));
+            assert_eq!((c.extra, c.listed), (None, PROOFING_LANGUAGES.map(|(t, _)| t == tag)), "{tag}");
+        }
+        for (tag, name) in
+            [("en-NZ", "English (New Zealand)"), ("en-IE", "English (Ireland)"), ("en-ZA", "English (South Africa)"), ("en-IN", "English (India)")]
+        {
+            assert!(crate::dialogs_layout::LANGUAGES.contains(&(tag, name)), "{tag}");
+            assert_eq!(language_name(Some(tag)), name);
+        }
+        assert_eq!(language_name(Some("en-SG")), "English (Singapore)");
+    }
+
+    #[test]
+    fn indonesian_has_a_name_in_the_language_menu() {
+        assert!(PROOFING_LANGUAGES.contains(&("id-ID", "Indonesian")));
+        for tag in ["id", "id-ID", "ID-id", "ind", "in"] {
+            assert_eq!(language_name(Some(tag)), "Indonesian", "{tag}");
+        }
+    }
+
+    /// #3360, #3553: the Spanishes WordCraft proofs are in the menu, checked by their tags; other
+    /// Spanish regions show by name, and a bare `es` is Spain's.
+    #[test]
+    fn spanish_varieties_are_in_the_language_menu() {
+        for (tag, name) in
+            [("es-ES", "Spanish (Spain)"), ("es-MX", "Spanish (Mexico)"), ("es-419", "Spanish (Latin America)"), ("es-UY", "Spanish (Uruguay)")]
+        {
+            assert!(PROOFING_LANGUAGES.contains(&(tag, name)), "{tag}");
+            assert!(crate::dialogs_layout::LANGUAGES.contains(&(tag, name)), "{tag}");
+            assert_eq!(language_name(Some(tag)), name);
+            let c = language_checks(&tag.to_ascii_lowercase(), |t| t.eq_ignore_ascii_case(tag));
+            assert_eq!((c.extra, c.listed), (None, PROOFING_LANGUAGES.map(|(t, _)| t == tag)), "{tag}");
+        }
+        assert_eq!(language_name(Some("es")), "Spanish (Spain)");
+        assert_eq!(language_name(Some("es-AR")), "Spanish (Argentina)");
+        let c = language_checks("es-AR", |t| t.eq_ignore_ascii_case("es-AR"));
+        assert_eq!(c.extra.as_deref(), Some("Spanish (Argentina)"));
+        assert!(!c.listed.contains(&true));
+    }
+
+    #[test]
+    fn czech_has_a_name_in_the_language_menu() {
+        assert!(PROOFING_LANGUAGES.contains(&("cs-CZ", "Czech")));
+        for tag in ["cs", "cs-CZ", "CS-cz", "ces", "CZE"] {
+            assert_eq!(language_name(Some(tag)), "Czech", "{tag}");
+        }
+    }
+
     #[test]
     fn portuguese_has_a_name_in_the_language_menu() {
         assert!(PROOFING_LANGUAGES.iter().any(|(t, _)| *t == "pt-BR"));
         assert_eq!(language_name(Some("pt-BR")), "Portuguese (Brazil)");
         assert_eq!(language_name(Some("pt")), "Portuguese (Brazil)");
         assert_eq!(language_name(Some("PT-BR".to_string().as_str())), "Portuguese (Brazil)");
+    }
+
+    #[test]
+    fn turkish_has_a_name_in_the_language_menu() {
+        assert!(PROOFING_LANGUAGES.iter().any(|(t, _)| *t == "tr-TR"));
+        assert_eq!(language_name(Some("tr-TR")), "Turkish");
+        assert_eq!(language_name(Some("tr")), "Turkish");
+        assert_eq!(language_name(Some("TR-TR")), "Turkish");
     }
 
     #[test]
@@ -2557,6 +3503,200 @@ mod tests {
         assert!(tall.is_empty(), "groups taller than the ribbon: {tall:#?}");
     }
 
+    /// #897: the tabs that didn't fit were drawn under Comments / Editing / Share, so at 1280 pt
+    /// in Polish the table tabs were out of reach. They stay on the strip and a click opens them.
+    #[test]
+    fn table_tabs_stay_clickable_when_the_tab_strip_overflows() {
+        if !crate::i18n::catalogs_embedded() {
+            return;
+        }
+        use egui_kittest::kittest::Queryable;
+        let mut app = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Text")), crate::Services::default());
+        app.run("insert.table", json!({"rows": 3, "cols": 3})).unwrap();
+        app.run("ui.language", json!({"value": "pl"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1280.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let buttons = [tl!("Comments"), tl!("Editing")].map(|b| h.get_by_label(b).rect());
+        for tab in ["Table Design", "Table Layout"] {
+            let r = h.get_by_label(tl!(tab)).rect();
+            assert!(r.right() <= 1280.0 && buttons.iter().all(|b| !b.intersects(r)), "{tab} {r:?} under {buttons:?}");
+            h.get_by_label(tl!(tab)).click();
+            h.run_steps(2);
+            assert_eq!(h.state().ui.tab, tab);
+        }
+    }
+
+    /// #2026: at every width and in the longest languages no tab is drawn over Comments /
+    /// Editing / Share, the tabs stay inside the window, and the buttons keep their room.
+    #[test]
+    fn tab_strip_never_overlaps_the_right_buttons() {
+        if !crate::i18n::catalogs_embedded() {
+            return;
+        }
+        use egui_kittest::kittest::Queryable;
+        for lang in ["en", "pl", "de"] {
+            for width in [300.0, 420.0, 520.0, 640.0, 765.0, 1280.0] {
+                let mut app = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Text")), crate::Services::default());
+                app.run("insert.table", json!({"rows": 3, "cols": 3})).unwrap();
+                app.run("ui.language", json!({"value": lang})).unwrap();
+                app.run("ui.tab", json!({"tab": "Table Layout"})).unwrap();
+                let mut h = egui_kittest::Harness::builder().with_size(vec2(width, 600.0)).build_ui_state(
+                    |ui, app: &mut WordApp| {
+                        let ctx = ui.ctx().clone();
+                        app.logic(&ctx);
+                        app.ui(ui);
+                    },
+                    app,
+                );
+                h.run_steps(3);
+                let buttons: Vec<Rect> =
+                    [tl!("Comments"), tl!("Editing"), tl!("Share")].iter().filter_map(|b| h.query_by_label(b).map(|n| n.rect())).collect();
+                assert_eq!(buttons.len(), 3, "{lang} {width}: the three buttons are on the strip");
+                assert!(buttons.iter().all(|b| b.right() <= width + 0.5 && b.left() >= 0.0), "{lang} {width}: buttons inside {buttons:?}");
+                for tab in crate::ribbon::TABS.iter().copied().chain(["Table Design", "Table Layout"]) {
+                    // A group folded into a button can share the tab's name (Draw): only the node on
+                    // the strip is the tab.
+                    let Some(r) = h.query_all_by_label(tl!(tab)).map(|n| n.rect()).find(|r| r.top() <= 40.0) else { continue };
+                    assert!(r.right() <= width + 0.5, "{lang} {width}: {tab} {r:?} past the window");
+                    assert!(buttons.iter().all(|b| !b.intersects(r)), "{lang} {width}: {tab} {r:?} under {buttons:?}");
+                }
+                assert!(h.query_by_label(tl!("File")).is_some(), "{lang} {width}: File stays on the strip");
+            }
+        }
+    }
+
+    #[test]
+    fn plan_strip_gives_way_in_order() {
+        let spec = |text_w, file, active, contextual| TabSpec { text_w, file, active, contextual };
+        let tabs = [spec(20.0, true, false, false), spec(30.0, false, true, false), spec(30.0, false, false, false), spec(40.0, false, false, true)];
+        let buttons = [200.0, 150.0, 60.0];
+        // Plenty of room: nothing gives way.
+        let p = plan_strip(&tabs, buttons, 600.0, 26.0);
+        assert_eq!((p.pad, p.buttons, p.fits.iter().all(|f| *f)), (18.0, 0, true));
+        // Tighter: the padding goes first, then the Comments / Editing labels, then Share's.
+        let p = plan_strip(&tabs, buttons, 380.0, 26.0);
+        assert_eq!((p.pad, p.buttons), (10.0, 0));
+        let p = plan_strip(&tabs, buttons, 330.0, 26.0);
+        assert_eq!((p.pad, p.buttons), (10.0, 1));
+        let p = plan_strip(&tabs, buttons, 240.0, 26.0);
+        assert_eq!((p.pad, p.buttons), (10.0, 2));
+        // Then the plain tab goes into »; File, the active and the contextual tab stay.
+        let p = plan_strip(&tabs, buttons, 215.0, 26.0);
+        assert_eq!(p.fits, [true, true, false, true]);
+        // Then the labels of the active and contextual tabs are cut down.
+        let p = plan_strip(&tabs, buttons, 208.0, 26.0);
+        assert_eq!(p.fits, [true, true, false, true]);
+        assert!(p.widths[3] < 52.0 && p.widths[3] >= MIN_TAB_W - 0.01, "{:?}", p.widths);
+        // No room for that either: the contextual one goes into », the active one last.
+        let p = plan_strip(&tabs, buttons, 190.0, 26.0);
+        assert_eq!(p.fits, [true, true, false, false]);
+        let p = plan_strip(&tabs, buttons, 140.0, 26.0);
+        assert_eq!(p.fits, [true, false, false, false]);
+        // The buttons' room is never taken, and hostile numbers don't panic.
+        for avail in [0.0, -5.0, f32::NAN, f32::INFINITY] {
+            let _ = plan_strip(&tabs, buttons, avail, 26.0);
+        }
+        let _ = plan_strip(&[], buttons, 100.0, 26.0);
+        let _ = plan_strip(&[spec(f32::NAN, false, true, false)], [f32::NAN; 3], 100.0, f32::NAN);
+    }
+
+    /// #1110: the strip's drawn buttons have names for screen readers: Share, and the "»" that
+    /// holds the tabs that don't fit ("More tabs", not a glyph).
+    #[test]
+    fn the_tab_strip_buttons_have_names() {
+        use egui_kittest::kittest::Queryable;
+        let app = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Text")), crate::Services::default());
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(760.0, 700.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, tl!("Share"));
+        let more = h.get_by_role_and_label(egui::accesskit::Role::Button, tl!("More tabs"));
+        more.click();
+        h.run_steps(2);
+        // The menu lists a tab that didn't fit (View is among the last on a narrow strip).
+        assert!(h.query_by_label(tl!("View")).is_some(), "the » menu lists the tabs left out");
+    }
+
+    #[test]
+    fn fit_tabs_keeps_the_kept_tabs_and_drops_from_the_end() {
+        let tabs = [(40.0, true), (50.0, false), (50.0, false), (50.0, false), (60.0, true)];
+        assert_eq!(fit_tabs(&tabs, 250.0, 20.0), [true; 5]);
+        // 250 doesn't fit 240 with room for »: the last plain tabs give way, the kept ones stay.
+        assert_eq!(fit_tabs(&tabs, 240.0, 20.0), [true, true, true, false, true]);
+        // 200 would fit 210, but not with the » button too.
+        assert_eq!(fit_tabs(&tabs, 210.0, 20.0), [true, true, false, false, true]);
+        assert_eq!(fit_tabs(&tabs, 150.0, 20.0), [true, false, false, false, true]);
+        // Nothing but the kept tabs fits: they stay anyway.
+        assert_eq!(fit_tabs(&tabs, 10.0, 20.0), [true, false, false, false, true]);
+        // Hostile numbers don't panic.
+        let _ = fit_tabs(&[(f32::NAN, false), (f32::INFINITY, false)], f32::NAN, 20.0);
+    }
+
+    /// #860: Review › Language (and the status bar) reach every proofing language, not just the
+    /// short list: Set Proofing Language… opens the Language dialog (French, Set As Default),
+    /// Language Preferences… opens Options › Language, and French text shows by name, checked.
+    #[test]
+    fn language_menu_reaches_every_language() {
+        use egui_kittest::kittest::{By, NodeT, Queryable};
+        let item = |label: &'static str| By::new().label_contains(label);
+        let app = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Bonjour")), crate::Services::default());
+        let mut h =
+            egui_kittest::Harness::builder().with_size(vec2(400.0, 600.0)).build_ui_state(|ui, app: &mut WordApp| language_menu(ui, app), app);
+        h.run();
+        assert!(h.query(item("French (France)")).is_none(), "the short list only, on an English document");
+        assert!(!h.get(item("Set Proofing Language…")).accesskit_node().is_disabled(), "never greyed out on a fresh document");
+        assert!(!h.get(item("English (United States)")).accesskit_node().is_disabled());
+        h.get(item("Set Proofing Language…")).click();
+        h.run();
+        assert_eq!(h.state().dialog.as_ref().map(crate::dialogs::Dialog::name), Some("language"));
+        h.state_mut().dialog = None;
+        // French for the whole document: the menu and the status bar name it.
+        h.state_mut().run("review.language", json!({"lang": "fr-FR", "default": true})).unwrap();
+        h.run();
+        assert_eq!(caret_language(h.state()), "French (France)");
+        assert!(h.query(item("French (France)")).is_some(), "the current language is listed (only while it is the current one)");
+        h.get(item("Language Preferences…")).click();
+        h.run();
+        assert!(h.state().ui.backstage, "File › Options opened");
+        assert_eq!(h.state().ui.options_pane, "language");
+        assert_eq!(language_name(Some("de-DE")), "German (Germany)");
+    }
+
+    /// #1281: every short-list entry (the four Englishes, Indonesian…) is picked in the menu:
+    /// clicking it sets the selection's proofing language, and the entry is then the checked one.
+    #[test]
+    fn every_proofing_language_is_picked_from_the_language_menu() {
+        use egui_kittest::kittest::{By, NodeT, Queryable};
+        let mut app = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Colour")), crate::Services::default());
+        app.run("select.all", json!({})).unwrap();
+        let mut h =
+            egui_kittest::Harness::builder().with_size(vec2(400.0, 600.0)).build_ui_state(|ui, app: &mut WordApp| language_menu(ui, app), app);
+        h.run();
+        for (tag, name) in PROOFING_LANGUAGES {
+            h.get(By::new().label_contains(name)).click();
+            h.run();
+            let st = h.state_mut().session.run("format.state", &json!({})).unwrap();
+            assert_eq!(st.get("lang").and_then(Value::as_str), Some(tag), "{name}");
+            for (_, other) in PROOFING_LANGUAGES {
+                let ticked = h.get(By::new().label_contains(other)).accesskit_node().toggled();
+                assert_eq!(ticked == Some(egui::accesskit::Toggled::True), other == name, "{name}: {other} ticked {ticked:?}");
+            }
+        }
+    }
+
     #[test]
     fn resolve_tab_falls_back_when_contextual_tab_expires() {
         let all = ["Home", "Table Design", "Picture Format"];
@@ -2564,5 +3704,153 @@ mod tests {
         assert_eq!(resolve_tab("Picture Format", &["Home"]), "Home");
         assert_eq!(resolve_tab("Table Design", &["Home"]), "Home");
         assert_eq!(resolve_tab("Home", &["Home"]), "Home");
+    }
+
+    /// #2573, #1901: Picture Format › Size's width shows the interface unit and takes a size typed
+    /// in pixels. It applies once typed (Enter), not while typing, keeping the picture's proportions, as one
+    /// undo step.
+    #[test]
+    fn picture_width_typed_in_pixels_keeps_the_proportions() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut a = crate::WordApp::new(Session::new(wordcraft_doc::Document::new()), crate::Services::default());
+        a.run("file.options", json!({"units": "centimeters"})).unwrap();
+        a.run("insert.picture", json!({"data": png_data()})).unwrap();
+        a.run("ui.tab", json!({"tab": "Picture Format"})).unwrap();
+        let size = |a: &crate::WordApp| wordcraft_engine::cmd::objects::selected(&a.session).and_then(|(_, o)| o.frame().map(|(w, h, _)| (w, h)));
+        assert_eq!(size(&a), Some((15.0, 7.5)), "20×10 px at 96 ppi");
+        // Wide enough for the whole tab: the Size group is its last.
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(2560.0, 900.0)).build_ui_state(
+            |ui, app: &mut crate::WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(4);
+        let shown = h.get_by_role_and_label(Role::SpinButton, "W:").value().unwrap_or_default();
+        assert!(shown.ends_with(" cm"), "the interface unit: {shown:?}");
+        h.get_by_role_and_label(Role::SpinButton, "W:").click();
+        h.run_steps(2);
+        // Editing, the field is still a spin button, now showing the bare number to type over.
+        let editing = h.get_by_role_and_label(Role::SpinButton, "W:");
+        assert!(editing.is_focused() && editing.value().is_some_and(|v| !v.ends_with(" cm")), "a click starts typing");
+        editing.type_text("300 px");
+        h.run_steps(2);
+        assert_eq!(size(h.state()), Some((15.0, 7.5)), "nothing applies while typing");
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        let (w, ht) = size(h.state()).unwrap();
+        assert!((w - 225.0).abs() < 0.01 && (ht - 112.5).abs() < 0.01, "300 px = 225 pt, the height follows: {w}×{ht}");
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        assert_eq!(size(h.state()), Some((15.0, 7.5)), "one undo step");
+        // Esc throws a typed size away.
+        h.get_by_role_and_label(Role::SpinButton, "W:").click();
+        h.run_steps(2);
+        h.get_by_role_and_label(Role::SpinButton, "W:").type_text("500 px");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert_eq!(size(h.state()), Some((15.0, 7.5)), "Esc cancels the typing");
+    }
+
+    /// #2573 review: showing Picture Format never resizes a picture whose size is outside the
+    /// fields' range (a 1×1 px spacer is 0.75 pt): egui clamps such a value by default and reports
+    /// it as a change.
+    #[test]
+    fn picture_format_leaves_a_tiny_picture_alone() {
+        let mut a = crate::WordApp::new(Session::new(wordcraft_doc::Document::new()), crate::Services::default());
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]));
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        a.run("insert.picture", json!({"data": wordcraft_engine::cmd::insert::base64_encode(&png)})).unwrap();
+        a.run("ui.tab", json!({"tab": "Picture Format"})).unwrap();
+        let size = |a: &crate::WordApp| wordcraft_engine::cmd::objects::selected(&a.session).and_then(|(_, o)| o.frame().map(|(w, h, _)| (w, h)));
+        assert_eq!(size(&a), Some((0.75, 0.75)));
+        let undo = a.session.undo_depth();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(2560.0, 900.0)).build_ui_state(
+            |ui, app: &mut crate::WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(6);
+        assert_eq!(size(h.state()), Some((0.75, 0.75)), "shown, not resized");
+        assert_eq!(h.state().session.undo_depth(), undo, "no undo step");
+    }
+
+    /// #3242: Align used to run `arrange.align` directly with no `value`, which always centers
+    /// (`crates/engine/src/cmd/objects.rs`) — there was no way to reach Left or Right from the
+    /// ribbon short of dragging. Align now opens a menu, like Word's own Align dropdown.
+    #[test]
+    fn align_menu_reaches_left_and_right_not_just_center() {
+        use egui_kittest::kittest::{By, Queryable};
+        let item = |label: &'static str| By::new().label_contains(label);
+        let mut a = crate::WordApp::new(Session::new(wordcraft_doc::Document::new()), crate::Services::default());
+        a.run("insert.picture", json!({"data": png_data()})).unwrap();
+        let frame =
+            |a: &crate::WordApp| wordcraft_engine::cmd::objects::selected(&a.session).and_then(|(_, o)| o.frame().map(|(_, _, f)| (f.wrap, f.x)));
+        assert!(matches!(frame(&a), Some((wordcraft_doc::para::Wrap::Inline, _))), "a freshly inserted picture is inline");
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(300.0, 300.0))
+            .build_ui_state(|ui, app: &mut crate::WordApp| align_menu(ui, app, None), a);
+        h.run();
+        h.get(item("Align")).click();
+        h.run();
+        assert!(h.query(item("Align Left")).is_some(), "Align opens a menu, instead of running arrange.align with no value");
+        h.get(item("Align Right")).click();
+        h.run();
+        let (wrap, right_x) = frame(h.state()).unwrap();
+        assert_eq!(wrap, wordcraft_doc::para::Wrap::Square, "aligning floats an inline picture, as arrange.align already does");
+        // A positive x alone doesn't pin Right down: Center's x is positive too whenever the
+        // picture is narrower than the text column, so Right could silently dispatch Center.
+        h.get(item("Align")).click();
+        h.run();
+        h.get(item("Align Center")).click();
+        h.run();
+        let center_x = frame(h.state()).unwrap().1;
+        h.get(item("Align")).click();
+        h.run();
+        h.get(item("Align Left")).click();
+        h.run();
+        let left_x = frame(h.state()).unwrap().1;
+        assert!(left_x < center_x && center_x < right_x, "Left, Center and Right each land at a distinct x: {left_x} < {center_x} < {right_x}");
+    }
+
+    /// #2573 review: Shape Format and Chart Design leave sizes outside their fields' ranges alone
+    /// too (a 0.5 pt high line; a chart narrower than 36 pt), as Picture Format does.
+    #[test]
+    fn shape_and_chart_formats_leave_out_of_range_sizes_alone() {
+        let size = |a: &crate::WordApp| wordcraft_engine::cmd::objects::selected(&a.session).and_then(|(_, o)| o.frame().map(|(w, h, _)| (w, h)));
+        let shown = |a: crate::WordApp| {
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(2560.0, 900.0)).build_ui_state(
+                |ui, app: &mut crate::WordApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                a,
+            );
+            h.run_steps(6);
+            let a = h.state();
+            (size(a), a.session.undo_depth())
+        };
+        let mut a = crate::WordApp::new(Session::new(wordcraft_doc::Document::new()), crate::Services::default());
+        a.run("insert.shape", json!({"kind": "rectangle"})).unwrap();
+        a.run("picture.size", json!({"width": 3000.0, "height": 1.0, "lockAspect": false})).unwrap();
+        a.run("ui.tab", json!({"tab": "Shape Format"})).unwrap();
+        let before = (size(&a), a.session.undo_depth());
+        assert_eq!(before.0, Some((3000.0, 1.0)));
+        assert_eq!(shown(a), before, "Shape Format shown, the shape untouched");
+
+        let mut a = crate::WordApp::new(Session::new(wordcraft_doc::Document::new()), crate::Services::default());
+        a.run("insert.chart", json!({"type": "doughnut"})).unwrap();
+        a.run("picture.size", json!({"width": 20.0, "height": 2500.0, "lockAspect": false})).unwrap();
+        a.run("ui.tab", json!({"tab": "Chart Design"})).unwrap();
+        let before = (size(&a), a.session.undo_depth());
+        assert_eq!(before.0, Some((20.0, 2500.0)));
+        assert_eq!(shown(a), before, "Chart Design shown, the chart untouched");
     }
 }

@@ -88,8 +88,8 @@ pub fn tool_definitions() -> Value {
         tool(
             "open_document",
             "Open",
-            "Open a .docx, .doc, .odt, .rtf, .md, .tex, .html, .txt or .json file, or any other text file (.m3u, .log, .ini…) as plain text.",
-            obj(json!({"path": s("File path")}), &["path"]),
+            "Open a .docx, .doc, .odt, .rtf, .md, .tex, .html, .txt or .json file, or any other text file (.m3u, .log, .ini…) as plain text. Give `password` for a protected file; without it the call fails asking for one.",
+            obj(json!({"path": s("File path"), "password": s("Password, if the file is protected")}), &["path"]),
             false
         ),
         tool(
@@ -102,7 +102,7 @@ pub fn tool_definitions() -> Value {
         tool(
             "type_text",
             "Type text",
-            "Type at the caret (replacing the selection). Use \\n... for line breaks inside text; use execute text.newParagraph for new paragraphs, or `paragraphs: true` to split lines into paragraphs.",
+            "Type at the caret (replacing the selection). Use \\n... for line breaks inside text; use execute text.newParagraph for new paragraphs, or `paragraphs: true` to split lines into paragraphs (all in one step, one Undo; the line breaks are plain text breaks: no AutoCorrect or AutoFormat runs on them).",
             obj(json!({"text": s("Text"), "paragraphs": {"type": "boolean"}}), &["text"]),
             false
         ),
@@ -113,7 +113,7 @@ pub fn tool_definitions() -> Value {
             obj(json!({"text": s("Text to find"), "occurrence": n("1-based")}), &["text"]),
             false
         ),
-        tool("get_text", "Document text", "Plain text of the document body.", obj(json!({}), &[]), true),
+        tool("get_text", "Document text", "Body text with tracked deletions omitted.", obj(json!({}), &[]), true),
         tool(
             "inspect_document",
             "Inspect document",
@@ -209,7 +209,7 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
             ToolResult::json(&Value::Array(out))
         }
         "new_document" => wrap(exec(b, "file.new", json!({"template": st("template").unwrap_or("blank")}))),
-        "open_document" => wrap(exec(b, "file.open", json!({"path": st("path").unwrap_or("")}))),
+        "open_document" => wrap(exec(b, "file.open", json!({"path": st("path").unwrap_or(""), "password": st("password")}))),
         "save_document" => {
             let p = st("path");
             let ext = p.and_then(|x| x.rsplit('.').next()).unwrap_or("").to_ascii_lowercase();
@@ -229,19 +229,11 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         "type_text" => {
             let t = st("text").unwrap_or("");
             if a.get("paragraphs").and_then(Value::as_bool).unwrap_or(false) {
-                let mut last = Ok(Value::Null);
-                for (i, line) in t.split('\n').enumerate() {
-                    if i > 0 {
-                        last = exec(b, "text.newParagraph", json!({}));
-                    }
-                    if !line.is_empty() {
-                        last = exec(b, "text.insert", json!({"text": line, "raw": true}));
-                    }
-                    if last.is_err() {
-                        break;
-                    }
-                }
-                wrap(last)
+                // One command for all the lines: `text.insert` takes a carriage return as a
+                // paragraph break. A command per line was quadratic in the document (each one
+                // snapshots all of it for Undo: 10,000 lines took 2.8 s, 7 ms in one command),
+                // and left an Undo step per line. CRLF is one break, not two (#3973).
+                wrap(exec(b, "text.insert", json!({"text": t.replace("\r\n", "\n").replace('\n', "\r"), "raw": true})))
             } else {
                 wrap(exec(b, "text.insert", json!({"text": t, "raw": true})))
             }
@@ -269,5 +261,64 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         "key" => wrap(b.call("ui.key", a.clone())),
         "ui_inspect" => wrap(b.call("ui.inspect", json!({}))),
         other => ToolResult::error(format!("unknown tool `{other}`")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backend that keeps what it was asked for, so a test can read the forwarded params.
+    struct Recording {
+        seen: Option<(String, Value)>,
+    }
+
+    impl Backend for Recording {
+        fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+            self.seen = Some((method.to_string(), params));
+            Ok(json!({"encrypted": true}))
+        }
+        fn has_ui(&self) -> bool {
+            false
+        }
+        fn describe(&self) -> String {
+            "recording".into()
+        }
+    }
+
+    /// What the backend was asked for: `file.open` runs through `engine.execute`, so the
+    /// command and its parameters are nested one level down.
+    fn forwarded(args: Value) -> Value {
+        let mut b = Recording { seen: None };
+        let r = call_tool(&mut b, "open_document", &args);
+        assert!(!r.is_error, "open_document failed: {:?}", r);
+        let (method, mut call) = b.seen.expect("the backend was called");
+        assert_eq!(method, "engine.execute");
+        assert_eq!(call["command"], json!("file.open"));
+        call["params"].take()
+    }
+
+    #[test]
+    fn open_document_forwards_the_password_to_file_open() {
+        let p = forwarded(json!({"path": "/tmp/a.docx", "password": "s3cret"}));
+        assert_eq!(p["path"], json!("/tmp/a.docx"));
+        assert_eq!(p["password"], json!("s3cret"));
+    }
+
+    /// Without a password the parameter stays null rather than an empty string: `file.open` reads
+    /// an empty one as "no password given", so a protected file would come back unprotected.
+    #[test]
+    fn open_document_without_a_password_passes_null() {
+        assert_eq!(forwarded(json!({"path": "/tmp/a.docx"}))["password"], Value::Null);
+    }
+
+    /// The password has to be in the schema, or a client has no way to know it can be sent.
+    #[test]
+    fn the_schema_advertises_the_password_as_optional() {
+        let tools = tool_definitions();
+        let open = tools.as_array().expect("the tools are a list").iter().find(|t| t["name"] == "open_document").expect("open_document is offered");
+        let schema = &open["inputSchema"];
+        assert!(schema["properties"]["password"].is_object(), "the schema offers no password");
+        assert_eq!(schema["required"], json!(["path"]), "the password stays optional");
     }
 }

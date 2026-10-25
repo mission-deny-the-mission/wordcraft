@@ -14,7 +14,8 @@ use wordcraft_doc::para::Float;
 
 use super::PartRels;
 use crate::package::{
-    CUSTOM_XML_ROOTS, EMBEDDED_PARTS, EmbeddedManifest, MAX_EMBEDDED_PARTS, MAX_EMBEDDED_RELS, VBA_PROJECT_PART, VBA_RELATED, rel_is, relative, rt,
+    CUSTOM_XML_ROOTS, EMBEDDED_PARTS, EmbeddedManifest, FONT_TABLE_PART, MAX_EMBEDDED_PARTS, MAX_EMBEDDED_RELS, VBA_PROJECT_PART, VBA_RELATED,
+    rel_is, relative, rt,
 };
 use crate::units::{MAX_LEN_PT, emu, int};
 use crate::xml::{self, El, MAX_DEPTH};
@@ -28,9 +29,6 @@ const PART_COST: u64 = 4096;
 
 /// Where the stories' parts live: every story this writer makes is a part in `word/`.
 const STORY_PART: &str = "word/document.xml";
-
-/// The font table kept from a file (read by `Reader::keep_part_tree`).
-const FONT_TABLE_PART: &str = "word/fontTable.xml";
 
 /// The embedded-object parts of a package being written.
 pub(crate) struct EmbedWriter<'d> {
@@ -48,6 +46,8 @@ pub(crate) struct EmbedWriter<'d> {
     markup_bytes: u64,
     /// Parts to write: (name, bytes, content type, relationships).
     pub parts: Vec<(String, Vec<u8>, String, PartRels)>,
+    /// Leave out the main document's kept glossary (it's written from the model instead).
+    pub drop_glossary: bool,
 }
 
 impl<'d> EmbedWriter<'d> {
@@ -63,6 +63,8 @@ impl<'d> EmbedWriter<'d> {
             "word/endnotes.xml",
             "word/comments.xml",
             "word/commentsextended.xml",
+            "word/commentsids.xml",
+            "word/commentsextensible.xml",
             "[content_types].xml",
         ]
         .iter()
@@ -90,6 +92,7 @@ impl<'d> EmbedWriter<'d> {
             copy_bytes: MAX_COPY_BYTES,
             markup_bytes: MAX_MARKUP_BYTES,
             parts: Vec::new(),
+            drop_glossary: false,
         }
     }
 
@@ -111,13 +114,15 @@ impl<'d> EmbedWriter<'d> {
     /// Names this writer may give its own parts later (headers, footers, package parts).
     fn reserved(lower: &str) -> bool {
         lower.ends_with(".rels")
-            || lower.starts_with("docprops/")
+            || (lower.starts_with("docprops/") && !lower.starts_with("docprops/thumbnail."))
             || lower.starts_with("_rels/")
             || ((lower.starts_with("word/header") || lower.starts_with("word/footer")) && lower.ends_with(".xml"))
     }
 
     /// A free part name for (a copy of) `orig`: `orig` itself if free, else `stem_N.ext`.
     fn alloc(&mut self, orig: &str) -> String {
+        let clean = valid_part_name(orig);
+        let orig = clean.as_str();
         // Suffixes cannot escape reserved directories or a .rels extension. Such a kept
         // part needs a different base name, otherwise every candidate would be reserved.
         let orig = if Self::reserved(&orig.to_ascii_lowercase()) { "word/embeddings/part.xml" } else { orig };
@@ -142,7 +147,7 @@ impl<'d> EmbedWriter<'d> {
     }
 
     /// A number `n` for which every `{stem}{n}{ext}` is a free part name, with those names taken.
-    fn fresh_set(&mut self, stems: &[&str], ext: &str) -> Vec<String> {
+    pub(super) fn fresh_set(&mut self, stems: &[&str], ext: &str) -> Vec<String> {
         let mut n: u32 = 1;
         loop {
             let names: Vec<String> = stems.iter().map(|s| format!("{s}{n}{ext}")).collect();
@@ -194,6 +199,35 @@ impl<'d> EmbedWriter<'d> {
             }
         }
         self.first = memo;
+    }
+
+    /// Reattach the parts kept by `keep_unmodelled` (`UNMODELLED_ROOTS`) to their owner: the
+    /// package (`P`) or the main document (`D`).
+    pub fn unmodelled_rels(&mut self, owner: &str, rels: &mut PartRels) {
+        let Some(roots) = self.passthrough.get(crate::package::UNMODELLED_ROOTS).cloned() else { return };
+        let mut memo = std::mem::take(&mut self.first);
+        let mut written = Vec::new();
+        for line in String::from_utf8_lossy(&roots).lines().take(MAX_EMBEDDED_RELS * 2) {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let [source, kind, target] = fields.as_slice() else { continue };
+            if *source != owner || (self.drop_glossary && owner == "D" && rel_is(kind, rt::GLOSSARY)) {
+                continue;
+            }
+            if let Some(name) = self.copy_tree(target, &mut memo, &mut written) {
+                let source_part = if owner == "P" { "" } else { STORY_PART };
+                rels.add(kind, &relative(source_part, &name), false);
+            }
+        }
+        self.first = memo;
+    }
+
+    /// Whether `unmodelled_rels("D", …)` can write the main document's kept glossary back.
+    pub fn kept_glossary(&self) -> bool {
+        let Some(roots) = self.passthrough.get(crate::package::UNMODELLED_ROOTS) else { return false };
+        String::from_utf8_lossy(roots).lines().take(MAX_EMBEDDED_RELS * 2).any(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            matches!(fields.as_slice(), [source, kind, target] if *source == "D" && rel_is(kind, rt::GLOSSARY) && (self.first.contains_key(*target) || self.available(target)))
+        })
     }
 
     /// What copying the parts reached from `roots` costs against the copy budget.
@@ -499,6 +533,38 @@ impl super::Writer<'_> {
             Self::ink_transform(c, from, to, float, depth + 1);
         }
     }
+
+    /// Put a group or canvas member kept from a file (native ink and its picture fallback) at
+    /// `frame` ([x, y, w, h] in points, in the group's space, as the group is written): its
+    /// `w14:xfrm` and the fallback's `a:xfrm` get that offset and extent and the member's turn.
+    /// It rewrites every `w14:xfrm` and `a:xfrm` under `e` and doesn't descend into them: right
+    /// for the forms Word writes (the content part's own transform and one `pic:pic` fallback's
+    /// `pic:spPr/a:xfrm`); a fallback holding several transforms (a group) would get one frame.
+    pub(super) fn place_member(e: &mut El, frame: [f32; 4], float: &Float, depth: usize) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        if matches!(e.name.as_str(), "w14:xfrm" | "a:xfrm") {
+            e.attrs.retain(|(k, _)| !matches!(k.as_str(), "rot" | "flipH" | "flipV"));
+            for (k, v) in super::story::spin_attrs(float.spin()) {
+                e.attrs.push((k.to_string(), v));
+            }
+            let [x, y, w, h] = frame.map(|v| v.clamp(-MAX_LEN_PT, MAX_LEN_PT));
+            e.kids.retain(|k| !matches!(k, xml::Node::El(c) if matches!(c.name.as_str(), "a:off" | "a:ext")));
+            let el = |name: &str, attrs: [(&str, String); 2]| {
+                xml::Node::El(El { name: name.to_string(), attrs: attrs.map(|(k, v)| (k.to_string(), v)).to_vec(), kids: Vec::new() })
+            };
+            e.kids.insert(0, el("a:ext", [("cx", emu(w.max(0.0))), ("cy", emu(h.max(0.0)))]));
+            e.kids.insert(0, el("a:off", [("x", emu(x)), ("y", emu(y))]));
+            return;
+        }
+        for c in e.kids.iter_mut().filter_map(|k| match k {
+            xml::Node::El(c) => Some(c),
+            _ => None,
+        }) {
+            Self::place_member(c, frame, float, depth + 1);
+        }
+    }
 }
 
 /// Set an extent's `cx` and `cy` (those it has) to `w` × `h` points.
@@ -521,17 +587,12 @@ fn set_attr(e: &mut El, k: &str, v: &str) {
     }
 }
 
-/// Is attribute `k` a relationship id (see `read::embed::rel_ids`)?
-fn is_rel_attr(k: &str) -> bool {
-    k.starts_with("r:") || k == "o:relid"
-}
-
 fn rel_attr_values(e: &El, out: &mut Vec<String>, depth: usize) {
     if depth > MAX_DEPTH {
         return;
     }
     for (k, v) in &e.attrs {
-        if is_rel_attr(k) && !out.contains(v) {
+        if xml::is_rel_attr(&e.name, k) && !out.contains(v) {
             out.push(v.clone());
         }
     }
@@ -544,8 +605,9 @@ fn set_rel_ids(e: &mut El, ids: &HashMap<String, String>, depth: usize) {
     if depth > MAX_DEPTH {
         return;
     }
+    let name = e.name.clone();
     for (k, v) in e.attrs.iter_mut() {
-        if is_rel_attr(k)
+        if xml::is_rel_attr(&name, k)
             && let Some(n) = ids.get(v.as_str())
         {
             *v = n.clone();
@@ -620,6 +682,29 @@ fn pt(v: f32) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
+/// `name` as a valid OPC part name: no backslashes, empty or dot segments, segments ending in a
+/// dot, or encoded separators.
+fn valid_part_name(name: &str) -> String {
+    let mut out = Vec::new();
+    for seg in name.split('/') {
+        let mut seg = seg.replace('\\', "_");
+        for enc in ["%2f", "%5c"] {
+            while let Some(i) = seg.to_ascii_lowercase().find(enc) {
+                seg.replace_range(i..i + 3, "_");
+            }
+        }
+        if seg.is_empty() || seg == "." || seg == ".." {
+            continue;
+        }
+        // A segment can't end in a dot either (`word/a.`).
+        if seg.ends_with('.') {
+            seg = format!("{}_", seg.trim_end_matches('.'));
+        }
+        out.push(seg);
+    }
+    if out.is_empty() { "word/embeddings/part.xml".to_string() } else { out.join("/") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,5 +734,17 @@ mod tests {
         assert_eq!(s, "z-index:3;width:2pt;height:3pt;rotation:329.5;flip:x y");
         // Unturned: no rotation or flip left behind.
         assert_eq!(vml_style_with("rotation:90;flip:y;width:1pt", 2.0, 3.0, &Float::default()), "width:2pt;height:3pt");
+    }
+
+    #[test]
+    fn kept_part_names_are_valid_opc_names() {
+        let doc = wordcraft_doc::Document::default();
+        let mut w = EmbedWriter::new(&doc);
+        for orig in ["word/a\\b.bin", "word/..\\..\\x.bin", "word/a/../b%2Fc.bin", "word/a//./b%5Cc.bin", "word/a./b.bin", "word/a..."] {
+            let name = w.alloc(orig);
+            assert!(!name.contains('\\'), "{name}");
+            assert!(!name.to_ascii_lowercase().contains("%2f") && !name.to_ascii_lowercase().contains("%5c"), "{name}");
+            assert!(name.split('/').all(|s| !s.is_empty() && !s.ends_with('.')), "{name}");
+        }
     }
 }

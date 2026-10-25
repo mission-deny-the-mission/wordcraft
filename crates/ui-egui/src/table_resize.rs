@@ -133,7 +133,7 @@ pub fn pointer(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect]
             if resp.double_clicked() && matches!(d.target.edge, Edge::Column(_)) {
                 let sc = page_scale(rects, layout, scale, d.page).unwrap_or(1.0);
                 let params = json!({"page": d.page, "x": d.from.0, "y": d.from.1, "reach": REACH_PX / sc});
-                if let Err(e) = app.run("table.fitColumn", params) {
+                if let Err(e) = app.run_keep_view("table.fitColumn", params) {
                     app.status(e);
                 }
             }
@@ -145,12 +145,12 @@ pub fn pointer(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect]
             "page": d.page, "x": d.from.0, "y": d.from.1, "toX": d.to.0, "toY": d.to.1,
             "shift": share == Share::LeftOnly, "ctrl": share == Share::Proportional, "reach": REACH_PX / sc,
         });
-        if let Err(e) = app.run("table.resizeDrag", params) {
+        if let Err(e) = app.run_keep_view("table.resizeDrag", params) {
             app.status(e);
         }
         return true;
     }
-    if !available(app) || !(ui.input(|i| i.pointer.primary_pressed()) && resp.contains_pointer()) {
+    if !(available(app) && ui.input(|i| i.pointer.primary_pressed()) && resp.contains_pointer()) {
         return false;
     }
     let Some(p) = latest else { return false };
@@ -263,6 +263,16 @@ pub fn paint(app: &WordApp, painter: &egui::Painter, t: &Tokens, layout: &DocLay
     if !available(app) {
         return;
     }
+    // The caret's table shows it wherever the pointer is, as in Word.
+    for (page, _, h) in caret_handles(app, painter, layout, rects) {
+        if let Some(h) = h
+            && let (Some(a), Some(b)) = (s(page, h.x, h.y), s(page, h.right(), h.bottom()))
+        {
+            let r = Rect::from_two_pos(a, b);
+            painter.rect_filled(r, 0.0, egui::Color32::WHITE);
+            painter.rect_stroke(r, 0.0, Stroke::new(1.0, t.text_dim), egui::StrokeKind::Inside);
+        }
+    }
     // The handle shows while the pointer is over the table (or on the handle itself).
     let Some(p) = painter.ctx().input(|i| i.pointer.hover_pos()) else { return };
     let Some((page, x, y)) = crate::canvas::page_at(rects, layout, scale, p) else { return };
@@ -274,6 +284,29 @@ pub fn paint(app: &WordApp, painter: &egui::Painter, t: &Tokens, layout: &DocLay
         painter.rect_filled(r, 0.0, egui::Color32::WHITE);
         painter.rect_stroke(r, 0.0, Stroke::new(1.0, t.text_dim), egui::StrokeKind::Inside);
     }
+}
+
+/// The move and resize handles (page points) of the caret's table on the pages in view: Word
+/// shows them while the caret is in a table, not only under the pointer.
+pub(crate) fn caret_handles(
+    app: &WordApp,
+    painter: &egui::Painter,
+    layout: &DocLayout,
+    rects: &[Rect],
+) -> Vec<(usize, Option<wordcraft_geom::Rect>, Option<wordcraft_geom::Rect>)> {
+    let focus = &app.session.sel.focus;
+    let Some((tp, _, _)) = focus.path.cell() else { return Vec::new() };
+    let clip = painter.clip_rect();
+    rects
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.intersects(clip))
+        .map(|(page, _)| {
+            let (m, z) = wordcraft_engine::cmd::table_mouse::caret_handles(layout, &app.session.doc, focus.story, &tp, page);
+            (page, m, z)
+        })
+        .filter(|(_, m, z)| m.is_some() || z.is_some())
+        .collect()
 }
 
 #[cfg(test)]
@@ -378,6 +411,30 @@ pub(crate) mod tests {
         assert_eq!(h.state().session.sel, sel, "the selection is kept");
         assert!(h.state_mut().session.undo());
         assert_eq!(cell(&mut h, 0, 0), a);
+    }
+
+    /// #1738: releasing a column-border drag leaves the view where it is, not scrolled back to
+    /// the caret; typing afterwards still follows the caret.
+    #[test]
+    fn dragging_a_column_border_keeps_the_view_where_it_is() {
+        let mut h = table_window();
+        let a = cell(&mut h, 0, 0);
+        let start = screen(&mut h, a.right(), a.y + a.h / 2.0);
+        let end = screen(&mut h, a.right() + 30.0, a.y + a.h / 2.0);
+        h.event(egui::Event::PointerMoved(start));
+        steps(&mut h, 2);
+        button(&h, start, true);
+        h.step();
+        h.event(egui::Event::PointerMoved(end));
+        steps(&mut h, 2);
+        h.state_mut().canvas.scroll_to_caret = false;
+        let depth = h.state().session.undo_depth();
+        button(&h, end, false);
+        h.step();
+        assert_eq!(h.state().session.undo_depth(), depth + 1, "the drag was applied");
+        assert!(!h.state().canvas.scroll_to_caret, "the resize scrolled to the caret");
+        h.state_mut().run("text.insert", json!({"text": "x"})).unwrap();
+        assert!(h.state().canvas.scroll_to_caret, "typing still brings the caret into view");
     }
 
     /// The zone of the ruler marker named `label` nearest to screen point `near`.
@@ -563,6 +620,28 @@ pub(crate) mod tests {
         button(&h, end, false);
         steps(&mut h, 3);
         assert!(widths(&mut h).is_empty(), "gone with the drag");
+    }
+
+    /// A cell selected with a click along its left edge: dragging its right border with the
+    /// mouse moves it in that cell's row only (#962).
+    #[test]
+    fn a_selected_cells_border_drags_in_its_row_only() {
+        let mut h = table_window();
+        let (above, b, c) = (cell(&mut h, 0, 1), cell(&mut h, 1, 1), cell(&mut h, 1, 2));
+        let y = b.y + b.h / 2.0;
+        let at = screen(&mut h, b.x + 4.5, y);
+        h.event(egui::Event::PointerMoved(at));
+        h.step();
+        button(&h, at, true);
+        h.step();
+        button(&h, at, false);
+        steps(&mut h, 2);
+        assert_eq!(h.state().session.cell_range().map(|r| (r.rows, r.cols)), Some(((1, 1), (1, 1))), "the cell is selected");
+        let (start, end) = (screen(&mut h, b.right(), y), screen(&mut h, b.right() + 30.0, y));
+        drag(&mut h, start, end);
+        let (b1, c1) = (cell(&mut h, 1, 1), cell(&mut h, 1, 2));
+        assert!((b1.w - (b.w + 30.0)).abs() < 1.0 && (c1.w - (c.w - 30.0)).abs() < 1.0, "{b1:?} {c1:?}");
+        assert!((cell(&mut h, 0, 1).right() - above.right()).abs() < 0.5, "the first row keeps its border");
     }
 
     /// Clicks inside a cell still place the caret (the border doesn't steal them), and Esc drops a

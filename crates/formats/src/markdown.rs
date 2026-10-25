@@ -9,6 +9,8 @@
 //!
 //! Export writes the same constructs; pictures become `![alt](media-name)` placeholders.
 
+use std::collections::HashMap;
+
 use wordcraft_doc::{Align, Document};
 
 use crate::html::decode_entity;
@@ -25,11 +27,135 @@ pub fn import(text: &str) -> Document {
     model::to_doc(&parse(text))
 }
 
+/// [`import`] onto `page`: Markdown gives no page size (#1381).
+pub fn import_on(text: &str, page: &wordcraft_doc::SectionProps) -> Document {
+    model::to_doc_in(&parse(text), page.clone())
+}
+
+/// Link reference definitions: the normalised label to its destination.
+pub type Refs = HashMap<String, String>;
+
+/// A label as CommonMark compares them: case-folded, and any run of white space one space
+/// (§4.7, "matches"). `[FOO bar]` and `[foo   BAR]` are the same label.
+fn ref_label(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// A link reference definition on its own line: `[label]: destination "optional title"`. The
+/// destination may be wrapped in `<...>`. Returns the label and the destination.
+///
+/// CommonMark allows the title on the following line and the label to span lines; a definition
+/// written across lines is left as text here, which is what it was before these were read at all.
+fn link_definition(line: &str) -> Option<(String, String)> {
+    let t = line.trim_start();
+    // Up to three spaces of indentation; four makes it indented code.
+    if line.len() - t.len() > 3 || !t.starts_with('[') {
+        return None;
+    }
+    let bytes = t.as_bytes();
+    // The label ends at the first unescaped `]`, and cannot be empty or hold an unescaped `[`.
+    let mut i = 1;
+    let mut close = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'[' => return None,
+            b']' => {
+                close = Some(i);
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let close = close?;
+    let label = ref_label(t.get(1..close)?);
+    // `[^label]: ...` is a footnote definition, which this importer leaves as text.
+    if label.starts_with('^') {
+        return None;
+    }
+    if label.is_empty() || t.as_bytes().get(close + 1) != Some(&b':') {
+        return None;
+    }
+    let rest = t.get(close + 2..)?.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    // The destination: `<...>`, else up to the next space. What follows may only be a title.
+    let (dest, after) = match rest.strip_prefix('<') {
+        Some(inner) => {
+            let end = inner.find('>')?;
+            (inner.get(..end)?.to_string(), inner.get(end + 1..)?)
+        }
+        None => {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            (rest.get(..end)?.to_string(), rest.get(end..)?)
+        }
+    };
+    if dest.is_empty() {
+        return None;
+    }
+    let title = after.trim();
+    let titled =
+        title.is_empty() || (title.len() >= 2 && matches!((title.chars().next()?, title.chars().last()?), ('"', '"') | ('\'', '\'') | ('(', ')')));
+    titled.then_some((label, dest))
+}
+
+/// Take the link reference definitions out of `lines`, leaving the rest. Lines inside a fenced
+/// code block are left alone: a definition there is code, not a definition. Fences open and
+/// close by the same rules [`parse_blocks`] applies, or a line it reads as code would be read
+/// here as a definition and deleted.
+///
+/// A definition has to start a block: CommonMark §4.7 forbids one from interrupting a paragraph,
+/// and a line like `[Warning]: unstable` in the middle of one is the author's text. This pass
+/// sees lines without the block structure around them, so it takes a definition only after a
+/// blank line, at the start of the document, after a heading or thematic break, or after another
+/// definition. A definition anywhere else stays in the document and reads as text, which is what
+/// it did before definitions were understood at all; deleting a line that was part of a
+/// paragraph would lose it silently.
+fn take_definitions(lines: &mut Vec<String>) -> Refs {
+    let mut refs = Refs::new();
+    let mut open: Option<(char, usize)> = None;
+    // The start of the document begins a block.
+    let mut starts_block = true;
+    lines.retain(|line| {
+        let t = line.trim_start_matches([' ', '\t']);
+        // Four spaces of indentation is code, not a fence (`parse_blocks`), on both sides.
+        let marker = (indent(line) < 4).then(|| fence(t)).flatten();
+        match open {
+            Some((c, n)) => {
+                // A closing fence holds nothing but its own run of fence characters.
+                if marker.is_some_and(|(fc, fl)| fc == c && fl >= n) && t.trim_start_matches(c).trim().is_empty() {
+                    open = None;
+                    starts_block = true;
+                }
+                return true;
+            }
+            None => {
+                if let Some(f) = marker {
+                    open = Some(f);
+                    return true;
+                }
+            }
+        }
+        if starts_block && let Some((label, dest)) = link_definition(line) {
+            // The first definition of a label wins, as CommonMark says, and definitions may
+            // follow one another.
+            refs.entry(label).or_insert(dest);
+            return false;
+        }
+        starts_block = is_blank(line) || atx_heading(t).is_some() || thematic_break(t);
+        true
+    });
+    refs
+}
+
 /// Parse Markdown text into the flow model.
 pub fn parse(text: &str) -> model::Flow {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
-    let lines: Vec<String> = text.split('\n').map(|l| expand_tabs(l.trim_end_matches('\r'))).collect();
-    let mut blocks = parse_blocks(&lines, 0, 0);
+    let mut lines: Vec<String> = text.split('\n').map(|l| expand_tabs(l.trim_end_matches('\r'))).collect();
+    let refs = take_definitions(&mut lines);
+    let mut blocks = parse_blocks(&lines, 0, 0, &refs);
     // A leading "Title" from front matter isn't supported; a first-level heading stays a heading.
     if blocks.is_empty() {
         blocks.push(FBlock::Para(Para::default()));
@@ -142,7 +268,7 @@ fn list_marker(t: &str) -> Option<Marker> {
     let (m, len) = if matches!(first, '-' | '+' | '*') {
         (Marker { ordered: false, ch: first, len: 1, start: 1 }, 1)
     } else {
-        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        let digits = t.chars().take_while(char::is_ascii_digit).count();
         if !(1..=9).contains(&digits) {
             return None;
         }
@@ -154,28 +280,36 @@ fn list_marker(t: &str) -> Option<Marker> {
         (Marker { ordered: true, ch: d, len: digits + 1, start }, digits + 1)
     };
     let rest = t.get(len..)?;
-    if rest.is_empty() || rest.starts_with(' ') { Some(m) } else { None }
+    if rest.is_empty() || rest.starts_with([' ', '\t']) { Some(m) } else { None }
 }
 
 fn split_row(l: &str) -> Vec<String> {
     let t = l.trim();
     let t = t.strip_prefix('|').unwrap_or(t);
-    let t = if t.ends_with('|') && !t.ends_with("\\|") { &t[..t.len() - 1] } else { t };
+    let t = if let Some(before) = t.strip_suffix('|') {
+        let num_bs = before.chars().rev().take_while(|&c| c == '\\').count();
+        if num_bs % 2 == 0 { before } else { t }
+    } else {
+        t
+    };
     let mut cells = Vec::new();
     let mut cur = String::new();
     let mut chars = t.chars().peekable();
-    let mut in_code = false;
     while let Some(c) = chars.next() {
         match c {
-            '\\' if chars.peek() == Some(&'|') => {
-                cur.push('|');
-                chars.next();
-            }
-            '`' => {
-                in_code = !in_code;
-                cur.push(c);
-            }
-            '|' if !in_code => cells.push(std::mem::take(&mut cur).trim().to_string()),
+            '\\' => match chars.peek() {
+                Some(&'|') => {
+                    cur.push('|');
+                    chars.next();
+                }
+                Some(&'\\') => {
+                    cur.push('\\');
+                    cur.push('\\');
+                    chars.next();
+                }
+                _ => cur.push('\\'),
+            },
+            '|' => cells.push(std::mem::take(&mut cur).trim().to_string()),
             _ => cur.push(c),
         }
     }
@@ -200,6 +334,7 @@ fn delimiter_row(l: &str) -> Option<Vec<Option<Align>>> {
         out.push(match (left, right) {
             (true, true) => Some(Align::Center),
             (false, true) => Some(Align::Right),
+            (true, false) => Some(Align::Left),
             _ => None,
         });
     }
@@ -211,7 +346,7 @@ fn interrupts(l: &str) -> bool {
     if indent(l) >= 4 {
         return false;
     }
-    let t = l.trim_start();
+    let t = l.trim_start_matches([' ', '\t']);
     atx_heading(t).is_some()
         || thematic_break(t)
         || fence(t).is_some()
@@ -219,13 +354,13 @@ fn interrupts(l: &str) -> bool {
         || list_marker(t).is_some_and(|m| (!m.ordered || m.start == 1) && !is_blank(t.get(m.len..).unwrap_or("")))
 }
 
-fn flush_para(lines: &mut Vec<String>, out: &mut Vec<FBlock>, depth: usize) {
+fn flush_para(lines: &mut Vec<String>, out: &mut Vec<FBlock>, depth: usize, refs: &Refs) {
     if lines.is_empty() {
         return;
     }
     let text = join_lines(lines);
     lines.clear();
-    let p = Para { inlines: parse_inlines(&text, &Fmt::default(), depth), ..Default::default() };
+    let p = Para { inlines: parse_inlines(&text, &Fmt::default(), depth, refs), ..Default::default() };
     out.push(FBlock::Para(p));
 }
 
@@ -234,7 +369,7 @@ fn join_lines(lines: &[String]) -> String {
     let mut s = String::new();
     let n = lines.len();
     for (i, l) in lines.iter().enumerate() {
-        let l = l.trim_start();
+        let l = l.trim_start_matches([' ', '\t']);
         if i + 1 == n {
             s.push_str(l.trim_end());
         } else if l.ends_with("  ") {
@@ -258,13 +393,13 @@ fn code_para(line: &str) -> FBlock {
 }
 
 /// Parse block structure. `level` is the list nesting level for lists found here.
-fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
+fn parse_blocks(lines: &[String], depth: usize, level: u8, refs: &Refs) -> Vec<FBlock> {
     let mut out = Vec::new();
     let mut para: Vec<String> = Vec::new();
     let mut i = 0;
     while let Some(line) = lines.get(i) {
         if is_blank(line) {
-            flush_para(&mut para, &mut out, depth);
+            flush_para(&mut para, &mut out, depth, refs);
             i += 1;
             continue;
         }
@@ -293,7 +428,7 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
             out.extend(code.into_iter().map(code_para));
             continue;
         }
-        let t = line.trim_start();
+        let t = line.trim_start_matches([' ', '\t']);
         // Setext heading underline.
         if !para.is_empty() {
             let u = t.trim_end();
@@ -302,32 +437,32 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
                 let text = join_lines(&para);
                 para.clear();
                 let mut p = Para::new(Kind::Heading(lvl));
-                p.inlines = parse_inlines(&text, &Fmt::default(), depth);
+                p.inlines = parse_inlines(&text, &Fmt::default(), depth, refs);
                 out.push(FBlock::Para(p));
                 i += 1;
                 continue;
             }
         }
         if let Some((n, body)) = atx_heading(t) {
-            flush_para(&mut para, &mut out, depth);
+            flush_para(&mut para, &mut out, depth, refs);
             let mut p = Para::new(Kind::Heading(n));
-            p.inlines = parse_inlines(body, &Fmt::default(), depth);
+            p.inlines = parse_inlines(body, &Fmt::default(), depth, refs);
             out.push(FBlock::Para(p));
             i += 1;
             continue;
         }
         if thematic_break(t) {
-            flush_para(&mut para, &mut out, depth);
+            flush_para(&mut para, &mut out, depth, refs);
             out.push(FBlock::Para(Para::new(Kind::Rule)));
             i += 1;
             continue;
         }
         if let Some((fc, fl)) = fence(t) {
-            flush_para(&mut para, &mut out, depth);
+            flush_para(&mut para, &mut out, depth, refs);
             i += 1;
             while let Some(l) = lines.get(i) {
                 i += 1;
-                let lt = l.trim_start();
+                let lt = l.trim_start_matches([' ', '\t']);
                 if indent(l) < 4 && fence(lt).is_some_and(|(c, n)| c == fc && n >= fl) && lt.trim_start_matches(fc).trim().is_empty() {
                     break;
                 }
@@ -336,10 +471,10 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
             continue;
         }
         if t.starts_with('>') {
-            flush_para(&mut para, &mut out, depth);
+            flush_para(&mut para, &mut out, depth, refs);
             let mut inner: Vec<String> = Vec::new();
             while let Some(l) = lines.get(i) {
-                let lt = l.trim_start();
+                let lt = l.trim_start_matches([' ', '\t']);
                 if indent(l) < 4 && lt.starts_with('>') {
                     let s = &lt[1..];
                     inner.push(s.strip_prefix(' ').unwrap_or(s).to_string());
@@ -355,7 +490,7 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
                 p.push_text(&inner.join(" "), &Fmt::default());
                 out.push(FBlock::Para(p));
             } else {
-                for mut b in parse_blocks(&inner, depth + 1, level) {
+                for mut b in parse_blocks(&inner, depth + 1, level, refs) {
                     if let FBlock::Para(p) = &mut b
                         && p.kind == Kind::Normal
                     {
@@ -374,7 +509,7 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
             if head.len() == aligns.len() {
                 let mut table = FTable::default();
                 let cell = |s: &str, header: bool, a: Option<Align>| {
-                    let p = Para { align: a, inlines: parse_inlines(s, &Fmt::default(), depth), ..Default::default() };
+                    let p = Para { align: a, inlines: parse_inlines(s, &Fmt::default(), depth, refs), ..Default::default() };
                     Cell { blocks: vec![FBlock::Para(p)], header, ..Default::default() }
                 };
                 table.rows.push(head.iter().zip(&aligns).map(|(s, a)| cell(s, true, *a)).collect());
@@ -395,63 +530,93 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
         if let Some(m) = list_marker(t)
             && (para.is_empty() || ((!m.ordered || m.start == 1) && !is_blank(t.get(m.len..).unwrap_or(""))))
         {
-            flush_para(&mut para, &mut out, depth);
-            i = parse_list(lines, i, depth, level, &mut out);
+            flush_para(&mut para, &mut out, depth, refs);
+            i = parse_list(lines, i, depth, level, &mut out, refs);
             continue;
         }
         para.push(line.clone());
         i += 1;
     }
-    flush_para(&mut para, &mut out, depth);
+    flush_para(&mut para, &mut out, depth, refs);
     out
 }
 
+fn marker_space(ind: usize, marker_len: usize, after: &str) -> (usize, usize) {
+    let mut cols = 0;
+    let mut bytes = 0;
+    let mut rest = after;
+    while let Some(c) = rest.chars().next() {
+        match c {
+            ' ' => {
+                cols += 1;
+                bytes += 1;
+                rest = &rest[1..];
+                if cols >= 4 {
+                    break;
+                }
+            }
+            '\t' => {
+                let col = ind + marker_len + cols;
+                let n = 4 - col % 4;
+                cols += n;
+                bytes += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    (cols, bytes)
+}
+
 /// Parse a list starting at `lines[i]`; returns the index after it.
-fn parse_list(lines: &[String], mut i: usize, depth: usize, level: u8, out: &mut Vec<FBlock>) -> usize {
-    let Some(first) = lines.get(i).and_then(|l| list_marker(l.trim_start())) else { return i + 1 };
+fn parse_list(lines: &[String], mut i: usize, depth: usize, level: u8, out: &mut Vec<FBlock>, refs: &Refs) -> usize {
+    let Some(first) = lines.get(i).and_then(|l| list_marker(l.trim_start_matches([' ', '\t']))) else { return i + 1 };
     while let Some(line) = lines.get(i) {
         let ind = indent(line);
         if ind >= 4 {
             break;
         }
-        let t = line.trim_start();
+        let t = line.trim_start_matches([' ', '\t']);
         let Some(m) = list_marker(t) else { break };
         if m.ordered != first.ordered || m.ch != first.ch {
             break;
         }
         let after = t.get(m.len..).unwrap_or("");
-        let spaces = indent(after);
-        let content_indent = if is_blank(after) || spaces > 4 { ind + m.len + 1 } else { ind + m.len + spaces };
-        let mut item: Vec<String> =
-            vec![if is_blank(after) { String::new() } else { after.get(spaces.min(4).min(after.len())..).unwrap_or("").to_string() }];
-        if spaces > 4 {
-            item[0] = after.get(1..).unwrap_or("").to_string();
-        }
+        let (spaces, skip) = if indent(after) > 4 {
+            (1, 1)
+        } else if after.starts_with([' ', '\t']) {
+            marker_space(ind, m.len, after)
+        } else {
+            (0, 0)
+        };
+        let content_indent = if is_blank(after) { ind + m.len + 1 } else { ind + m.len + spaces };
+        let item0 = if is_blank(after) { String::new() } else { after.get(skip.min(after.len())..).unwrap_or("").to_string() };
+        let mut item: Vec<String> = vec![item0];
         i += 1;
         while let Some(l) = lines.get(i) {
             if is_blank(l) {
                 item.push(String::new());
             } else if indent(l) >= content_indent {
                 item.push(strip_indent(l, content_indent).to_string());
-            } else if item.last().is_some_and(|x| !is_blank(x)) && !interrupts(l) && list_marker(l.trim_start()).is_none() {
+            } else if item.last().is_some_and(|x| !is_blank(x)) && !interrupts(l) && list_marker(l.trim_start_matches([' ', '\t'])).is_none() {
                 // Lazy continuation of the item's paragraph.
-                item.push(l.trim_start().to_string());
+                item.push(l.trim_start_matches([' ', '\t']).to_string());
             } else {
                 break;
             }
             i += 1;
         }
         // Blank lines at the end of an item belong between items.
-        while item.len() > 1 && item.last().is_some_and(|x| x.is_empty()) {
+        while item.len() > 1 && item.last().is_some_and(String::is_empty) {
             item.pop();
         }
-        let li = ListInfo { ordered: first.ordered, level: level.min(8) };
+        let li = ListInfo { ordered: first.ordered, level: level.min(8), start: first.start };
         let inner = if depth >= MAX_NEST {
             let mut p = Para::default();
             p.push_text(&item.join(" "), &Fmt::default());
             vec![FBlock::Para(p)]
         } else {
-            parse_blocks(&item, depth + 1, level.saturating_add(1).min(8))
+            parse_blocks(&item, depth + 1, level.saturating_add(1).min(8), refs)
         };
         let mut placed = false;
         if inner.is_empty() {
@@ -492,9 +657,9 @@ fn parse_list(lines: &[String], mut i: usize, depth: usize, level: u8, out: &mut
         }
         // Blank lines between items.
         while lines.get(i).is_some_and(|l| is_blank(l)) {
-            let next_is_item = lines
-                .get(i + 1)
-                .is_some_and(|l| indent(l) < 4 && list_marker(l.trim_start()).is_some_and(|m| m.ordered == first.ordered && m.ch == first.ch));
+            let next_is_item = lines.get(i + 1).is_some_and(|l| {
+                indent(l) < 4 && list_marker(l.trim_start_matches([' ', '\t'])).is_some_and(|m| m.ordered == first.ordered && m.ch == first.ch)
+            });
             if !next_is_item {
                 return i;
             }
@@ -524,8 +689,8 @@ fn is_punct(c: char) -> bool {
 }
 
 /// Parse inline Markdown into formatted spans (on top of `base`).
-pub fn parse_inlines(s: &str, base: &Fmt, depth: usize) -> Vec<Inline> {
-    let nodes = tokenize(s, base, depth);
+pub fn parse_inlines(s: &str, base: &Fmt, depth: usize, refs: &Refs) -> Vec<Inline> {
+    let nodes = tokenize(s, base, depth, refs);
     emit(nodes)
 }
 
@@ -543,10 +708,11 @@ fn push_text(nodes: &mut Vec<Node>, s: &str, f: &Fmt) {
 }
 
 /// The closing `]` matching the `[` at byte `open` (escapes and code spans respected). Gives up
-/// after looking `max` bytes ahead.
-fn matching_bracket(s: &str, open: usize, max: usize) -> Option<usize> {
+/// after looking `max` bytes ahead. Records in `known` every bracket pair it passes, and every `[`
+/// still open at the end of the text: a scan from one of those would take the same path.
+fn matching_bracket(s: &str, open: usize, max: usize, ticks: &Backticks, known: &mut HashMap<usize, Option<usize>>) -> Option<usize> {
     let b = s.as_bytes();
-    let mut depth = 0usize;
+    let mut opens: Vec<usize> = Vec::new();
     let mut i = open;
     while let Some(&c) = b.get(i) {
         if i - open > max {
@@ -556,16 +722,18 @@ fn matching_bracket(s: &str, open: usize, max: usize) -> Option<usize> {
             b'\\' => i += 1,
             b'`' => {
                 let n = b.get(i..).map(|r| r.iter().take_while(|x| **x == b'`').count()).unwrap_or(1);
-                if let Some(end) = find_backticks(s, i + n, n) {
+                if let Some(end) = ticks.find(i + n, n) {
                     i = end + n - 1;
                 } else {
                     i += n - 1;
                 }
             }
-            b'[' => depth += 1,
+            b'[' => opens.push(i),
             b']' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
+                if let Some(o) = opens.pop() {
+                    known.insert(o, Some(i));
+                }
+                if opens.is_empty() {
                     return Some(i);
                 }
             }
@@ -573,25 +741,39 @@ fn matching_bracket(s: &str, open: usize, max: usize) -> Option<usize> {
         }
         i += 1;
     }
+    for o in opens {
+        known.insert(o, None);
+    }
     None
 }
 
-/// Byte index of a run of exactly `n` backticks at or after `from`.
-fn find_backticks(s: &str, from: usize, n: usize) -> Option<usize> {
-    let b = s.as_bytes();
-    let mut i = from;
-    while let Some(&c) = b.get(i) {
-        if c == b'`' {
-            let k = b.get(i..).map(|r| r.iter().take_while(|x| **x == b'`').count()).unwrap_or(1);
-            if k == n {
-                return Some(i);
+/// Where a text's runs of backticks start, by run length. Finding the run that closes a code span
+/// is then a lookup: scanning the rest of the text for it, again for every run nothing closes
+/// (each of a different length) and from every link bracket over them, was superlinear.
+struct Backticks(HashMap<usize, Vec<usize>>);
+
+impl Backticks {
+    fn new(s: &str) -> Self {
+        let b = s.as_bytes();
+        let mut runs: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut i = 0;
+        while let Some(&c) = b.get(i) {
+            if c == b'`' {
+                let k = b.get(i..).map(|r| r.iter().take_while(|x| **x == b'`').count()).unwrap_or(1);
+                runs.entry(k).or_default().push(i);
+                i += k;
+            } else {
+                i += 1;
             }
-            i += k;
-        } else {
-            i += 1;
         }
+        Self(runs)
     }
-    None
+
+    /// Byte index of a run of exactly `n` backticks at or after `from` (which is not inside a run).
+    fn find(&self, from: usize, n: usize) -> Option<usize> {
+        let starts = self.0.get(&n)?;
+        starts.get(starts.partition_point(|&p| p < from)).copied()
+    }
 }
 
 /// Parse `(dest "title")` at byte `at` (which holds `(`): (destination, index after `)`).
@@ -651,7 +833,7 @@ fn unescape(s: &str) -> String {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\'
-            && let Some(n) = chars.peek().copied().filter(|n| n.is_ascii_punctuation())
+            && let Some(n) = chars.peek().copied().filter(char::is_ascii_punctuation)
         {
             out.push(n);
             chars.next();
@@ -670,7 +852,7 @@ fn tag_attr(tag: &str, name: &str) -> Option<String> {
         let at = from + k;
         let before = lower.get(..at)?.chars().next_back();
         let after = lower.get(at + name.len()..)?.trim_start();
-        if before.is_some_and(|c| c.is_whitespace()) && after.starts_with('=') {
+        if before.is_some_and(char::is_whitespace) && after.starts_with('=') {
             let v = after.get(1..)?.trim_start();
             let q = v.chars().next()?;
             return Some(if q == '"' || q == '\'' {
@@ -689,12 +871,15 @@ fn tag_attr(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
+fn tokenize(s: &str, base: &Fmt, depth: usize, refs: &Refs) -> Vec<Node> {
     let mut nodes: Vec<Node> = Vec::new();
     // Bytes the link and image scans below may look ahead in total. Each unmatched `[` or `![(`
     // would otherwise rescan the rest of the text, which is quadratic on hostile input; once the
-    // budget is gone, further brackets are plain text.
+    // budget is gone, further brackets are plain text. A scan pays for what it reads; brackets an
+    // earlier scan passed are looked up in `known` instead.
     let mut scan_budget = s.len().saturating_mul(8).saturating_add(8192);
+    let ticks = Backticks::new(s);
+    let mut known: HashMap<usize, Option<usize>> = HashMap::new();
     let b = s.as_bytes();
     let mut i = 0usize;
     let mut text_start = 0usize;
@@ -724,7 +909,7 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
             b'`' => {
                 flush!();
                 let n = b.get(i..).map(|r| r.iter().take_while(|x| **x == b'`').count()).unwrap_or(1);
-                match find_backticks(s, i + n, n) {
+                match ticks.find(i + n, n) {
                     Some(end) => {
                         let mut code = s.get(i + n..end).unwrap_or("").replace('\n', " ");
                         if code.len() >= 2 && code.starts_with(' ') && code.ends_with(' ') && !code.trim().is_empty() {
@@ -766,14 +951,39 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
             b'!' | b'[' if depth < MAX_NEST => {
                 let img = c == b'!';
                 let open = if img { i + 1 } else { i };
-                let parsed = if b.get(open) == Some(&b'[') && scan_budget > 0 {
-                    let found = matching_bracket(s, open, scan_budget);
-                    scan_budget = scan_budget.saturating_sub(found.map_or(scan_budget, |close| close - open));
-                    found.and_then(|close| {
-                        // A destination that does not parse may have been read to the end of the text.
-                        scan_budget = scan_budget.saturating_sub(s.len().saturating_sub(close));
-                        let (dest, end) = link_dest(s, close + 1)?;
-                        Some((s.get(open + 1..close)?.to_string(), dest, end))
+                let parsed = if b.get(open) == Some(&b'[') {
+                    let found = match known.get(&open).copied() {
+                        Some(found) => found,
+                        None if scan_budget > 0 => {
+                            let found = matching_bracket(s, open, scan_budget, &ticks, &mut known);
+                            scan_budget = scan_budget.saturating_sub(found.unwrap_or(s.len()).saturating_sub(open));
+                            found
+                        }
+                        None => None,
+                    };
+                    found.filter(|_| scan_budget > 0).and_then(|close| {
+                        let text = s.get(open + 1..close)?;
+                        if b.get(close + 1) == Some(&b'(') {
+                            // A destination that does not parse may have been read to the end of the text.
+                            let dest = link_dest(s, close + 1);
+                            scan_budget = scan_budget.saturating_sub(dest.as_ref().map_or(s.len(), |d| d.1).saturating_sub(close));
+                            let (dest, end) = dest?;
+                            return Some((text.to_string(), dest, end));
+                        }
+                        // A reference link: `[text][label]`, `[text][]` and `[text]` all take
+                        // their destination from a definition collected before parsing (#3238).
+                        // The shortcut form is only a link when the label is defined, so an
+                        // ordinary bracketed phrase is still text.
+                        let (label, end) = match s.get(close + 1..).and_then(|rest| rest.strip_prefix('[')) {
+                            Some(rest) => {
+                                let shut = rest.find(']')?;
+                                let inner = rest.get(..shut)?;
+                                let label = if inner.trim().is_empty() { text } else { inner };
+                                (label, close + 2 + shut + 1)
+                            }
+                            None => (text, close + 1),
+                        };
+                        Some((text.to_string(), refs.get(&ref_label(label))?.clone(), end))
                     })
                 } else {
                     None
@@ -781,7 +991,7 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
                 match parsed {
                     Some((inner, dest, end)) if img => {
                         flush!();
-                        let alt: String = parse_inlines(&inner, &Fmt::default(), depth + 1)
+                        let alt: String = parse_inlines(&inner, &Fmt::default(), depth + 1, refs)
                             .iter()
                             .filter_map(|x| if let Inline::Text(t, _) = x { Some(t.as_str()) } else { None })
                             .collect();
@@ -796,7 +1006,7 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
                         flush!();
                         let mut f = base.clone();
                         f.link = Some(dest);
-                        for x in parse_inlines(&inner, &f, depth + 1) {
+                        for x in parse_inlines(&inner, &f, depth + 1, refs) {
                             nodes.push(Node::Inl(x));
                         }
                         i = end;
@@ -1028,30 +1238,46 @@ pub(crate) fn escape(s: &str) -> String {
     out
 }
 
-/// Escape what would start a block at the beginning of a line.
+/// Escape what would start a block at the beginning of a line. Leading spaces are kept, but at
+/// most three (a tab counts as four): four would turn the line into an indented code block.
 fn escape_line_start(s: String) -> String {
-    let s = s.trim_start().to_string();
-    let t = s.as_str();
-    let lead = s.len() - t.len();
+    let t = s.trim_start_matches([' ', '\t']);
+    let lead = s.get(..s.len() - t.len()).unwrap_or("");
+    let cols: usize = lead.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum();
+    let indent = " ".repeat(cols.min(3));
     let needs = t.starts_with('#')
         || t.starts_with('>')
         || t.starts_with("- ")
         || t.starts_with("+ ")
+        || t.starts_with("-\t")
+        || t.starts_with("+\t")
         || t == "-"
         || t == "+"
         || t.starts_with('=')
+        || (t.starts_with('-') && t.trim_end_matches([' ', '\t']).chars().all(|c| c == '-'))
         || thematic_break(t)
         || {
-            let d = t.chars().take_while(|c| c.is_ascii_digit()).count();
-            d > 0 && t.get(d..).is_some_and(|r| r.starts_with(". ") || r.starts_with(") ") || r == "." || r == ")")
+            let d = t.chars().take_while(char::is_ascii_digit).count();
+            d > 0
+                && t.get(d..).is_some_and(|r| {
+                    r.starts_with(". ") || r.starts_with(") ") || r.starts_with(".\t") || r.starts_with(")\t") || r == "." || r == ")"
+                })
         };
     if !needs {
-        return s;
+        return if cols > 3 || lead.contains('\t') { format!("{indent}{t}") } else { s };
     }
     if let Some(d) = t.find(['.', ')']).filter(|_| t.starts_with(|c: char| c.is_ascii_digit())) {
-        return format!("{}{}\\{}", &s[..lead], &t[..d], &t[d..]);
+        return format!("{indent}{}\\{}", &t[..d], &t[d..]);
     }
-    format!("{}\\{}", &s[..lead], t)
+    format!("{indent}\\{t}")
+}
+
+/// [`escape_line_start`] for every line of a body, including those after a manual line break.
+fn escape_lines(body: String) -> String {
+    if !body.contains("\\\n") {
+        return escape_line_start(body);
+    }
+    body.split("\\\n").map(|l| escape_line_start(l.to_string())).collect::<Vec<_>>().join("\\\n")
 }
 
 fn code_span(t: &str) -> String {
@@ -1079,9 +1305,19 @@ enum Mark {
 
 /// Inline spans → Markdown with properly nested markers.
 fn inlines_md(inlines: &[Inline]) -> String {
+    inlines_md_impl(inlines, false)
+}
+
+fn inlines_md_table(inlines: &[Inline]) -> String {
+    inlines_md_impl(inlines, true)
+}
+
+fn inlines_md_impl(inlines: &[Inline], in_table: bool) -> String {
     // Split into (text, fmt) pieces with whitespace moved outside emphasis.
     let mut pieces: Vec<(String, Fmt, Option<String>)> = Vec::new();
-    let inlines = crate::model::equations_as_text(inlines);
+    let eq = crate::model::equations_as_text(inlines);
+    // Markdown keeps no ruby: its base text goes through the text path below.
+    let inlines = crate::model::ruby_as_text(&eq);
     for i in inlines.iter() {
         match i {
             Inline::Text(t, f) => {
@@ -1114,6 +1350,8 @@ fn inlines_md(inlines: &[Inline]) -> String {
             }
             Inline::Figure(alt) => pieces.push((String::new(), Fmt::default(), Some(format!("![{}]()", escape(alt))))),
             Inline::Equation { .. } => {}
+            // Read as its base text by `ruby_as_text` above.
+            Inline::Ruby { .. } => {}
         }
     }
     let mut out = String::new();
@@ -1159,7 +1397,12 @@ fn inlines_md(inlines: &[Inline]) -> String {
             }
         }
         if f.code {
-            out.push_str(&code_span(&text));
+            if in_table {
+                let t = text.replace('|', "\\|");
+                out.push_str(&code_span(&t));
+            } else {
+                out.push_str(&code_span(&text));
+            }
         } else {
             out.push_str(&escape(&text).replace('\n', "\\\n").replace('\t', "    "));
         }
@@ -1189,7 +1432,7 @@ fn table_md(t: &FTable, out: &mut Vec<String>) {
         let mut parts = Vec::new();
         for b in &c.blocks {
             match b {
-                FBlock::Para(p) => parts.push(inlines_md(&p.inlines).replace("\\\n", "<br>")),
+                FBlock::Para(p) => parts.push(inlines_md_table(&p.inlines).replace("\\\n", "<br>")),
                 FBlock::Table(inner) => parts.push(escape(&inner.rows.iter().flat_map(|r| r.iter().map(Cell::text)).collect::<Vec<_>>().join(" "))),
             }
         }
@@ -1222,6 +1465,7 @@ fn table_md(t: &FTable, out: &mut Vec<String>) {
         .map(|a| match a {
             Some(Align::Center) => ":---:",
             Some(Align::Right) => "---:",
+            Some(Align::Left) => ":---",
             _ => "---",
         })
         .collect();
@@ -1268,7 +1512,9 @@ fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>) {
                     i += 1;
                 }
                 let longest = lines.iter().map(|l| l.chars().filter(|c| *c == '`').count()).max().unwrap_or(0);
-                let fence = "`".repeat(3.max(longest + 1).min(64));
+                // The fence must be longer than the longest run in the content, or a content
+                // line is read back as the closing fence (the `.min(64)` cap did exactly that).
+                let fence = "`".repeat(3.max(longest + 1));
                 out.push(fence.clone());
                 out.extend(lines);
                 out.push(fence);
@@ -1288,7 +1534,10 @@ fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>) {
                             prev_top_ordered = li.ordered;
                         }
                         let n = counters.get_mut(lv).map(|c| {
-                            *c += 1;
+                            if *c == 0 {
+                                *c = li.start.saturating_sub(1);
+                            }
+                            *c = c.saturating_add(1);
                             *c
                         });
                         for d in counters.iter_mut().skip(lv + 1) {
@@ -1297,8 +1546,13 @@ fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>) {
                         let marker = if li.ordered { format!("{}.", n.unwrap_or(1)) } else { "-".to_string() };
                         let pad = " ".repeat(4 * lv);
                         let cont = " ".repeat(4 * lv + marker.len() + 1);
-                        let body = body.replace("\\\n", &format!("\\\n{cont}"));
-                        let body = if p.kind == Kind::Code { code_span(&p.text()) } else { body };
+                        let body = if p.kind == Kind::Code {
+                            code_span(&p.text())
+                        } else {
+                            let body = escape_lines(body).replace("\\\n", &format!("\\\n{cont}"));
+                            // The bullet marker can turn a short run of hyphens into a rule.
+                            if thematic_break(&format!("{marker} {body}")) { format!("\\{body}") } else { body }
+                        };
                         out.push(format!("{pad}{marker} {body}").trim_end().to_string());
                         prev_list = true;
                         let next_is_list = matches!(blocks.get(i + 1), Some(FBlock::Para(q)) if q.list.is_some());
@@ -1313,7 +1567,7 @@ fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>) {
                             Kind::Title => format!("# {}", body.replace("\\\n", " ")),
                             Kind::Rule => "---".to_string(),
                             Kind::Quote => {
-                                let b = escape_line_start(body);
+                                let b = escape_lines(body);
                                 format!("> {}", b.replace("\\\n", "\\\n> "))
                             }
                             _ => {
@@ -1321,7 +1575,7 @@ fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>) {
                                     i += 1;
                                     continue;
                                 }
-                                escape_line_start(body)
+                                escape_lines(body)
                             }
                         };
                         out.push(line);
@@ -1339,7 +1593,7 @@ mod tests {
     use super::*;
 
     fn inl(s: &str) -> Vec<Inline> {
-        parse_inlines(s, &Fmt::default(), 0)
+        parse_inlines(s, &Fmt::default(), 0, &Refs::new())
     }
 
     fn spans(s: &str) -> Vec<(String, bool, bool)> {
@@ -1372,6 +1626,84 @@ mod tests {
         assert!(s.iter().any(|i| matches!(i, Inline::Text(t, f) if t == "a*b*" && f.code)));
         let text: String = s.iter().filter_map(|i| if let Inline::Text(t, _) = i { Some(t.as_str()) } else { None }).collect();
         assert!(text.contains("*lit* & "), "{text}");
+    }
+
+    /// Reference links: `[text][label]`, `[text][]` and `[text]` take their destination from a
+    /// definition line, and the definition itself leaves the document. Before, none of the three
+    /// was a link and the definition stayed as a paragraph of its own (#3238).
+    #[test]
+    fn reference_links_resolve_and_their_definitions_leave_the_body() {
+        let links = |md: &str| -> Vec<(String, String)> {
+            match &*parse(md).blocks {
+                [FBlock::Para(p), ..] => p
+                    .inlines
+                    .iter()
+                    .filter_map(|x| match x {
+                        Inline::Text(t, f) => f.link.clone().map(|l| (t.clone(), l)),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => vec![],
+            }
+        };
+        let def = "\n\n[ref1]: https://example.com/ref\n";
+        let to_ref = |text: &str| vec![(text.to_string(), "https://example.com/ref".to_string())];
+
+        assert_eq!(links(&format!("[click here][ref1]{def}")), to_ref("click here"), "full");
+        assert_eq!(links(&format!("[ref1][]{def}")), to_ref("ref1"), "collapsed");
+        assert_eq!(links(&format!("[ref1]{def}")), to_ref("ref1"), "shortcut");
+        // Labels match case-folded with runs of white space collapsed (CommonMark §4.7).
+        assert_eq!(links(&format!("[click here][  REF1  ]{def}")), to_ref("click here"), "folded label");
+        // An undefined label is not a link: an ordinary bracketed phrase stays text.
+        assert_eq!(links(&format!("[nope]{def}")), vec![], "undefined");
+        // Inline links are unaffected.
+        assert_eq!(links("[x](https://inline.example)"), vec![("x".into(), "https://inline.example".into())], "inline");
+
+        // The definition is not a paragraph, and its text is nowhere in the body.
+        let doc = import(&format!("Reference link: [click here][ref1]{def}"));
+        let text = doc.plain_text(wordcraft_doc::StoryRef::Body);
+        assert_eq!(text, "Reference link: click here", "{text:?}");
+
+        // A definition inside a fence is code, not a definition.
+        let fenced = "```\n[ref1]: https://example.com/ref\n```\n\n[ref1]\n";
+        let body = import(fenced).plain_text(wordcraft_doc::StoryRef::Body);
+        assert!(body.contains("[ref1]: https://example.com/ref"), "the fenced definition is still code: {body:?}");
+        assert_eq!(links(fenced), vec![], "a fenced definition defines nothing");
+    }
+
+    /// A definition has to start a block (CommonMark §4.7), and a fence opens and closes by the
+    /// same rules the block parser uses. Reading a line without that context deleted text: a
+    /// definition-shaped line inside a paragraph, and every such line inside a code block whose
+    /// fence this pass thought had closed.
+    #[test]
+    fn a_definition_shaped_line_that_is_not_a_definition_stays_in_the_document() {
+        let body = |md: &str| import(md).plain_text(wordcraft_doc::StoryRef::Body);
+
+        // A definition cannot interrupt a paragraph: this is the author's text, lines and all.
+        let para = "Status update\n[Warning]: unstable\nmore text\n";
+        assert_eq!(body(para), "Status update [Warning]: unstable more text", "{:?}", body(para));
+
+        // `` ```rust `` holds an info string, so it does not close a fence: the definition-shaped
+        // line after it is still code.
+        let code = "```\n```rust\n[foo]: /bar\n```\n\nSee [foo].\n";
+        assert!(body(code).contains("[foo]: /bar"), "{:?}", body(code));
+        assert!(body(code).ends_with("See [foo]."), "nothing defines foo: {:?}", body(code));
+
+        // Four spaces of indentation is code, not a fence, so the definition that follows is
+        // taken and the reference resolves.
+        let indented = "    ```\n\n[x]: /y\n\nSee [x].\n";
+        let doc = import(indented);
+        let text = doc.plain_text(wordcraft_doc::StoryRef::Body);
+        assert!(text.contains("```") && text.ends_with("See x."), "{text:?}");
+
+        // A definition still gives up its line after a blank line, at the start of the document,
+        // after a heading, and after another definition.
+        let starts = "[a]: /a\n[b]: /b\n\n# Head\n[c]: /c\n\nSee [a], [b], [c].\n";
+        assert_eq!(body(starts), "Head\nSee a, b, c.", "{:?}", body(starts));
+
+        // A footnote definition is not a link definition: it stays in the body.
+        let footnote = "x[^1]\n\n[^1]: Note\n";
+        assert!(body(footnote).contains("[^1]: Note"), "{:?}", body(footnote));
     }
 
     #[test]
@@ -1412,5 +1744,312 @@ mod tests {
         let FBlock::Para(q) = &back.blocks[0] else { panic!() };
         assert_eq!(q.text(), "1. not a list *really*");
         assert!(q.list.is_none());
+    }
+
+    #[test]
+    fn escape_line_start_preserves_indentation() {
+        assert_eq!(escape_line_start("   indented text".to_string()), "   indented text");
+        assert_eq!(escape_line_start("   # not a heading".to_string()), "   \\# not a heading");
+        assert_eq!(escape_line_start("  1. not a list".to_string()), "  1\\. not a list");
+        assert_eq!(escape_line_start("  > quote".to_string()), "  \\> quote");
+        // Four spaces or a tab would make an indented code block: the indent is capped at three.
+        assert_eq!(escape_line_start("      deep".to_string()), "   deep");
+        assert_eq!(escape_line_start("\tTabbed # text".to_string()), "   Tabbed # text");
+        assert_eq!(escape_line_start("    # not a heading".to_string()), "   \\# not a heading");
+        assert_eq!(escape_line_start(" \t1. not a list".to_string()), "   1\\. not a list");
+    }
+
+    #[test]
+    fn leading_unicode_whitespace_is_kept_and_does_not_start_blocks() {
+        let kinds_text = |md: &str| -> Vec<(Kind, bool, String)> {
+            parse(md).blocks.iter().filter_map(|b| if let FBlock::Para(p) = b { Some((p.kind, p.list.is_some(), p.text())) } else { None }).collect()
+        };
+        assert_eq!(kinds_text("\u{3000}\u{3000}日本語の段落\n"), vec![(Kind::Normal, false, "\u{3000}\u{3000}日本語の段落".to_string())]);
+        for src in ["\u{a0}# not a heading", "\u{3000}1. not a list", "\u{a0}- x", "\u{a0}> not a quote"] {
+            let mut p = Para::default();
+            p.push_text(src, &Fmt::default());
+            let md = escape_line_start(inlines_md(&p.inlines));
+            assert_eq!(kinds_text(&md), vec![(Kind::Normal, false, src.to_string())], "{src:?} via {md:?}");
+        }
+    }
+
+    #[test]
+    fn single_backtick_code_span_escaped_pipe() {
+        let md = "| Command | Status |\n| --- | --- |\n| `cmd \\| grep` | pass |\n";
+        let flow = parse(md);
+        let FBlock::Table(t) = &flow.blocks[0] else { panic!("expected table") };
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[1].len(), 2);
+        let FBlock::Para(p0) = &t.rows[1][0].blocks[0] else { panic!() };
+        assert_eq!(p0.inlines.len(), 1);
+        assert!(matches!(&p0.inlines[0], Inline::Text(t, f) if t == "cmd | grep" && f.code));
+        let FBlock::Para(p1) = &t.rows[1][1].blocks[0] else { panic!() };
+        assert_eq!(p1.text(), "pass");
+
+        let mut out = Vec::new();
+        table_md(t, &mut out);
+        let exported = out.join("\n");
+        assert!(exported.contains("`cmd \\| grep`"), "Exported: {exported}");
+    }
+
+    #[test]
+    fn double_backtick_code_span_escaped_pipe() {
+        let md = "| Syntax | Note |\n| --- | --- |\n| ``a \\| b`` | second |\n";
+        let flow = parse(md);
+        let FBlock::Table(t) = &flow.blocks[0] else { panic!("expected table") };
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[1].len(), 2);
+        let FBlock::Para(p0) = &t.rows[1][0].blocks[0] else { panic!() };
+        assert_eq!(p0.inlines.len(), 1);
+        assert!(matches!(&p0.inlines[0], Inline::Text(t, f) if t == "a | b" && f.code));
+        let FBlock::Para(p1) = &t.rows[1][1].blocks[0] else { panic!() };
+        assert_eq!(p1.text(), "second");
+    }
+
+    #[test]
+    fn code_span_literal_backtick_and_escaped_pipe() {
+        let md = "| Expression | Detail |\n| --- | --- |\n| ``a`b\\|c`` | distinct |\n";
+        let flow = parse(md);
+        let FBlock::Table(t) = &flow.blocks[0] else { panic!("expected table") };
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[1].len(), 2);
+        let FBlock::Para(p0) = &t.rows[1][0].blocks[0] else { panic!() };
+        assert_eq!(p0.inlines.len(), 1);
+        assert!(matches!(&p0.inlines[0], Inline::Text(t, f) if t == "a`b|c" && f.code));
+        let FBlock::Para(p1) = &t.rows[1][1].blocks[0] else { panic!() };
+        assert_eq!(p1.text(), "distinct");
+    }
+
+    #[test]
+    fn three_column_table_with_distinctive_text() {
+        let md = "| Col1 | Col2 | Col3 |\n| --- | --- | --- |\n| `p1\\|q1` | Distinctive Two | Distinctive Three |\n";
+        let flow = parse(md);
+        let FBlock::Table(t) = &flow.blocks[0] else { panic!("expected table") };
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[1].len(), 3);
+        assert_eq!(t.rows[1][0].text(), "p1|q1");
+        assert_eq!(t.rows[1][1].text(), "Distinctive Two");
+        assert_eq!(t.rows[1][2].text(), "Distinctive Three");
+        let FBlock::Para(p0) = &t.rows[1][0].blocks[0] else { panic!() };
+        assert!(matches!(&p0.inlines[0], Inline::Text(_, f) if f.code));
+        let FBlock::Para(p1) = &t.rows[1][1].blocks[0] else { panic!() };
+        assert!(matches!(&p1.inlines[0], Inline::Text(_, f) if !f.code));
+        let FBlock::Para(p2) = &t.rows[1][2].blocks[0] else { panic!() };
+        assert!(matches!(&p2.inlines[0], Inline::Text(_, f) if !f.code));
+    }
+
+    #[test]
+    fn regular_table_cells_containing_escaped_pipes() {
+        let md = "| Option | Description |\n| --- | --- |\n| Regular \\| Pipe | Normal text cell |\n";
+        let flow = parse(md);
+        let FBlock::Table(t) = &flow.blocks[0] else { panic!("expected table") };
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[1].len(), 2);
+        assert_eq!(t.rows[1][0].text(), "Regular | Pipe");
+        assert_eq!(t.rows[1][1].text(), "Normal text cell");
+        let FBlock::Para(p0) = &t.rows[1][0].blocks[0] else { panic!() };
+        assert!(matches!(&p0.inlines[0], Inline::Text(_, f) if !f.code));
+
+        let mut out = Vec::new();
+        table_md(t, &mut out);
+        let exported = out.join("\n");
+        assert!(exported.contains("Regular \\| Pipe"), "Exported: {exported}");
+        assert!(!exported.contains("Regular \\\\| Pipe"), "Exported: {exported}");
+    }
+
+    #[test]
+    fn unescaped_pipes_behave_as_gfm_column_separators() {
+        let md = "| Header 1 | Header 2 |\n| --- | --- |\n| `raw|pipe` | Extra Column |\n";
+        let flow = parse(md);
+        let FBlock::Table(t) = &flow.blocks[0] else { panic!("expected table") };
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[1].len(), 2);
+        assert_eq!(t.rows[1][0].text(), "`raw");
+        assert_eq!(t.rows[1][1].text(), "pipe`");
+    }
+
+    #[test]
+    fn ordinary_tables_and_standalone_code_spans_unchanged() {
+        let md = "| Alpha | Beta |\n| --- | --- |\n| 1 | 2 |\n";
+        let flow = parse(md);
+        let FBlock::Table(t) = &flow.blocks[0] else { panic!() };
+        let mut out = Vec::new();
+        table_md(t, &mut out);
+        assert_eq!(out.join("\n"), "| Alpha | Beta |\n| --- | --- |\n| 1 | 2 |");
+
+        let mut p = Para::default();
+        let f = Fmt { code: true, ..Default::default() };
+        p.push_text("cmd | grep", &f);
+        let exported = inlines_md(&p.inlines);
+        assert_eq!(exported, "`cmd | grep`");
+    }
+
+    #[test]
+    fn table_code_pipe_export_import_round_trip() {
+        let mut table = FTable::default();
+        let mut cell_a = Cell::default();
+        let mut para_a = Para::default();
+        let fmt_a = Fmt { code: true, ..Default::default() };
+        para_a.push_text("a`b|c", &fmt_a);
+        cell_a.blocks.push(FBlock::Para(para_a));
+
+        let mut cell_b = Cell::default();
+        let mut para_b = Para::default();
+        para_b.push_text("CRITICAL_DISTINCTIVE_INFO", &Fmt::default());
+        cell_b.blocks.push(FBlock::Para(para_b));
+
+        let mut head_a = Cell::default();
+        let mut head_para_a = Para::default();
+        head_para_a.push_text("Col A", &Fmt::default());
+        head_a.blocks.push(FBlock::Para(head_para_a));
+
+        let mut head_b = Cell::default();
+        let mut head_para_b = Para::default();
+        head_para_b.push_text("Col B", &Fmt::default());
+        head_b.blocks.push(FBlock::Para(head_para_b));
+
+        table.rows.push(vec![head_a, head_b]);
+        table.rows.push(vec![cell_a, cell_b]);
+
+        let mut out = Vec::new();
+        table_md(&table, &mut out);
+        let exported_md = out.join("\n");
+
+        assert!(exported_md.contains("``a`b\\|c``"), "Exported: {exported_md}");
+        assert!(exported_md.contains("CRITICAL\\_DISTINCTIVE\\_INFO"), "Exported: {exported_md}");
+
+        let back_flow = parse(&exported_md);
+        let FBlock::Table(back_table) = &back_flow.blocks[0] else { panic!("expected table") };
+
+        assert_eq!(back_table.rows.len(), 2, "Both rows must exist");
+        let row1 = &back_table.rows[1];
+        assert_eq!(row1.len(), 2, "Both cells must exist in row 1");
+
+        let back_cell_a = &row1[0];
+        let back_cell_b = &row1[1];
+        assert_eq!(back_cell_a.text(), "a`b|c", "Cell A text must be preserved");
+        assert_eq!(back_cell_b.text(), "CRITICAL_DISTINCTIVE_INFO", "Cell B text must be preserved");
+
+        let FBlock::Para(back_p_a) = &back_cell_a.blocks[0] else { panic!() };
+        assert_eq!(back_p_a.inlines.len(), 1);
+        assert!(
+            matches!(&back_p_a.inlines[0], Inline::Text(t, f) if t == "a`b|c" && f.code),
+            "Code formatting must remain intact on Cell A: {:?}",
+            back_p_a.inlines
+        );
+
+        let FBlock::Para(back_p_b) = &back_cell_b.blocks[0] else { panic!() };
+        assert_eq!(back_p_b.inlines.len(), 1);
+        assert!(
+            matches!(&back_p_b.inlines[0], Inline::Text(t, f) if t == "CRITICAL_DISTINCTIVE_INFO" && !f.code),
+            "Cell B formatting must remain plain text: {:?}",
+            back_p_b.inlines
+        );
+
+        assert_eq!(back_cell_a.text(), "a`b|c");
+        assert_eq!(back_cell_b.text(), "CRITICAL_DISTINCTIVE_INFO");
+
+        assert!(!back_cell_a.text().contains("CRITICAL_DISTINCTIVE_INFO"));
+        assert!(!back_cell_b.text().contains("a`b|c"));
+
+        let doc = import(&exported_md);
+        let re_exported = export(&doc);
+        assert!(re_exported.contains("``a`b\\|c``"), "Re-exported: {re_exported}");
+        assert!(re_exported.contains("CRITICAL\\_DISTINCTIVE\\_INFO"), "Re-exported: {re_exported}");
+        let doc2 = import(&re_exported);
+        let back_flow2 = model::from_doc(&doc2);
+        let FBlock::Table(back_table2) = &back_flow2.blocks[0] else { panic!() };
+        assert_eq!(back_table2.rows[1][0].text(), "a`b|c");
+        assert_eq!(back_table2.rows[1][1].text(), "CRITICAL_DISTINCTIVE_INFO");
+    }
+
+    #[test]
+    fn ordered_list_keeps_start_number() {
+        let txt = |md: &str| String::from_utf8_lossy(&crate::txt::export(&import(md))).into_owned();
+        assert_eq!(txt("5. a\n6. b"), "5.\ta\r\n6.\tb");
+        assert_eq!(txt("3. a\n- b\n4. c"), "3.\ta\r\n•\tb\r\n4.\tc");
+        assert_eq!(export(&import("5. a\n6. b")).trim_end(), "5. a\n6. b");
+    }
+
+    #[test]
+    fn lines_after_line_break_stay_in_paragraph() {
+        use wordcraft_doc::{CharProps, Document, Paragraph, StoryRef, para_block};
+        let cases = ["Shopping\n- milk\n# not a heading", "a\n1. x", "a\n2) x", "a\n+ x", "a\n---", "a\n***", "a\n==", "a\n--", "a\n> q"];
+        for s in cases {
+            let d = Document { body: vec![para_block(Paragraph::with_text(s, CharProps::default()))], ..Default::default() };
+            let md = export(&d);
+            let back = import(&md);
+            assert_eq!(back.body.len(), 1, "{s:?} -> {md:?}");
+            assert_eq!(back.plain_text(StoryRef::Body), s, "{md:?}");
+        }
+    }
+
+    #[test]
+    fn lines_after_line_break_stay_in_list_item_and_quote() {
+        let cases = ["a\n- x", "a\n# h", "a\n1. x", "a\n--", "a\n---", "a\n==", "a\n> q"];
+        let shapes: [(Kind, Option<ListInfo>); 5] = [
+            (Kind::Normal, Some(ListInfo { ordered: false, level: 0, start: 1 })),
+            (Kind::Normal, Some(ListInfo { ordered: true, level: 0, start: 1 })),
+            (Kind::Normal, Some(ListInfo { ordered: false, level: 1, start: 1 })),
+            (Kind::Normal, Some(ListInfo { ordered: true, level: 1, start: 1 })),
+            (Kind::Quote, None),
+        ];
+        for s in cases {
+            for (kind, list) in shapes {
+                let mut blocks = Vec::new();
+                if let Some(li) = list.filter(|l| l.level > 0) {
+                    let mut parent = Para::new(Kind::Normal);
+                    parent.list = Some(ListInfo { ordered: li.ordered, level: 0, start: 1 });
+                    parent.push_text("top", &Fmt::default());
+                    blocks.push(FBlock::Para(parent));
+                }
+                let mut p = Para::new(kind);
+                p.list = list;
+                p.push_text(s, &Fmt::default());
+                blocks.push(FBlock::Para(p));
+                let mut out = Vec::new();
+                write_blocks(&blocks, &mut out);
+                let md = out.join("\n");
+                let back = parse(&md);
+                assert_eq!(back.blocks.len(), blocks.len(), "{s:?} {kind:?} {list:?} -> {md:?}");
+                let Some(FBlock::Para(q)) = back.blocks.last() else { panic!("{md:?}") };
+                assert_eq!(q.kind, kind, "{md:?}");
+                assert_eq!(q.list, list, "{md:?}");
+                assert_eq!(q.text(), s, "{md:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn table_column_alignments_import_and_export() {
+        let md = "| Left | Center | Right | Default |\n| :--- | :---: | ---: | --- |\n| 1 | 2 | 3 | 4 |\n";
+        let flow = parse(md);
+        let FBlock::Table(t) = &flow.blocks[0] else { panic!("expected table") };
+        assert_eq!(t.rows.len(), 2);
+        let aligns: Vec<Option<Align>> =
+            t.rows[0].iter().map(|c| c.blocks.iter().find_map(|b| if let FBlock::Para(p) = b { Some(p.align) } else { None }).flatten()).collect();
+        assert_eq!(aligns, vec![Some(Align::Left), Some(Align::Center), Some(Align::Right), None]);
+
+        let mut out = Vec::new();
+        table_md(t, &mut out);
+        let exported = out.join("\n");
+        assert!(exported.contains("| :--- | :---: | ---: | --- |"), "Exported: {exported}");
+    }
+
+    #[test]
+    fn tab_separated_list_markers() {
+        let f = parse("-\tbullet item\n*\tstar item\n+\tplus item\n1.\tone item\n2)\ttwo item\n");
+        assert_eq!(f.blocks.len(), 5);
+        for (i, b) in f.blocks.iter().enumerate() {
+            let FBlock::Para(p) = b else { panic!("block {i} not a para") };
+            assert!(p.list.is_some(), "block {i} should be a list item: {:?}", p);
+        }
+        let FBlock::Para(p0) = &f.blocks[0] else { panic!() };
+        assert_eq!(p0.text(), "bullet item");
+        assert!(!p0.list.unwrap().ordered);
+
+        let FBlock::Para(p3) = &f.blocks[3] else { panic!() };
+        assert_eq!(p3.text(), "one item");
+        assert!(p3.list.unwrap().ordered);
     }
 }
