@@ -5,16 +5,33 @@
 //! destination may not have had), `fsync` it, journal the pending commit, rename over the
 //! destination, then journal the commit. A crash between the lines is finished or dropped by
 //! [`recover`][crate::StorageBackend::recover]. Non-atomic writes go straight to the final name
-//! (parents created first). Conditional writes (`if_match`) compare a sidecar `.etag` file the
-//! backend maintains per document; a mismatch is [`StorageError::Conflict`].
+//! (parents created first).
+//!
+//! A file's ETag is a hash of its current bytes, so a change made outside this backend (a sync
+//! client, another tool on the NAS) is seen by the next conditional write. Every write holds a
+//! per-document lock file (`.wordcraft-lock-<name>`, created exclusively) across the `if_match`
+//! check and the commit, so two writers going through this backend cannot both pass the check.
+//! The lock is cooperative: a program that ignores it can still replace the file between the
+//! check and the rename, and only a server-side compare-and-swap (WebDAV `If-Match`) closes that.
+//! A lock older than [`LOCK_STALE`] is treated as a crashed writer's residue and taken over.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::journal::{self, JournalEntry, JournalState};
 use crate::{Capabilities, Entry, FileMeta, RecoveryReport, StorageBackend, StorageError, WriteOptions, clean_path};
+
+/// Prefix of a staged write's temporary file (beside its document).
+const STAGE_PREFIX: &str = ".wordcraft-save-";
+/// Prefix of a document's writer lock file (beside its document).
+const LOCK_PREFIX: &str = ".wordcraft-lock-";
+/// How long a writer waits for another writer's lock before reporting a conflict.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+/// A lock file older than this belongs to a writer that crashed; it is taken over.
+pub const LOCK_STALE: Duration = Duration::from_secs(30);
 
 /// A folder on disk holding documents. `root` must be (or become) a directory.
 #[derive(Clone, Debug)]
@@ -51,19 +68,6 @@ impl LocalBackend {
         }
     }
 
-    fn read_etag(&self, dest: &Path) -> Option<String> {
-        fs::read_to_string(etag_path(dest)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-    }
-
-    fn write_etag(&self, dest: &Path, meta: &FileMeta) {
-        if let Some(tag) = &meta.etag
-            && let Some(parent) = dest.parent()
-        {
-            let _ = fs::create_dir_all(parent);
-            let _ = fs::write(etag_path(dest), tag.as_bytes());
-        }
-    }
-
     fn meta_of(&self, rel: &str, dest: &Path) -> Result<FileMeta, StorageError> {
         let meta = fs::metadata(dest).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -76,11 +80,11 @@ impl LocalBackend {
             return Err(StorageError::NotFound(rel.into()));
         }
         let modified = meta.modified().ok().map(|t| format!("{t:?}"));
-        Ok(FileMeta { size: meta.len(), etag: self.read_etag(dest), modified, is_dir: false })
+        Ok(FileMeta { size: meta.len(), etag: current_etag(dest), modified, is_dir: false })
     }
 
     /// Stage `bytes` beside `dest`, journal the pending write, rename into place, journal the
-    /// commit. Returns the staged temp path's file name (for the journal).
+    /// commit. The caller holds the document's [`PathLock`].
     fn atomic_commit(&self, rel: &str, dest: &Path, bytes: &[u8]) -> Result<FileMeta, StorageError> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         if let Some(parent) = dest.parent() {
@@ -95,7 +99,8 @@ impl LocalBackend {
         let fname = dest.file_name().and_then(|n| n.to_str()).unwrap_or("doc");
         for _ in 0..128 {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            let tmp = dest.with_file_name(format!(".wordcraft-save-{id}-{fname}.tmp"));
+            let tmp_name = format!("{STAGE_PREFIX}{id}-{fname}.tmp");
+            let tmp = dest.with_file_name(&tmp_name);
             let mut opts = OpenOptions::new();
             opts.write(true).create_new(true);
             #[cfg(unix)]
@@ -109,8 +114,13 @@ impl LocalBackend {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(StorageError::Io(format!("{}: {e}", tmp.display()))),
             };
-            let staged_name = tmp.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-            let entry = JournalEntry { path: rel.into(), staged: staged_name, state: JournalState::Pending, len: bytes.len() as u64 };
+            // Journal the staged file relative to the root (beside `rel`), so recovery finds
+            // staged writes in subfolders too.
+            let staged = match rel.rsplit_once('/') {
+                Some((dir, _)) => format!("{dir}/{tmp_name}"),
+                None => tmp_name.clone(),
+            };
+            let entry = JournalEntry { path: rel.into(), staged, state: JournalState::Pending, len: bytes.len() as u64 };
             if f.write_all(bytes).is_err() || f.sync_all().is_err() {
                 let _ = fs::remove_file(&tmp);
                 return Err(StorageError::Io(format!("{}: could not stage the write", dest.display())));
@@ -128,24 +138,82 @@ impl LocalBackend {
                 let _ = fs::remove_file(&tmp);
                 return Err(StorageError::Io(format!("{}: {e}", dest.display())));
             }
-            self.append_journal(&JournalEntry { state: JournalState::Committed, ..entry });
-            let tag = etag_of(bytes);
-            let meta = FileMeta { size: bytes.len() as u64, etag: Some(tag), modified: None, is_dir: false };
-            self.write_etag(dest, &meta);
-            return Ok(meta);
+            // The rename is durable only once the directory entry is: until then the journal
+            // keeps the write pending, and recovery confirms it from the final file.
+            if sync_parent(dest) {
+                self.append_journal(&JournalEntry { state: JournalState::Committed, ..entry });
+            }
+            return Ok(FileMeta { size: bytes.len() as u64, etag: Some(etag_of(bytes)), modified: None, is_dir: false });
         }
         Err(StorageError::Io(format!("{}: no free staging name after 128 tries", dest.display())))
     }
 }
 
-/// Sidecar holding a file's ETag: `<name>.wc-etag` beside it (hidden from [`list`][StorageBackend::list]).
-fn etag_path(dest: &Path) -> PathBuf {
-    let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("doc");
-    dest.with_file_name(format!("{name}.wc-etag"))
+/// Exclusive writer lock beside one document, removed on drop.
+struct PathLock {
+    path: PathBuf,
 }
 
-/// Content tag: a short hex of a wrapping hash (FNV-1a, 64-bit). It only needs to change when
-/// the bytes change *through this backend*; it is not a cryptographic digest.
+impl Drop for PathLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl PathLock {
+    /// Take `dest`'s writer lock, waiting up to [`LOCK_WAIT`] for another writer and taking over
+    /// a lock older than [`LOCK_STALE`].
+    fn acquire(rel: &str, dest: &Path) -> Result<PathLock, StorageError> {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| StorageError::Io(format!("{}: {e}", parent.display())))?;
+        }
+        let fname = dest.file_name().and_then(|n| n.to_str()).unwrap_or("doc");
+        let path = dest.with_file_name(format!("{LOCK_PREFIX}{fname}"));
+        let start = Instant::now();
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(PathLock { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let age = fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                    if age.is_some_and(|a| a > LOCK_STALE) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if start.elapsed() > LOCK_WAIT {
+                        return Err(StorageError::Conflict(format!("{rel}: another writer holds {}", path.display())));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(StorageError::Io(format!("{}: {e}", path.display()))),
+            }
+        }
+    }
+}
+
+/// `fsync` the directory holding `dest`, so a rename into it survives power loss. Returns whether
+/// that succeeded (always `true` where directories cannot be synced).
+fn sync_parent(dest: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        match dest.parent() {
+            Some(parent) => File::open(parent).and_then(|d| d.sync_all()).is_ok(),
+            None => true,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dest;
+        true
+    }
+}
+
+/// The ETag of whatever is stored at `dest` right now (`None` when it cannot be read).
+fn current_etag(dest: &Path) -> Option<String> {
+    fs::read(dest).ok().map(|b| etag_of(&b))
+}
+
+/// Content tag: a short hex of a wrapping hash (FNV-1a, 64-bit) of the stored bytes, so any change
+/// to the file (through this backend or not) changes it. It is not a cryptographic digest.
 fn etag_of(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in bytes {
@@ -170,8 +238,10 @@ impl StorageBackend for LocalBackend {
             return Err(StorageError::Unsupported(format!("{rel}: larger than 2 GB")));
         }
         let dest = self.root.join(&rel);
+        // Held across the `if_match` check and the commit (dropped on every return).
+        let _lock = PathLock::acquire(&rel, &dest)?;
         if let Some(want) = &opts.if_match {
-            match self.read_etag(&dest) {
+            match current_etag(&dest) {
                 Some(have) if &have == want => {}
                 _ if !dest.exists() => return Err(StorageError::Conflict(format!("{rel}: no stored version matches `{want}`"))),
                 _ => return Err(StorageError::Conflict(format!("{rel}: stored version changed (stale If-Match)"))),
@@ -185,9 +255,7 @@ impl StorageBackend for LocalBackend {
         }
         let mut f = File::create(&dest).map_err(|e| StorageError::Io(format!("{}: {e}", dest.display())))?;
         f.write_all(bytes).map_err(|e| StorageError::Io(format!("{}: {e}", dest.display())))?;
-        let meta = FileMeta { size: bytes.len() as u64, etag: Some(etag_of(bytes)), modified: None, is_dir: false };
-        self.write_etag(&dest, &meta);
-        Ok(meta)
+        Ok(FileMeta { size: bytes.len() as u64, etag: Some(etag_of(bytes)), modified: None, is_dir: false })
     }
 
     fn stat(&self, path: &str) -> Result<FileMeta, StorageError> {
@@ -209,9 +277,9 @@ impl StorageBackend for LocalBackend {
         for ent in rd {
             let ent = ent.map_err(|e| StorageError::Io(e.to_string()))?;
             let name = ent.file_name().to_string_lossy().into_owned();
-            if name.starts_with(".wordcraft-save-")
+            if name.starts_with(STAGE_PREFIX)
+                || name.starts_with(LOCK_PREFIX)
                 || name.ends_with(".tmp")
-                || name.ends_with(".wc-etag")
                 || name.ends_with(".lease")
                 || name == journal::JOURNAL_FILE
             {
@@ -223,7 +291,7 @@ impl StorageBackend for LocalBackend {
                 out.push(Entry { path: rel, meta: FileMeta { size: 0, etag: None, modified: None, is_dir: true } });
             } else if ft.is_file() {
                 let size = ent.metadata().map(|m| m.len()).unwrap_or(0);
-                out.push(Entry { path: rel, meta: FileMeta { size, etag: self.read_etag(&ent.path()), modified: None, is_dir: false } });
+                out.push(Entry { path: rel, meta: FileMeta { size, etag: current_etag(&ent.path()), modified: None, is_dir: false } });
             }
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -238,7 +306,6 @@ impl StorageBackend for LocalBackend {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(StorageError::Io(format!("{}: {e}", dest.display()))),
         }
-        let _ = fs::remove_file(etag_path(&dest));
         Ok(())
     }
 
@@ -255,25 +322,29 @@ impl StorageBackend for LocalBackend {
                 report.dropped += 1;
                 continue;
             };
-            let staged = self.root.join(&pending.staged);
             let dest = self.root.join(&rel);
-            let staged_bytes = fs::read(&staged).ok();
-            match staged_bytes {
-                Some(b) if b.len() as u64 == pending.len && dest.exists() => {
-                    // Final file survived alongside the staged one: the rename may or may not
-                    // have happened, but the document is intact either way.
-                    let _ = fs::remove_file(&staged);
-                    report.completed += 1;
-                }
+            // The journal sits inside the (possibly shared) root, so its `staged` field is
+            // untrusted: it must name one of our staging files beside `rel`, or nothing is
+            // touched for this entry.
+            let Some(staged) = staged_beside(&rel, &pending.staged) else {
+                report.dropped += 1;
+                continue;
+            };
+            let staged = self.root.join(staged);
+            match fs::read(&staged).ok() {
+                // The rename moves the staged file, so one that survives with its full length
+                // means the rename never happened: finish it (the staged bytes are the newer,
+                // fsynced save).
                 Some(b) if b.len() as u64 == pending.len => {
                     if fs::rename(&staged, &dest).is_ok() {
-                        let meta = FileMeta { size: b.len() as u64, etag: Some(etag_of(&b)), modified: None, is_dir: false };
-                        self.write_etag(&dest, &meta);
+                        sync_parent(&dest);
                         report.completed += 1;
                     } else {
                         report.dropped += 1;
                     }
                 }
+                // Gone: the rename happened (the commit line or the directory sync was lost).
+                None if fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == pending.len) => report.completed += 1,
                 _ => {
                     let _ = fs::remove_file(&staged);
                     report.dropped += 1;
@@ -287,6 +358,14 @@ impl StorageBackend for LocalBackend {
         let _ = fs::remove_file(self.journal_path());
         Ok(report)
     }
+}
+
+/// `staged` as a root-relative path, when it is a staging file in the same folder as `rel`.
+fn staged_beside(rel: &str, staged: &str) -> Option<String> {
+    let staged = clean_path(staged).ok()?;
+    let (dir, name) = staged.rsplit_once('/').map_or(("", staged.as_str()), |(d, n)| (d, n));
+    let rel_dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
+    (dir == rel_dir && name.starts_with(STAGE_PREFIX)).then(|| staged.clone())
 }
 
 /// Delete staging files no journal entry names. Returns how many were removed.
@@ -305,7 +384,7 @@ fn remove_orphan_temps(root: &Path) -> usize {
             let Ok(ft) = ent.file_type() else { continue };
             if ft.is_dir() {
                 stack.push(ent.path());
-            } else if ft.is_file() && name.starts_with(".wordcraft-save-") && fs::remove_file(ent.path()).is_ok() {
+            } else if ft.is_file() && name.starts_with(STAGE_PREFIX) && fs::remove_file(ent.path()).is_ok() {
                 removed += 1;
             }
         }
@@ -388,6 +467,103 @@ mod tests {
         let report = b.recover().unwrap();
         assert_eq!(report.completed, 1);
         assert_eq!(b.read("crash.txt").unwrap(), b"saved?");
+    }
+
+    #[test]
+    fn recover_finishes_interrupted_commit_in_a_subfolder() {
+        let (_tmp, b) = backend();
+        fs::create_dir_all(b.root().join("a/b")).unwrap();
+        fs::write(b.root().join("a/b/c.txt"), b"old").unwrap();
+        // Crash after staging, before the rename: the old file is still in place.
+        let staged = "a/b/.wordcraft-save-7-c.txt.tmp";
+        fs::write(b.root().join(staged), b"newer").unwrap();
+        b.append_journal(&JournalEntry { path: "a/b/c.txt".into(), staged: staged.into(), state: JournalState::Pending, len: 5 });
+        let report = b.recover().unwrap();
+        assert_eq!((report.completed, report.dropped), (1, 0));
+        assert_eq!(b.read("a/b/c.txt").unwrap(), b"newer", "the staged (newer) save wins, it is not discarded");
+        assert!(!b.root().join(staged).exists());
+    }
+
+    #[test]
+    fn recover_journals_staged_path_relative_to_root() {
+        let (_tmp, b) = backend();
+        b.write("x/y.txt", b"one", &WriteOptions { atomic: true, ..Default::default() }).unwrap();
+        let log = fs::read(b.root().join(journal::JOURNAL_FILE)).unwrap();
+        let entries = journal::read(&log);
+        assert!(entries.iter().all(|e| e.staged.starts_with("x/.wordcraft-save-")), "{entries:?}");
+    }
+
+    #[test]
+    fn recover_ignores_a_staged_path_outside_the_document_folder() {
+        let (_tmp, b) = backend();
+        let outside = TempDir::create();
+        let victim = outside.path().join("victim.txt");
+        fs::write(&victim, b"secret").unwrap();
+        fs::write(b.root().join("bait.txt"), b"x").unwrap();
+        for staged in
+            [victim.to_string_lossy().into_owned(), "../victim.txt".into(), "other/.wordcraft-save-1-bait.txt.tmp".into(), "bait.txt".into()]
+        {
+            b.append_journal(&JournalEntry { path: "bait.txt".into(), staged, state: JournalState::Pending, len: 6 });
+        }
+        let report = b.recover().unwrap();
+        assert_eq!(report.dropped, 4);
+        assert_eq!(fs::read(&victim).unwrap(), b"secret", "an untrusted journal line must not move or delete files");
+        assert_eq!(b.read("bait.txt").unwrap(), b"x");
+    }
+
+    #[test]
+    fn conditional_write_sees_changes_made_outside_the_backend() {
+        let (_tmp, b) = backend();
+        let tag = b.write("doc.docx", b"v1", &WriteOptions::default()).unwrap().etag.unwrap();
+        // A sync client replaces the file without going through the backend.
+        fs::write(b.root().join("doc.docx"), b"v1-from-elsewhere").unwrap();
+        let err = b.write("doc.docx", b"v2", &WriteOptions { if_match: Some(tag), atomic: true }).unwrap_err();
+        assert!(matches!(err, StorageError::Conflict(_)));
+        assert_eq!(b.read("doc.docx").unwrap(), b"v1-from-elsewhere");
+    }
+
+    #[test]
+    fn a_file_written_by_another_tool_has_a_usable_etag() {
+        let (_tmp, b) = backend();
+        fs::write(b.root().join("foreign.docx"), b"made elsewhere").unwrap();
+        let tag = b.stat("foreign.docx").unwrap().etag.expect("etag from content");
+        b.write("foreign.docx", b"edited", &WriteOptions { if_match: Some(tag), atomic: true }).unwrap();
+        assert_eq!(b.read("foreign.docx").unwrap(), b"edited");
+    }
+
+    #[test]
+    fn a_held_lock_blocks_a_second_writer_and_a_stale_one_is_taken_over() {
+        let (_tmp, b) = backend();
+        let dest = b.root().join("held.docx");
+        let lock = PathLock::acquire("held.docx", &dest).unwrap();
+        assert!(matches!(PathLock::acquire("held.docx", &dest), Err(StorageError::Conflict(_))));
+        assert!(b.list("").unwrap().is_empty(), "lock files are hidden from listings");
+        drop(lock);
+        // A crashed writer's lock, backdated past the stale limit.
+        let path = b.root().join(".wordcraft-lock-held.docx");
+        let f = File::create(&path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - LOCK_STALE - Duration::from_secs(1)).unwrap();
+        drop(f);
+        b.write("held.docx", b"ok", &WriteOptions::default()).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn concurrent_conditional_writers_only_one_wins() {
+        let (_tmp, b) = backend();
+        let tag = b.write("race.docx", b"base", &WriteOptions::default()).unwrap().etag.unwrap();
+        let wins: usize = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let (b, tag) = (&b, tag.clone());
+                    s.spawn(move || {
+                        b.write("race.docx", format!("writer {i}").as_bytes(), &WriteOptions { if_match: Some(tag), atomic: true }).is_ok()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| usize::from(h.join().unwrap())).sum()
+        });
+        assert_eq!(wins, 1);
     }
 
     #[test]

@@ -71,7 +71,8 @@ USAGE:
                     (plain http only: LAN, VPN or SSH tunnel; https is refused, see #518).
                     WebDAV auth is Basic (--store-user/--store-password) or an OIDC
                     Bearer token (--store-token, or $CRAFT_DAV_TOKEN to keep it off argv),
-                    never both.
+                    never both. Credentials go only to a loopback host unless
+                    --store-insecure-http says the network is trusted.
   wordcraft-cli [<command>] -h | --help       this help
   wordcraft-cli --version
 
@@ -371,6 +372,7 @@ const STORE_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--store-user", takes_value: true },
     OptionSpec { name: "--store-password", takes_value: true },
     OptionSpec { name: "--store-token", takes_value: true },
+    OptionSpec { name: "--store-insecure-http", takes_value: false },
     OptionSpec { name: "--etag", takes_value: true },
     OptionSpec { name: "--atomic", takes_value: false },
 ];
@@ -776,7 +778,12 @@ fn open_store(command: &str, args: &[String]) -> Result<Box<dyn wordcraft_storag
                 (None, u, p) => wordcraft_storage::webdav::WebDavBackend::new(&url, u.as_deref(), p.as_deref()),
                 _ => return Err(format!("{command}: --store-token cannot be combined with --store-user/--store-password (pick one auth scheme)")),
             };
-            backend.map(|b| Box::new(b) as Box<dyn wordcraft_storage::StorageBackend>).map_err(|e| format!("{command}: {e}"))
+            // Credentials go only to a loopback host over plain HTTP unless the network is trusted.
+            let insecure = args.iter().any(|a| a == "--store-insecure-http");
+            backend
+                .map(|b| if insecure { b.allow_cleartext_credentials() } else { b })
+                .map(|b| Box::new(b) as Box<dyn wordcraft_storage::StorageBackend>)
+                .map_err(|e| format!("{command}: {e}"))
         }
         other => Err(format!("{command}: unknown --store `{other}` (local or webdav)")),
     }

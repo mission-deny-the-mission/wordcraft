@@ -12,9 +12,14 @@
 //! - `PROPFIND` (depth 0/1) for `stat`/`list`, `GET` for `read`, `DELETE` for `remove`,
 //!   `OPTIONS` for [`probe`][crate::StorageBackend::probe].
 //!
-//! Deliberately stubbed (see [`строй`][WebDavBackend] docs and the crate report): `https://`
+//! Deliberately stubbed (see the [`WebDavBackend`] docs and the crate report): `https://`
 //! URLs (no TLS in this build — put Caddy / a reverse proxy in front, or sync a local folder),
 //! digest/NTLM auth, locking (`LOCK`/`UNLOCK`, Phase 3 takes these), and partial writes.
+//!
+//! Because there is no TLS, credentials are only sent to a loopback host (`localhost`,
+//! `127.0.0.0/8`, `::1`) unless the caller opts in with
+//! [`WebDavBackend::allow_cleartext_credentials`] (the CLI's `--store-insecure-http`); anything
+//! else fails with [`StorageError::Unsupported`] before a byte goes out.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -38,6 +43,7 @@ pub struct WebDavBackend {
     port: u16,
     base: String,
     auth: Option<String>,
+    cleartext_ok: bool,
 }
 
 impl WebDavBackend {
@@ -50,7 +56,10 @@ impl WebDavBackend {
             (None, None) => None,
             _ => return Err(StorageError::Auth("need both user and password, or neither".into())),
         };
-        Ok(WebDavBackend { host, port, base, auth })
+        if let Some(a) = &auth {
+            check_header_value("Authorization", a)?;
+        }
+        Ok(WebDavBackend { host, port, base, auth, cleartext_ok: false })
     }
 
     /// `url` like `http://host:port/dav/spaces/...`; `token` becomes an OIDC/Bearer credential
@@ -62,7 +71,18 @@ impl WebDavBackend {
         if token.is_empty() {
             return Err(StorageError::Auth("bearer token must not be empty".into()));
         }
-        Ok(WebDavBackend { host, port, base, auth: Some(format!("Bearer {token}")) })
+        let auth = format!("Bearer {token}");
+        check_header_value("Authorization", &auth)?;
+        Ok(WebDavBackend { host, port, base, auth: Some(auth), cleartext_ok: false })
+    }
+
+    /// Send credentials over plain HTTP to a host that is not loopback. Only for networks the
+    /// caller trusts (a LAN, VPN, or cluster network): anyone on the path can read the password
+    /// or token. Without this, an authenticated request to a non-loopback host is refused.
+    #[must_use]
+    pub fn allow_cleartext_credentials(mut self) -> WebDavBackend {
+        self.cleartext_ok = true;
+        self
     }
 
     /// The collection URL this backend talks to (password never included).
@@ -72,6 +92,15 @@ impl WebDavBackend {
 
     fn request(&self, method: &str, path: &str, extra: &[(&str, &str)], body: Option<&[u8]>) -> Result<Response, StorageError> {
         let target = join_path(&self.base, path);
+        if self.auth.is_some() && !self.cleartext_ok && !is_loopback(&self.host) {
+            return Err(StorageError::Unsupported(format!(
+                "{}: refusing to send credentials over plain HTTP to a non-loopback host; use a tunnel or opt in (--store-insecure-http)",
+                self.host
+            )));
+        }
+        for (k, v) in extra {
+            check_header_value(k, v)?;
+        }
         let addr = (self.host.as_str(), self.port)
             .to_socket_addrs()
             .map_err(|e| StorageError::Io(format!("{}:{}: {e}", self.host, self.port)))?
@@ -207,6 +236,21 @@ impl StorageBackend for WebDavBackend {
         // autosave copy); there is nothing server-side to replay yet.
         Ok(RecoveryReport::default())
     }
+}
+
+/// Header values are written verbatim, so a CR or LF (e.g. in an ETag echoed back as `If-Match`,
+/// or a pasted token) could inject headers. Refuse them.
+fn check_header_value(name: &str, value: &str) -> Result<(), StorageError> {
+    if value.contains(['\r', '\n']) {
+        return Err(StorageError::Protocol(format!("{name}: header value contains CR or LF")));
+    }
+    Ok(())
+}
+
+/// `localhost`, `127.0.0.0/8` or `::1` (bracketed or not): traffic that never leaves the machine.
+fn is_loopback(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    h.eq_ignore_ascii_case("localhost") || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Create each missing parent collection (`MKCOL`), deepest-first errors ignored when the
@@ -352,7 +396,7 @@ fn dechunk(body: &[u8]) -> Result<Vec<u8>, StorageError> {
         if size == 0 {
             break;
         }
-        if out.len() + size > MAX_BODY as usize {
+        if out.len().checked_add(size).is_none_or(|total| total > MAX_BODY as usize) {
             return Err(StorageError::Protocol("response is larger than 2 GB".into()));
         }
         let end = i.checked_add(size).ok_or_else(|| StorageError::Protocol("bad chunk".into()))?;
@@ -640,6 +684,38 @@ mod tests {
         let b = WebDavBackend::with_bearer(&format!("http://{addr}/dav/"), "test-token-123").unwrap();
         b.probe().unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "Authorization: Bearer test-token-123");
+    }
+
+    #[test]
+    fn credentials_stay_off_non_loopback_plain_http_unless_opted_in() {
+        // Port 9 on a TEST-NET address: the refusal must come before any connection attempt.
+        let b = WebDavBackend::with_bearer("http://192.0.2.1:9/dav/", "t").unwrap();
+        assert!(matches!(b.stat("x.docx").unwrap_err(), StorageError::Unsupported(_)));
+        let b = WebDavBackend::new("http://ocis.lan:9/dav/", Some("alice"), Some("pw")).unwrap();
+        assert!(matches!(b.read("x.docx").unwrap_err(), StorageError::Unsupported(_)));
+        // Opting in gets past the check (and then fails to connect at once: `0.0.0.0` is not loopback).
+        let b = WebDavBackend::with_bearer("http://0.0.0.0:9/dav/", "t").unwrap().allow_cleartext_credentials();
+        assert!(!matches!(b.stat("x.docx"), Err(StorageError::Unsupported(_))));
+        // No credentials, nothing to leak.
+        let b = WebDavBackend::new("http://0.0.0.0:9/dav/", None, None).unwrap();
+        assert!(!matches!(b.stat("x.docx"), Err(StorageError::Unsupported(_))));
+        assert!(is_loopback("localhost") && is_loopback("127.0.0.2") && is_loopback("[::1]") && !is_loopback("10.0.0.1"));
+    }
+
+    #[test]
+    fn header_values_with_cr_or_lf_are_refused() {
+        assert!(matches!(WebDavBackend::with_bearer("http://127.0.0.1:9/dav/", "t\r\nX-Evil: 1"), Err(StorageError::Protocol(_))));
+        // Basic credentials are base64-encoded, so CR/LF in them cannot reach the header block.
+        assert!(WebDavBackend::new("http://127.0.0.1:9/dav/", Some("a\n"), Some("p")).is_ok());
+        let b = WebDavBackend::new("http://127.0.0.1:9/dav/", None, None).unwrap();
+        let err = b.write("x.docx", b"d", &WriteOptions { if_match: Some("tag\r\nX-Evil: 1".into()), atomic: false }).unwrap_err();
+        assert!(matches!(err, StorageError::Protocol(_)), "{err:?}");
+    }
+
+    #[test]
+    fn dechunk_rejects_an_overflowing_chunk_size() {
+        let body = format!("2\r\nab\r\n{:x}\r\n", usize::MAX);
+        assert!(matches!(dechunk(body.as_bytes()), Err(StorageError::Protocol(_))));
     }
 
     #[test]

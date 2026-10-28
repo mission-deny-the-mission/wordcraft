@@ -28,7 +28,8 @@ fn live_backend() -> Option<(WebDavBackend, String)> {
         "CRAFT_E2E_LIVE=1 needs CRAFT_DAV_BASE (e.g. http://ocis.lan:9200), CRAFT_DAV_USER and CRAFT_DAV_TOKEN set"
     );
     let url = format!("{}/remote.php/dav/files/{user}/", base.trim_end_matches('/'));
-    let backend = WebDavBackend::with_bearer(&url, &token).expect("bearer backend builds");
+    // The tester names the server, so the network is theirs to trust (plain http, no TLS).
+    let backend = WebDavBackend::with_bearer(&url, &token).expect("bearer backend builds").allow_cleartext_credentials();
     Some((backend, user))
 }
 
