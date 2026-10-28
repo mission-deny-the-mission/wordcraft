@@ -567,16 +567,12 @@ fn store_flags_open_the_right_backend_or_explain() {
     assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "https://h/dav/"])).is_err());
     // Bearer token: accepted alone, rejected with user/password, rejected empty.
     assert!(
-        validate_options("store-probe", &args(&["--store", "webdav", "--store-url", "http://h/dav/", "--store-token", "t"]), STORE_OPTIONS)
-            .is_ok()
+        validate_options("store-probe", &args(&["--store", "webdav", "--store-url", "http://h/dav/", "--store-token", "t"]), STORE_OPTIONS).is_ok()
     );
     assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/", "--store-token", "t"])).is_ok());
     assert!(
-        open_store(
-            "store-probe",
-            &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/", "--store-token", "t", "--store-user", "u"])
-        )
-        .is_err()
+        open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/", "--store-token", "t", "--store-user", "u"]))
+            .is_err()
     );
     assert!(open_store("store-probe", &args(&["--store", "webdav", "--store-url", "http://127.0.0.1:9/dav/", "--store-token", ""])).is_err());
     assert!(open_store("store-probe", &args(&[])).is_err());

@@ -6912,9 +6912,9 @@ dependencies = [
 
 [[package]]
 name = "wordcraft-storage"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
