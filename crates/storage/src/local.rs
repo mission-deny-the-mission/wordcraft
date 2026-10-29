@@ -13,12 +13,18 @@
 //! check and the commit, so two writers going through this backend cannot both pass the check.
 //! The lock is cooperative: a program that ignores it can still replace the file between the
 //! check and the rename, and only a server-side compare-and-swap (WebDAV `If-Match`) closes that.
-//! A lock older than [`LOCK_STALE`] is treated as a crashed writer's residue and taken over.
+//! The lock is a lease: its holder renews it (touches it) every [`LOCK_RENEW`] for as long as the
+//! write runs, so only a lock nobody has renewed for [`LOCK_STALE`] (a crashed writer's residue)
+//! is taken over. Takeover renames the stale file aside (one taker wins) and backs off if it was
+//! renewed meanwhile; the lock file names its owner, the writer re-checks that it still owns the
+//! lock right before the commit, and release removes the file only while it is still the owner's.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::journal::{self, JournalEntry, JournalState};
@@ -30,8 +36,10 @@ const STAGE_PREFIX: &str = ".wordcraft-save-";
 const LOCK_PREFIX: &str = ".wordcraft-lock-";
 /// How long a writer waits for another writer's lock before reporting a conflict.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
-/// A lock file older than this belongs to a writer that crashed; it is taken over.
+/// A lock file not renewed for this long belongs to a writer that crashed; it is taken over.
 pub const LOCK_STALE: Duration = Duration::from_secs(30);
+/// How often a writer renews the lock it holds (well inside [`LOCK_STALE`]).
+const LOCK_RENEW: Duration = if cfg!(test) { Duration::from_millis(50) } else { Duration::from_secs(5) };
 
 /// A folder on disk holding documents. `root` must be (or become) a directory.
 #[derive(Clone, Debug)]
@@ -84,8 +92,8 @@ impl LocalBackend {
     }
 
     /// Stage `bytes` beside `dest`, journal the pending write, rename into place, journal the
-    /// commit. The caller holds the document's [`PathLock`].
-    fn atomic_commit(&self, rel: &str, dest: &Path, bytes: &[u8]) -> Result<FileMeta, StorageError> {
+    /// commit. The caller holds the document's [`PathLock`], re-checked right before the rename.
+    fn atomic_commit(&self, rel: &str, dest: &Path, bytes: &[u8], lock: &PathLock) -> Result<FileMeta, StorageError> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| StorageError::Io(format!("{}: {e}", parent.display())))?;
@@ -133,6 +141,10 @@ impl LocalBackend {
                 }
             }
             drop(f);
+            if let Err(e) = lock.still_held(rel) {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
             self.append_journal(&entry);
             if let Err(e) = fs::rename(&tmp, dest) {
                 let _ = fs::remove_file(&tmp);
@@ -149,34 +161,71 @@ impl LocalBackend {
     }
 }
 
-/// Exclusive writer lock beside one document, removed on drop.
+/// Exclusive writer lease beside one document: renewed while held, released on drop.
 struct PathLock {
     path: PathBuf,
+    /// This writer's token, the lock file's contents.
+    owner: String,
+    /// Stops the renewal thread (flag + wake-up).
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    /// Set by the renewal thread when the file is no longer this writer's.
+    lost: Arc<AtomicBool>,
+    renew: Option<JoinHandle<()>>,
 }
 
 impl Drop for PathLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let (flag, cv) = &*self.stop;
+        if let Ok(mut stopped) = flag.lock() {
+            *stopped = true;
+            cv.notify_all();
+        }
+        if let Some(h) = self.renew.take() {
+            let _ = h.join();
+        }
+        // Remove the file only while it is still ours: a writer that took over a lock we failed
+        // to renew must keep it.
+        if lock_owner(&self.path).as_deref() == Some(self.owner.as_str()) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+/// Who holds the lock at `path` (its token), if anyone.
+fn lock_owner(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
+/// Whether the lock file at `path` has gone [`LOCK_STALE`] without renewal.
+fn lock_is_stale(path: &Path) -> bool {
+    fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a > LOCK_STALE)
 }
 
 impl PathLock {
     /// Take `dest`'s writer lock, waiting up to [`LOCK_WAIT`] for another writer and taking over
-    /// a lock older than [`LOCK_STALE`].
+    /// a lock nobody has renewed for [`LOCK_STALE`].
     fn acquire(rel: &str, dest: &Path) -> Result<PathLock, StorageError> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| StorageError::Io(format!("{}: {e}", parent.display())))?;
         }
         let fname = dest.file_name().and_then(|n| n.to_str()).unwrap_or("doc");
         let path = dest.with_file_name(format!("{LOCK_PREFIX}{fname}"));
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let owner = format!("{}-{nanos}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
         let start = Instant::now();
         loop {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(PathLock { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let age = fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
-                    if age.is_some_and(|a| a > LOCK_STALE) {
+                Ok(mut f) => {
+                    if f.write_all(owner.as_bytes()).and_then(|()| f.sync_all()).is_err() {
                         let _ = fs::remove_file(&path);
+                        return Err(StorageError::Io(format!("{}: could not write the lock", path.display())));
+                    }
+                    return Ok(PathLock::hold(path, owner, f));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path) {
+                        Self::take_over_stale(&path, &owner);
                         continue;
                     }
                     if start.elapsed() > LOCK_WAIT {
@@ -187,6 +236,57 @@ impl PathLock {
                 Err(e) => return Err(StorageError::Io(format!("{}: {e}", path.display()))),
             }
         }
+    }
+
+    /// Move a stale lock out of the way. The rename is atomic, so of several writers seeing the
+    /// same stale lock only one moves it; if its holder renewed it in between, it goes back.
+    fn take_over_stale(path: &Path, owner: &str) {
+        let aside = path.with_file_name(format!("{}.stale-{owner}", path.file_name().and_then(|n| n.to_str()).unwrap_or("lock")));
+        if fs::rename(path, &aside).is_err() {
+            return; // Someone else moved it first: try again from the top.
+        }
+        if !lock_is_stale(&aside) {
+            // Renewed between our check and the rename: it is live, so restore it (unless a new
+            // lock has appeared meanwhile, which then wins and the old holder's re-check fails).
+            let _ = fs::hard_link(&aside, path);
+        }
+        let _ = fs::remove_file(&aside);
+    }
+
+    /// Start renewing a freshly created lock.
+    fn hold(path: PathBuf, owner: String, file: File) -> PathLock {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let lost = Arc::new(AtomicBool::new(false));
+        let renew = {
+            let (stop, lost, path, owner) = (Arc::clone(&stop), Arc::clone(&lost), path.clone(), owner.clone());
+            std::thread::Builder::new()
+                .name("wordcraft-storage-lock".into())
+                .spawn(move || {
+                    let (flag, cv) = &*stop;
+                    let Ok(mut stopped) = flag.lock() else { return };
+                    while !*stopped {
+                        let Ok((guard, _)) = cv.wait_timeout(stopped, LOCK_RENEW) else { return };
+                        stopped = guard;
+                        if *stopped {
+                            break;
+                        }
+                        if lock_owner(&path).as_deref() != Some(owner.as_str()) || file.set_modified(std::time::SystemTime::now()).is_err() {
+                            lost.store(true, Ordering::SeqCst);
+                        }
+                    }
+                })
+                .ok()
+        };
+        PathLock { path, owner, stop, lost, renew }
+    }
+
+    /// Fail with [`StorageError::Conflict`] unless this writer still owns the lock (checked right
+    /// before a commit, so a writer whose lease was taken over cannot rename over the new commit).
+    fn still_held(&self, rel: &str) -> Result<(), StorageError> {
+        if self.lost.load(Ordering::SeqCst) || lock_owner(&self.path).as_deref() != Some(self.owner.as_str()) {
+            return Err(StorageError::Conflict(format!("{rel}: lost the writer lock {} to another writer", self.path.display())));
+        }
+        Ok(())
     }
 }
 
@@ -239,7 +339,7 @@ impl StorageBackend for LocalBackend {
         }
         let dest = self.root.join(&rel);
         // Held across the `if_match` check and the commit (dropped on every return).
-        let _lock = PathLock::acquire(&rel, &dest)?;
+        let lock = PathLock::acquire(&rel, &dest)?;
         if let Some(want) = &opts.if_match {
             match current_etag(&dest) {
                 Some(have) if &have == want => {}
@@ -248,11 +348,12 @@ impl StorageBackend for LocalBackend {
             }
         }
         if opts.atomic {
-            return self.atomic_commit(&rel, &dest, bytes);
+            return self.atomic_commit(&rel, &dest, bytes, &lock);
         }
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| StorageError::Io(format!("{}: {e}", parent.display())))?;
         }
+        lock.still_held(&rel)?;
         let mut f = File::create(&dest).map_err(|e| StorageError::Io(format!("{}: {e}", dest.display())))?;
         f.write_all(bytes).map_err(|e| StorageError::Io(format!("{}: {e}", dest.display())))?;
         Ok(FileMeta { size: bytes.len() as u64, etag: Some(etag_of(bytes)), modified: None, is_dir: false })
@@ -291,7 +392,8 @@ impl StorageBackend for LocalBackend {
                 out.push(Entry { path: rel, meta: FileMeta { size: 0, etag: None, modified: None, is_dir: true } });
             } else if ft.is_file() {
                 let size = ent.metadata().map(|m| m.len()).unwrap_or(0);
-                out.push(Entry { path: rel, meta: FileMeta { size, etag: current_etag(&ent.path()), modified: None, is_dir: false } });
+                // No ETag here: hashing every file would read the whole folder. `stat` has it.
+                out.push(Entry { path: rel, meta: FileMeta { size, etag: None, modified: None, is_dir: false } });
             }
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -546,6 +648,46 @@ mod tests {
         drop(f);
         b.write("held.docx", b"ok", &WriteOptions::default()).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_held_lock_is_renewed_so_a_slow_writer_is_not_taken_over() {
+        let (_tmp, b) = backend();
+        let dest = b.root().join("slow.docx");
+        let lock = PathLock::acquire("slow.docx", &dest).unwrap();
+        // Make the held lock look stale, as a write outlasting LOCK_STALE would without renewal.
+        let path = b.root().join(".wordcraft-lock-slow.docx");
+        File::options().write(true).open(&path).unwrap().set_modified(std::time::SystemTime::now() - LOCK_STALE - Duration::from_secs(1)).unwrap();
+        std::thread::sleep(LOCK_RENEW * 4);
+        assert!(!lock_is_stale(&path), "the holder renews its lock");
+        assert!(matches!(b.write("slow.docx", b"second", &WriteOptions::default()), Err(StorageError::Conflict(_))));
+        assert!(lock.still_held("slow.docx").is_ok());
+    }
+
+    #[test]
+    fn a_writer_that_lost_its_lock_cannot_commit_or_remove_the_new_owners_lock() {
+        let (_tmp, b) = backend();
+        let dest = b.root().join("lost.docx");
+        let lock = PathLock::acquire("lost.docx", &dest).unwrap();
+        // Another writer took the lock over (as after a missed renewal).
+        let path = b.root().join(".wordcraft-lock-lost.docx");
+        fs::write(&path, "someone-else").unwrap();
+        assert!(matches!(lock.still_held("lost.docx"), Err(StorageError::Conflict(_))));
+        assert!(matches!(b.atomic_commit("lost.docx", &dest, b"late", &lock), Err(StorageError::Conflict(_))));
+        assert!(!dest.exists(), "nothing was renamed over the new owner's commit");
+        assert_eq!(b.list("").unwrap().len(), 0, "the staged file was cleaned up");
+        drop(lock);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "someone-else", "release leaves another owner's lock alone");
+    }
+
+    #[test]
+    fn list_skips_hashing_but_stat_has_the_etag() {
+        let (_tmp, b) = backend();
+        let tag = b.write("l.docx", b"bytes", &WriteOptions::default()).unwrap().etag;
+        let listed = b.list("").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].meta.etag, None);
+        assert_eq!(b.stat("l.docx").unwrap().etag, tag);
     }
 
     #[test]

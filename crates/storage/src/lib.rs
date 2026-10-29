@@ -60,7 +60,9 @@ pub struct Capabilities {
     pub conditional_write: bool,
     /// [`StorageBackend::list`] is implemented (else it reports [`StorageError::Unsupported`]).
     pub list: bool,
-    /// [`FileMeta::etag`] is populated, so optimistic concurrency is possible.
+    /// The backend has ETags, so optimistic concurrency is possible: [`StorageBackend::stat`] and
+    /// [`StorageBackend::write`] return one. [`StorageBackend::list`] entries may omit it (a local
+    /// folder would have to read every file); `stat` the entry when the tag is needed.
     pub etag: bool,
     /// Bytes survive a process restart on the backend itself (as opposed to a pure cache).
     pub persistent: bool,

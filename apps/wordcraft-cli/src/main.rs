@@ -67,7 +67,7 @@ USAGE:
   wordcraft-cli store-probe [--store …]       capabilities + server probe as JSON
   wordcraft-cli store-recover [--store …]     finish or drop interrupted writes, as JSON
                     --store-root is a local/NAS/synced folder; --store-url is the WebDAV
-                    collection, e.g. http://ocis.lan:9200/remote.php/dav/files/alice/Docs/
+                    collection (a --store-url alone picks webdav), e.g. http://ocis.lan:9200/remote.php/dav/files/alice/Docs/
                     (plain http only: LAN, VPN or SSH tunnel; https is refused, see #518).
                     WebDAV auth is Basic (--store-user/--store-password) or an OIDC
                     Bearer token (--store-token, or $CRAFT_DAV_TOKEN to keep it off argv),
@@ -752,7 +752,9 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
 /// or `webdav` (a collection at `--store-url`, Basic auth via `--store-user`/`--store-password`
 /// or an OIDC/Bearer token via `--store-token`; the two schemes are mutually exclusive).
 fn open_store(command: &str, args: &[String]) -> Result<Box<dyn wordcraft_storage::StorageBackend>, String> {
-    match arg_value(args, "--store").as_deref().unwrap_or("local") {
+    // Without --store, a --store-url names a WebDAV collection; otherwise it's a local folder.
+    let default_kind = if arg_value(args, "--store-url").is_some() { "webdav" } else { "local" };
+    match arg_value(args, "--store").as_deref().unwrap_or(default_kind) {
         "local" => {
             let root = arg_value(args, "--store-root").ok_or_else(|| format!("{command}: --store local needs --store-root DIR"))?;
             if arg_value(args, "--store-url").is_some() {
@@ -843,8 +845,9 @@ fn store_command(command: &str, rest: &[String]) -> Result<(), Failure> {
             Ok(())
         }
         "store-probe" => {
-            let caps = store.capabilities();
             let probe = store.probe().map_err(|e| Failure::Error(e.to_string()))?;
+            // What the server said, not what the backend assumed before asking.
+            let caps = &probe.capabilities;
             write_stdout(|o| {
                 writeln!(
                     o,

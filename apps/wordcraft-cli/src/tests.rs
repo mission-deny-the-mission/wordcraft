@@ -578,6 +578,9 @@ fn store_flags_open_the_right_backend_or_explain() {
     assert!(open_store("store-probe", &args(&[])).is_err());
     assert!(open_store("store-probe", &args(&["--store", "tape"])).is_err());
     assert!(open_store("store-probe", &args(&["--store", "local", "--store-root", "x", "--store-url", "http://h/"])).is_err());
+    assert!(open_store("store-probe", &args(&["--store", "local", "--store-url", "http://h/"])).is_err());
+    // A --store-url alone picks WebDAV (opening does not touch the network).
+    assert!(open_store("store-probe", &args(&["--store-url", "http://127.0.0.1:9/dav/"])).is_ok());
 }
 
 #[test]
